@@ -1,0 +1,243 @@
+import { Injectable } from "@nestjs/common";
+import * as dotenv from "dotenv";
+import { existsSync } from "fs";
+import { join } from "path";
+
+@Injectable()
+export class AppConfigService {
+  private readonly env = this.loadEnv();
+
+  readonly port = this.integer("PORT", 7000);
+  readonly databaseUrl = this.normalizeDatabaseUrl(this.string("DATABASE_URL", "postgresql://localhost:5432/testpilot"));
+  readonly databaseUser = this.optionalString("DATABASE_USER");
+  readonly databasePassword = this.optionalString("DATABASE_PASSWORD");
+  // Connections this instance may hold. Budget it as poolMax x instances against the server's
+  // max_connections (100 by default) — the ceiling is shared, not per process.
+  readonly databasePoolMax = this.integer("DB_POOL_MAX", 20);
+  // Server-side cap on a single statement. Without it one pathological query (an unbounded report on
+  // a large workspace) holds its connection indefinitely, and enough of them stall the whole instance
+  // because nothing fails fast enough to shed load. Postgres cancels the query and the client sees an
+  // error, so the connection returns to the pool either way. 0 disables it.
+  readonly databaseStatementTimeoutMs = this.integer("DB_STATEMENT_TIMEOUT_MS", 30_000);
+  // How long a caller waits for a free connection before erroring rather than queueing forever.
+  readonly databaseConnectionTimeoutMs = this.integer("DB_CONNECTION_TIMEOUT_MS", 10_000);
+  readonly databaseIdleTimeoutMs = this.integer("DB_IDLE_TIMEOUT_MS", 30_000);
+  // Guards the transaction() helper: if its callback hangs between BEGIN and COMMIT, the connection
+  // is held with an open transaction, which also pins vacuum. 0 disables it.
+  readonly databaseIdleInTransactionTimeoutMs = this.integer("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", 60_000);
+  /*
+   * How long an idle keep-alive connection is held open, and how long headers may take to arrive.
+   *
+   * Node defaults these to 5s and 60s. 5s is shorter than any keep-alive client upstream of us
+   * holds a pooled socket for — nginx (deploy/nginx) reuses upstream connections for 60s by
+   * default, and so does every server-side HTTP agent that talks to this API — so the server would
+   * send FIN on a socket the client still believed was good, and a request written into that socket
+   * came back as ECONNRESET / "socket hang up" rather than as any HTTP status. It surfaces as an
+   * intermittent transport fault on whichever request happened to follow a pause, which reads like a
+   * network problem and is not one.
+   *
+   * The rule is that this must exceed the idle timeout of everything that connects to us, and that
+   * headersTimeout must in turn exceed this one (Node enforces the ordering: a headersTimeout below
+   * keepAliveTimeout closes connections mid-request).
+   */
+  readonly httpKeepAliveTimeoutMs = this.integer("HTTP_KEEP_ALIVE_TIMEOUT_MS", 65_000);
+  readonly httpHeadersTimeoutMs = this.integer("HTTP_HEADERS_TIMEOUT_MS", 70_000);
+  readonly redisUrl = this.string("REDIS_URL", "redis://localhost:6379");
+  readonly postmarkApiToken = this.string("POSTMARK_API_TOKEN", "");
+  readonly postmarkFromEmail = this.string("POSTMARK_FROM_EMAIL", "noreply@example.com");
+  // "live" delivers mail for real and is what PRODUCTION must set. Anything else — including an
+  // unset or misspelled value — means "log", which never emails an OTP and only posts the remaining
+  // communication emails when Postmark confirms the token belongs to a non-delivering Sandbox
+  // server. The default is the safe one on purpose: a forgotten setting has to fail towards "no mail
+  // sent", never towards "the e2e suite emailed a thousand invented addresses". See
+  // config/email-delivery.policy.ts for the full decision table.
+  readonly emailDeliveryMode: "live" | "log" =
+    this.string("EMAIL_DELIVERY_MODE", "log").trim().toLowerCase() === "live" ? "live" : "log";
+  // Daily Basecamp analytics report. Opt-in and PRODUCTION-ONLY: the scheduler registers only when this
+  // is exactly "true", and only the production Jenkinsfile sets it. Everything else (local, e2e,
+  // stage, or a stage stack pointed at the prod database) leaves it off, so a forgotten setting fails
+  // towards "no report posted", never towards a duplicate one.
+  readonly analyticsReportEnabled = this.optionalString("ANALYTICS_REPORT_ENABLED").toLowerCase() === "true";
+  readonly basecampClientId = this.optionalString("BASECAMP_CLIENT_ID");
+  readonly basecampClientSecret = this.optionalString("BASECAMP_CLIENT_SECRET");
+  readonly basecampRefreshToken = this.optionalString("BASECAMP_REFRESH_TOKEN");
+  readonly basecampAccountId = this.optionalString("BASECAMP_ACCOUNT_ID");
+  // Overrides the check-in the report is posted to (see analytics-report.constants.ts for the default).
+  readonly basecampAnalyticsQuestionUrl = this.optionalString("BASECAMP_ANALYTICS_QUESTION_URL");
+  readonly setupToken = this.optionalString("SETUP_TOKEN");
+  readonly otpExpiryMinutes = this.integer("OTP_EXPIRY_MINUTES", 10);
+  readonly sessionDays = this.integer("SESSION_DAYS", 30);
+  readonly sessionCookieName = "testpilot_session";
+  readonly corsAllowedOrigins = this.parseCorsAllowedOrigins();
+  readonly frontendUrl = this.string("FRONTEND_URL", "http://localhost:1010");
+  // Optional. The address people OUTSIDE this deployment reach it at, for links TestPilot writes into
+  // other systems (Jira/Linear ticket comments). Unset: FRONTEND_URL is used. Either way the link is
+  // only written if the address is externally reachable (common/external-url.util.ts) — so a local
+  // stack never posts localhost links. Does not affect invite/reset/billing emails or OAuth, which
+  // keep using FRONTEND_URL.
+  readonly publicAppUrl = this.optionalString("PUBLIC_APP_URL");
+  readonly uploadDir = this.string("UPLOAD_DIR", "./uploads");
+  readonly maxUploadSize = this.integer("MAX_UPLOAD_SIZE", 10485760);
+  // Applies to JSON/urlencoded request bodies (e.g. knowledge base document saves), not file uploads
+  readonly maxRequestBodySize = this.integer("MAX_REQUEST_BODY_SIZE", 20 * 1024 * 1024);
+  // Object storage: defaults to local disk (uploadDir above). Set STORAGE_DRIVER=s3 to use
+  // any S3-compatible service (AWS S3, MinIO, Cloudflare R2, DigitalOcean Spaces, etc).
+  readonly storageDriver = this.string("STORAGE_DRIVER", "local").toLowerCase() === "s3" ? "s3" : "local";
+  readonly s3Bucket = this.optionalString("S3_BUCKET");
+  // Optional key prefix so multiple environments (local/staging/prod) can share one bucket
+  // without colliding, e.g. "local/knowledge-base/<organizationId>/<projectId>/<uuid>.<ext>".
+  readonly s3BucketFolder = this.optionalString("S3_BUCKET_FOLDER");
+  readonly s3Region = this.string("S3_REGION", "us-east-1");
+  readonly s3Endpoint = this.optionalString("S3_ENDPOINT") || undefined;
+  readonly s3AccessKeyId = this.optionalString("S3_ACCESS_KEY_ID") || undefined;
+  readonly s3SecretAccessKey = this.optionalString("S3_SECRET_ACCESS_KEY") || undefined;
+  readonly s3ForcePathStyle = this.string("S3_FORCE_PATH_STYLE", "false").toLowerCase() === "true";
+  readonly s3PresignedUrlTtlSeconds = this.integer("S3_PRESIGNED_URL_TTL_SECONDS", 300);
+  readonly stripeSecretKey = this.optionalString("STRIPE_SECRET_KEY");
+  readonly stripeWebhookSecret = this.optionalString("STRIPE_WEBHOOK_SECRET");
+  readonly stripePriceIdProMonthly = this.optionalString("STRIPE_PRICE_ID_PRO_MONTHLY");
+  readonly stripePriceIdProAnnual = this.optionalString("STRIPE_PRICE_ID_PRO_ANNUAL");
+  // India-registered Stripe accounts can't charge Indian-issued cards in a non-INR
+  // currency (RBI cross-border rule) — these are the INR equivalents of the two prices
+  // above, charged instead when the buyer is detected as being in India.
+  readonly stripePriceIdProMonthlyInr = this.optionalString("STRIPE_PRICE_ID_PRO_MONTHLY_INR");
+  readonly stripePriceIdProAnnualInr = this.optionalString("STRIPE_PRICE_ID_PRO_ANNUAL_INR");
+  /**
+   * Billing/Stripe is optional. Empty STRIPE_SECRET_KEY → checkout/portal/webhooks stay off and
+   * plan-limit gating is skipped so the rest of the app is unaffected. Set the secret (and price
+   * IDs) in .env to turn Cloud billing back on.
+   */
+  readonly isStripeBillingEnabled = Boolean(this.stripeSecretKey?.trim());
+  // Forces the detected country (e.g. "IN") for every request. Local stacks and staging see only
+  // private IPs, which can't be geolocated, so without this the India price list is untestable.
+  // Must stay unset in production — it would hand INR pricing to every visitor.
+  readonly billingForceCountry = this.optionalString("BILLING_FORCE_COUNTRY");
+  // Only enable when an edge that OVERWRITES client-supplied country headers (Cloudflare,
+  // CloudFront, Vercel, Fastly) fronts the app. Otherwise a caller can forge cf-ipcountry: IN
+  // and buy the India price list from anywhere.
+  readonly trustProxyCountryHeader = this.string("TRUST_PROXY_COUNTRY_HEADER", "false").toLowerCase() === "true";
+  // Days of full Pro-level access a workspace keeps after its subscription ends, before Launch
+  // limits are enforced for real. 0 disables the grace window (immediate enforcement).
+  readonly planGraceDays = this.integer("PLAN_GRACE_DAYS", 30);
+  // Where "need more storage?" and other billing dead-ends point people.
+  readonly supportContactEmail = this.string("SUPPORT_CONTACT_EMAIL", "support@tryqable.com");
+  // Optional CC on the welcome email (welcome-email/), which is sent to the registering user. No
+  // default: unset means no CC.
+  readonly welcomeEmailCc = this.optionalString("WELCOME_EMAIL_CC");
+  // Kill switch for RequestCacheService's per-request memoization (see request-cache/). Off falls
+  // straight through to an uncached lookup at every call site — never staleness, just no dedup.
+  readonly enableRequestScopedCache = this.string("ENABLE_REQUEST_SCOPED_CACHE", "true").trim().toLowerCase() !== "false";
+  // Kill switch for running independent read queries concurrently (Promise.all) instead of one at a
+  // time in a few hot summary endpoints. Off reverts to the original sequential awaits — a pure
+  // scheduling change either way, so this is safe to flip without redeploying calling code.
+  readonly enableQueryParallelization = this.string("ENABLE_QUERY_PARALLELIZATION", "true").trim().toLowerCase() !== "false";
+  // Kill switches for the Redis-backed session/entitlement caches (src/cache/). Independently
+  // toggleable since they have different risk profiles — off, either falls straight through to
+  // today's uncached Postgres read, exactly as if this feature had never shipped.
+  // Brute-force limits (src/rate-limit/). They count failed guesses only, so they never affect a
+  // signed-in user or a successful login; off disables every counter. The multiplier scales the
+  // per-IP caps for a stack that shares one address between many clients (the e2e suite).
+  readonly rateLimitEnabled = this.string("RATE_LIMIT_ENABLED", "true").trim().toLowerCase() !== "false";
+  readonly rateLimitIpMultiplier = this.integer("RATE_LIMIT_IP_MULTIPLIER", 1);
+  readonly sessionCacheEnabled =this.string("SESSION_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  readonly entitlementCacheEnabled = this.string("ENTITLEMENT_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for offloading knowledge-base XLSX/PDF/DOCX text extraction onto worker_threads
+  // (src/legacy/kb-extraction-runner.service.ts). Off runs the identical extraction function inline
+  // on the request's own thread, exactly as before this phase shipped.
+  readonly kbExtractionWorkerThreadsEnabled = this.string("KB_EXTRACTION_WORKER_THREADS_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Bounds how many extraction worker threads may run at once — excess uploads queue (still
+  // "synchronous-feeling" to that uploader) rather than spawning unboundedly under concurrent load.
+  readonly kbExtractionWorkerPoolSize = this.integer("KB_EXTRACTION_WORKER_POOL_SIZE", 4);
+  // A pathological file could otherwise hang a worker (and, before this phase, the whole process)
+  // indefinitely — this is a strict new protection, not a preserved timing contract.
+  readonly kbExtractionTimeoutMs = this.integer("KB_EXTRACTION_TIMEOUT_MS", 30_000);
+  // NYRA agent. Server-to-server only: the key is never sent to the browser. One key is bound to one
+  // NYRA workspace and TestPilot project, so project isolation is enforced here (nyra_projects table).
+  // From the backend container, NYRA on the host is http://host.docker.internal:2905 (plain http only
+  // passes safeFetch while ALLOW_PRIVATE_AI_HOSTS=true; a hosted deployment needs an https URL).
+  readonly nyraApiKey = this.string("NYRA_API_KEY", "").trim();
+  readonly nyraBaseUrl = this.string("NYRA_BASE_URL", "").trim().replace(/\/+$/, "");
+
+  // Kill switch for Zyra batch-save's set-based create path (legacy.service.ts's
+  // processZyraSaveEntriesBatched/zyraBatchInsertTestCases). Defaults OFF, unlike this remediation's
+  // other flags: this is the highest-risk change in the plan (no existing test coverage for
+  // zyraSaveAttempt at all), so today's exact per-row behavior stays the default until this has been
+  // explicitly verified and someone deliberately opts in.
+  readonly zyraSetBasedSaveEnabled = this.string("ZYRA_SET_BASED_SAVE_ENABLED", "false").trim().toLowerCase() === "true";
+  // Kill switch for the Redis-backed suites-tree read cache (src/cache/suites-cache.service.ts).
+  // Off falls straight through to today's uncached listSuites() query on every call, exactly as if
+  // this phase had never shipped.
+  readonly suitesCacheEnabled = this.string("SUITES_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for the Redis-backed unfiltered-testcases-list cache (src/cache/testcases-list-cache.service.ts).
+  // Off falls straight through to today's uncached listTestCases() query for every call, exactly as
+  // if this optional phase had never shipped.
+  readonly testcasesListCacheEnabled = this.string("TESTCASES_LIST_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+  // Kill switch for the Redis-backed per-project overview cache (src/cache/project-overview-cache.service.ts).
+  // TTL-only by design (see that file's own comment) — off falls straight through to today's
+  // always-fresh listProjects()+5-query-batch, exactly as if this phase had never shipped.
+  readonly projectOverviewCacheEnabled = this.string("PROJECT_OVERVIEW_CACHE_ENABLED", "true").trim().toLowerCase() !== "false";
+
+  private loadEnv(): Record<string, string | undefined> {
+    const dotenvPath = this.findDotEnvPath();
+    const parsed = dotenvPath ? dotenv.config({ path: dotenvPath }).parsed ?? {} : {};
+    return { ...process.env, ...parsed };
+  }
+
+  normalizeCorsOrigin(raw?: string | null): string {
+    if (!raw) return "";
+    let origin = raw.trim();
+    if (origin.charCodeAt(0) === 0xfeff) origin = origin.slice(1).trim();
+    while (origin.endsWith("/")) origin = origin.slice(0, -1).trim();
+    return origin;
+  }
+
+  private parseCorsAllowedOrigins(): Set<string> {
+    const defaults = [
+      "http://localhost:1010",
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "http://127.0.0.1:1010",
+      "http://127.0.0.1:3000",
+      "http://127.0.0.1:3001",
+      "https://frontdoor.testpilot.io",
+      "https://automate.testpilot.io",
+      "https://exe.testpilot.io",
+      "https://backdoor.testpilot.io"
+    ].join(",");
+    const csv = this.string("CORS_ALLOWED_ORIGINS", defaults).trim() || defaults;
+    return new Set(
+      csv
+        .split(",")
+        .map((value) => this.normalizeCorsOrigin(value))
+        .filter(Boolean)
+    );
+  }
+
+  private normalizeDatabaseUrl(raw: string): string {
+    const value = raw.trim();
+    if (value.startsWith("jdbc:postgresql://")) return value.slice("jdbc:".length);
+    if (value.startsWith("jdbc:postgres://")) return value.slice("jdbc:".length);
+    return value;
+  }
+
+  private string(key: string, defaultValue: string): string {
+    return this.env?.[key] ?? process.env[key] ?? defaultValue;
+  }
+
+  private optionalString(key: string): string {
+    return (this.env?.[key] ?? process.env[key] ?? "").trim();
+  }
+
+  private integer(key: string, defaultValue: number): number {
+    const value = this.env?.[key] ?? process.env[key];
+    if (value == null || value.trim() === "") return defaultValue;
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isNaN(parsed)) return defaultValue;
+    return parsed;
+  }
+
+  private findDotEnvPath(): string | null {
+    const candidates = [join(process.cwd(), ".env"), join(process.cwd(), "backend", ".env")];
+    return candidates.find((candidate) => existsSync(candidate)) ?? null;
+  }
+}

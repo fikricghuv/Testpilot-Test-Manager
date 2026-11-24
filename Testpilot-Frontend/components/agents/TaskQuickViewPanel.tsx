@@ -1,0 +1,430 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { IconSparkles, IconUser, IconX } from "@tabler/icons-react";
+import { closeZyraTask, zyraTaskTicketKeys, type ZyraTask } from "@/lib/api";
+import { Button, CopyButton, StatusChip, PriorityBadge, type Priority, type Severity } from "@/components/ui";
+import { toTsv } from "@/lib/tsv";
+import { isMarkdownSource, renderMarkdown } from "@/lib/markdown";
+import { ZyraLanguageContext, zyraLanguage, zyraText } from "@/lib/zyra-i18n";
+import { formatDateTime } from "@/lib/date";
+import { TechniqueBadges } from "./ZyraChatReviewPanel";
+import { ZyraSeverityBadge } from "./ZyraContextDrawer";
+
+export const JIRA_BADGE_CLASS =
+  "rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-0.5 font-mono text-[11px] font-medium text-[var(--muted)]";
+
+export function normalizeTaskStatus(status: string): string {
+  if (status === "accepted") return "done";
+  if (status === "rejected") return "todo";
+  return status || "todo";
+}
+
+export function taskStatusTone(status: string): "neutral" | "info" | "success" | "warning" | "error" {
+  const normalized = normalizeTaskStatus(status);
+  if (normalized === "done") return "success";
+  if (normalized === "in_review") return "info";
+  if (normalized === "in_progress") return "warning";
+  if (normalized === "failed") return "error";
+  return "neutral";
+}
+
+// The latest "Generation failed" / "Regeneration failed" activity entry, if any — the only
+// place the real failure reason exists server-side. Used to surface it directly on the card
+// instead of making the user open the Activity tab to find out what happened. `fallback` lets the
+// quick view pass its localized text; other callers keep the English default.
+export function latestFailureDetail(
+  activities: ZyraTask["activities"],
+  fallback = "Zyra failed to generate testcase drafts.",
+): string | null {
+  for (let i = activities.length - 1; i >= 0; i -= 1) {
+    if (activities[i].stage === "failed") return activities[i].detail || fallback;
+  }
+  return null;
+}
+
+// The activity log is one flat timeline that also backs the Activity tab, but only a reviewer's
+// actual submitted words belong under "Feedback" — everything else in it (picked up, read
+// sources, generated drafts, closed, saved...) is status/process narration. The backend marks
+// the one entry that is genuine feedback with `kind: "feedback"`; rows written before that field
+// existed carry no `kind`, so entries are also matched by their fixed title as a fallback.
+export function isFeedbackActivity(activity: ZyraTask["activities"][number]): boolean {
+  return activity.kind === "feedback" || activity.title === "Review feedback submitted";
+}
+
+// The Activity tab shows the newest entry first. activity_log is append-only server-side, but the
+// order is decided here from createdAt rather than trusted from the array. Entries written in one
+// call share a timestamp ("Task created" + "Waiting for Zyra"), so ties fall back to array position
+// (later = newer); an entry without a parseable createdAt sinks to the bottom. Returns copies paired
+// with their original index, which stays stable as new entries arrive and so serves as the React key.
+// Callers that read the log chronologically (latestFailureDetail) keep using the raw array.
+export function sortActivitiesNewestFirst(
+  activities: ZyraTask["activities"],
+): Array<{ activity: ZyraTask["activities"][number]; index: number }> {
+  return activities
+    .map((activity, index) => ({ activity, index, time: Date.parse(activity?.createdAt ?? "") }))
+    .sort((a, b) => {
+      const aValid = Number.isFinite(a.time);
+      const bValid = Number.isFinite(b.time);
+      if (aValid !== bValid) return aValid ? -1 : 1;
+      if (aValid && a.time !== b.time) return b.time - a.time;
+      return aValid ? b.index - a.index : a.index - b.index;
+    })
+    .map(({ activity, index }) => ({ activity, index }));
+}
+
+// English labels for the task list / requirements pages; the quick view itself renders the
+// localized "taskStatus.<status>" key from lib/zyra-i18n.ts (same English text).
+const TASK_STATUS_LABELS: Record<string, string> = {
+  todo: "To Do",
+  in_progress: "In Progress",
+  in_review: "In Review",
+  failed: "Failed",
+  done: "Done",
+};
+
+export function taskStatusLabel(status: string): string {
+  const normalized = normalizeTaskStatus(status);
+  return TASK_STATUS_LABELS[normalized] ?? normalized.replaceAll("_", " ");
+}
+
+const KNOWN_SEVERITIES: Severity[] = ["Critical", "High", "Medium", "Low"];
+// See ZyraChatReviewPanel's identical guard — a draft's severity is only guaranteed to match this
+// set once actually saved (normalizeZyraSeverity); an in-review preview can still carry something
+// else, so this never trusts the string directly.
+function knownSeverity(value?: string | null): Severity | null {
+  return KNOWN_SEVERITIES.includes(value as Severity) ? (value as Severity) : null;
+}
+
+function firstStepText(stepsJson: string): string | null {
+  try {
+    const parsed = JSON.parse(stepsJson);
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const first = parsed[0];
+    if (typeof first === "string") return first;
+    if (first && typeof first === "object") {
+      return first.action || first.step || first.description || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function stepsText(stepsJson: string): string {
+  try {
+    const parsed = JSON.parse(stepsJson);
+    if (!Array.isArray(parsed)) return "";
+    return parsed
+      .map((step, index) => {
+        if (typeof step === "string") return `${index + 1}. ${step}`;
+        if (step && typeof step === "object") {
+          const action = step.action || step.step || step.description || "";
+          const expected = step.expectedResult || step.expected || "";
+          if (!action && !expected) return "";
+          return expected ? `${index + 1}. ${action} -> ${expected}` : `${index + 1}. ${action}`;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join(" | ");
+  } catch {
+    return "";
+  }
+}
+
+type PanelTab = "testcases" | "feedback" | "sources" | "activity";
+
+type TaskQuickViewPanelProps = {
+  task: ZyraTask;
+  projectId: string;
+  onClose: () => void;
+  onTaskUpdated: (task: ZyraTask) => void;
+};
+
+export default function TaskQuickViewPanel({ task, projectId, onClose, onTaskUpdated }: TaskQuickViewPanelProps) {
+  const [activeTab, setActiveTab] = useState<PanelTab>("testcases");
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The task's own language (set server-side from the script of what the user typed); English when
+  // missing. Also provided as context below, for the shared badges rendered inside the panel.
+  const t = zyraText(zyraLanguage(task.language));
+
+  useEffect(() => {
+    setActiveTab("testcases");
+    setError(null);
+  }, [task.id]);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  if (typeof document === "undefined") return null;
+
+  const normalizedStatus = normalizeTaskStatus(task.taskStatus);
+  const done = normalizedStatus === "done";
+  const failed = normalizedStatus === "failed";
+  // Defensive: activity_log is a jsonb array server-side and should always arrive as one, but a
+  // malformed or missing value here must render an empty list rather than throw.
+  const activities = Array.isArray(task.activities) ? task.activities : [];
+  const feedbackActivities = activities.filter(isFeedbackActivity);
+  const failureDetail = failed ? latestFailureDetail(activities, t("task.failedDefault")) : null;
+  const approvalRate = task.generatedCount > 0 ? Math.round((task.savedCount / task.generatedCount) * 100) : null;
+  // A task's ticket lives in jiraIssueKeys, linearIssueKeys OR notionPageIds depending on its source. Reading only
+  // the Jira list left every Linear task showing a bare "—" placeholder beside its status. Same
+  // combined list the full task page uses; a task with no ticket gets no key slot at all.
+  const ticketKey = zyraTaskTicketKeys(task)[0];
+  const draftsTsv = toTsv(
+    [t("col.title"), t("col.priority"), t("col.severity"), t("col.component"), t("col.preconditions"), t("col.steps"), t("col.expectedResultCap"), t("col.tags")],
+    task.drafts.map((draft) => [
+      draft.title,
+      draft.priority,
+      draft.severity ? t.value("severity", draft.severity) : draft.severity ?? "",
+      draft.component ?? "",
+      draft.preconditions,
+      stepsText(draft.stepsJson),
+      draft.expectedSummary,
+      draft.tags?.join(", ") ?? "",
+    ])
+  );
+
+  async function handleCloseTask() {
+    setWorking(true);
+    setError(null);
+    try {
+      const updated = await closeZyraTask(projectId, task.id);
+      onTaskUpdated(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("task.err.close"));
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  const tabs: Array<{ key: PanelTab; label: string; count?: number }> = [
+    { key: "testcases", label: t("task.tab.testcases"), count: task.drafts.length },
+    { key: "feedback", label: t("task.tab.feedback"), count: feedbackActivities.length },
+    { key: "sources", label: t("task.tab.sources"), count: task.sources.length },
+    { key: "activity", label: t("task.tab.activity"), count: activities.length },
+  ];
+
+  return createPortal(
+    <ZyraLanguageContext.Provider value={t.lang}>
+      <div role="presentation" className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="slide-in-right fixed right-0 top-0 z-50 flex h-screen w-full max-w-[520px] flex-col overflow-hidden border-l border-[var(--border)] bg-[var(--surface)] shadow-[var(--shadow-elevated)]">
+        {/* Header — kept slim and always visible so the close control never scrolls out of reach */}
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-5 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            {ticketKey && <span className="font-mono text-xs text-[var(--muted-soft)]">{ticketKey}</span>}
+            <StatusChip tone={taskStatusTone(task.taskStatus)}>{t.opt(`taskStatus.${normalizedStatus}`) ?? taskStatusLabel(task.taskStatus)}</StatusChip>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t("close")}
+            className="shrink-0 rounded-md p-1.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+          >
+            <IconX size={16} stroke={1.75} />
+          </button>
+        </div>
+
+        {/* Title + description — a long user story or context (e.g. pulled in from a Knowledge
+            Base doc) must never push the stats/tabs/footer below out of view, so this block is
+            height-capped and scrolls internally instead of growing without bound. The scrollbar
+            is hidden (no-scrollbar) so a short description still looks like plain static text. */}
+        <div className="no-scrollbar max-h-[35vh] shrink-0 overflow-y-auto border-b border-[var(--border)] p-5">
+          <h2 className="break-words text-[15px] font-semibold leading-snug text-[var(--foreground)]">{task.userStory}</h2>
+          {failureDetail && (
+            <p className="mt-1.5 break-words text-[12px] text-[var(--error-foreground)]">{failureDetail}</p>
+          )}
+          {/* Ticket descriptions synced from Jira/Linear are Markdown; render it rather than showing its syntax. */}
+          {task.context?.trim() && (
+            <div
+              className="zyra-prose mt-1.5 break-words text-[13px] text-[var(--muted)]"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(task.context) }}
+            />
+          )}
+        </div>
+
+        {/* Stats row */}
+        <div className="grid shrink-0 grid-cols-3 divide-x divide-[var(--border)] border-b border-[var(--border)]">
+          <div className="p-3.5 text-center">
+            <div className="font-mono text-lg font-semibold text-[var(--foreground)]">{task.generatedCount}</div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.testcases")}</div>
+          </div>
+          <div className="p-3.5 text-center">
+            <div className="font-mono text-lg font-semibold text-[var(--foreground)]">{task.tokenUsage.total}</div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.tokens")}</div>
+          </div>
+          <div className="p-3.5 text-center">
+            <div
+              className="font-mono text-lg font-semibold"
+              style={{ color: approvalRate === null ? "var(--muted-soft)" : "var(--success)" }}
+            >
+              {approvalRate === null ? "—" : `${approvalRate}%`}
+            </div>
+            <div className="mt-0.5 text-[11px] text-[var(--muted-soft)]">{t("task.stat.approval")}</div>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex shrink-0 gap-5 border-b border-[var(--border)] px-5">
+          {tabs.map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              onClick={() => setActiveTab(tab.key)}
+              className={`border-b-2 py-2.5 text-[13px] font-medium transition-colors ${
+                activeTab === tab.key
+                  ? "border-[var(--brand-primary)] text-[var(--foreground)]"
+                  : "border-transparent text-[var(--muted-soft)] hover:text-[var(--foreground)]"
+              }`}
+            >
+              {tab.label}
+              {tab.count != null ? ` (${tab.count})` : ""}
+            </button>
+          ))}
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-5">
+          {error && (
+            <p className="mb-3 rounded-lg border border-[var(--error)]/40 bg-[var(--error-soft)] px-3 py-2 text-sm text-[var(--error-foreground)]">{error}</p>
+          )}
+
+          {activeTab === "testcases" && (
+            <div className="flex flex-col gap-2.5">
+              {task.drafts.length > 0 && (
+                <div className="flex justify-end">
+                  <span title={t("task.copyAllTitle")}>
+                    <CopyButton value={draftsTsv} label={t("task.copyAll")} copiedLabel={t("copied")} />
+                  </span>
+                </div>
+              )}
+              {task.drafts.map((draft, index) => {
+                const step = firstStepText(draft.stepsJson);
+                return (
+                  <div key={`${task.id}-draft-${index}`} className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3.5">
+                    <div className="mb-1.5 flex items-center gap-2">
+                      {draft.action && (
+                        <StatusChip tone="info" className="!rounded-[5px] !px-1.5 !py-0 !text-[10px] !font-medium">
+                          {t.opt(`draftAction.${draft.action}`) || draft.action}
+                        </StatusChip>
+                      )}
+                      <PriorityBadge priority={draft.priority as Priority} />
+                      {knownSeverity(draft.severity) && <ZyraSeverityBadge severity={knownSeverity(draft.severity)!} />}
+                      {draft.component && <span className="text-[11px] text-[var(--muted-soft)]">{draft.component}</span>}
+                      {draft.externalId && <span className="font-mono text-[11px] text-[var(--muted-soft)]">{draft.externalId}</span>}
+                      {draft.tags?.length ? <span className="text-[11px] text-[var(--muted-soft)]">{draft.tags.join(", ")}</span> : null}
+                    </div>
+                    <div className="text-[13px] font-medium leading-snug text-[var(--foreground)]">{draft.title}</div>
+                    {step && <div className="mt-1.5 text-[12px] text-[var(--muted)]">1 → {step}</div>}
+                    {draft.techniques?.length ? <div className="mt-1.5"><TechniqueBadges techniques={draft.techniques} /></div> : null}
+                    {/* Only an update/archive draft carries a reason (why the sweep or the chat turn
+                        flagged this) — a plain task-board create draft never has one, so this stays
+                        silent for the case that already worked before this normalization existed. */}
+                    {draft.reason && <div className="mt-1.5 text-[12px] italic text-[var(--muted)]">{draft.reason}</div>}
+                  </div>
+                );
+              })}
+              {task.drafts.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noDrafts")}</p>}
+            </div>
+          )}
+
+          {activeTab === "feedback" && (
+            <div className="flex flex-col gap-3">
+              {feedbackActivities.map((activity, index) => {
+                const isAgent = activity.actor === "agent";
+                return (
+                  <div
+                    key={`${task.id}-feedback-${index}`}
+                    className={`rounded-lg border border-[var(--border)] p-3.5 ${isAgent ? "border-l-[3px] border-l-[var(--brand-primary)]" : ""}`}
+                    style={{ background: "var(--surface-secondary)" }}
+                  >
+                    <div className="mb-2 flex items-center gap-2">
+                      <div
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full"
+                        style={isAgent ? { background: "linear-gradient(135deg, var(--brand-primary), var(--accent-light))" } : { background: "var(--ink-300)" }}
+                      >
+                        {isAgent ? <IconSparkles size={12} stroke={1.75} className="text-white" /> : <IconUser size={12} stroke={1.75} className="text-white" />}
+                      </div>
+                      <span className="text-[12px] font-medium text-[var(--foreground)]">{isAgent ? "Zyra" : t("you")}</span>
+                      <span className="ml-auto font-mono text-[11px] text-[var(--muted-soft)]">
+                        {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
+                      </span>
+                    </div>
+                    <p className="text-[12px] leading-relaxed text-[var(--muted)]">{activity.detail || activity.title}</p>
+                  </div>
+                );
+              })}
+              {feedbackActivities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noFeedback")}</p>}
+            </div>
+          )}
+
+          {activeTab === "sources" && (
+            <div className="flex flex-col gap-2.5">
+              {task.sources.map((source, index) => (
+                <div key={`${task.id}-source-${index}`} className="rounded-lg border border-[var(--border)] p-3.5">
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">{source.type.replaceAll("_", " ")}</span>
+                  <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{source.title}</h3>
+                  {isMarkdownSource(source.type) ? (
+                    <div
+                      className="zyra-prose zyra-prose-compact break-words mt-1 text-[12px] text-[var(--muted)]"
+                      dangerouslySetInnerHTML={{ __html: renderMarkdown(source.detail) }}
+                    />
+                  ) : (
+                    <p className="mt-1 whitespace-pre-wrap break-words text-[12px] text-[var(--muted)]">{source.detail}</p>
+                  )}
+                </div>
+              ))}
+              {task.sources.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noSources")}</p>}
+            </div>
+          )}
+
+          {activeTab === "activity" && (
+            <div className="flex flex-col gap-2.5">
+              {sortActivitiesNewestFirst(activities).map(({ activity, index }) => (
+                <div key={`${task.id}-activity-${index}`} data-testid="task-activity-entry" className="rounded-lg border border-[var(--border)] p-3.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--muted-soft)]">
+                      {activity.actor} · {(activity.stage || "").replaceAll("_", " ")}
+                    </span>
+                    <span className="font-mono text-[11px] text-[var(--muted-soft)]">
+                      {activity.createdAt ? formatDateTime(activity.createdAt, t.locale) : ""}
+                    </span>
+                  </div>
+                  <h3 className="mt-1 text-[13px] font-semibold text-[var(--foreground)]">{activity.title}</h3>
+                  <p className="mt-1 whitespace-pre-wrap text-[12px] text-[var(--muted)]">{activity.detail}</p>
+                </div>
+              ))}
+              {activities.length === 0 && <p className="text-sm text-[var(--muted)]">{t("task.noActivity")}</p>}
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex shrink-0 gap-2 border-t border-[var(--border)] p-4">
+          <Link
+            href={`/projects/${projectId}/agents/tasks/${task.id}`}
+            className="flex flex-1 items-center justify-center rounded-[6px] border border-[var(--border)] px-4 text-[13px] font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+            style={{ height: 34 }}
+          >
+            {t("task.viewFull")}
+          </Link>
+          {!done && (
+            <Button variant="secondary" style={{ height: 34 }} onClick={() => void handleCloseTask()} disabled={working}>
+              {working ? t("task.closing") : t("task.closeTask")}
+            </Button>
+          )}
+        </div>
+      </div>
+    </ZyraLanguageContext.Provider>,
+    document.body
+  );
+}

@@ -1,0 +1,4610 @@
+import { readStoredValue } from "./storage";
+import { EVIDENCE_MAX_FILES_PER_REQUEST } from "./validation";
+
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
+
+type RequestInitWithBody = Omit<RequestInit, "body"> & { body?: unknown };
+
+type ApiErrorBody = { error?: string; detail?: string; message?: string; errors?: { field?: string; message?: string }[] };
+
+/**
+ * A response with no `error`/`errors`/`message` body is never something the endpoint chose to say
+ * to a user — every hand-written throw in the backend sets one (see legacy.service.ts's
+ * BadRequestException({ error: ... }) calls). It means the request failed somewhere that never
+ * got a chance to phrase it for a person: a rate limiter, a proxy's 502/504, or an unhandled
+ * exception. Falling back to `String(status)` used to hand the caller a bare "500" or "429" as
+ * the entire message — this is the friendly sentence for that case, keyed off the status class.
+ */
+function genericStatusMessage(status: number): string {
+  if (status === 401) return "Your session has expired. Please sign in again.";
+  if (status === 403) return "You don't have permission to do this.";
+  if (status === 404) return "That could not be found. It may have been deleted or moved.";
+  if (status === 409) return "This couldn't be saved because it conflicts with a recent change. Refresh and try again.";
+  if (status === 429) return "Too many requests. Please wait a moment and try again.";
+  if (status >= 500) return "Something went wrong on our end. Please try again.";
+  return "Something went wrong. Please try again.";
+}
+
+function formatApiError(status: number, body: ApiErrorBody): string {
+  if (!body.error && body.errors?.length) {
+    return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
+  }
+  // custom-field-validation.ts (definition config checks — e.g. a multi-select's minSelected
+  // exceeding its maxSelected) throws a bare { field, message } object rather than { error }/
+  // { errors }, since it isn't wrapped by anything that reshapes it before it reaches the HTTP
+  // layer. Falling back to `message` here — instead of straight to the generic text — is what
+  // keeps that already-specific backend wording ("Minimum selections cannot be greater than
+  // maximum selections.") from being swallowed into "Something went wrong."
+  const msg = body.error || body.message || genericStatusMessage(status);
+  const detail = body.detail?.trim();
+  if (detail) return `${msg}: ${detail}`;
+  return msg;
+}
+
+function isNetworkFetchError(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : "Network request failed";
+  return (
+    // Recent Chrome appends the host — "Failed to fetch (api-app-stage.testpilot.io)" — so an exact
+    // match silently stopped recognising network errors and surfaced the raw TypeError text.
+    msg.startsWith("Failed to fetch") ||
+    msg === "Load failed" ||
+    msg.includes("NetworkError") ||
+    msg.includes("network")
+  );
+}
+
+// Only ever thrown by a `signal` an individual call opted into (e.g. AbortSignal.timeout(...) on
+// the integration Connect/Sync/Disconnect calls) — api() itself sets no default timeout, so this
+// never fires for a call that didn't ask for one.
+function isAbortError(e: unknown): boolean {
+  return e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+}
+
+async function fetchWithNetworkErrorMessage(
+  input: string,
+  init: RequestInit
+): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (e) {
+    if (isAbortError(e)) throw new Error("The request took too long. Please check your connection and try again.");
+    if (!isNetworkFetchError(e)) throw e instanceof Error ? e : new Error(String(e));
+    // A browser keep-alive connection left idle past the server/proxy's keep-alive window fails
+    // on the next write before any bytes reach the server — the request was never delivered, so
+    // retrying once (a fresh connection) is safe even for a POST body. `init.body` here is always
+    // an already-serialized JSON string (see `api()` below), never a one-shot stream, so it can be
+    // resent. This is what a manual page refresh already did to "fix" the error; automate that one
+    // retry instead of surfacing it.
+    try {
+      return await fetch(input, init);
+    } catch (e2) {
+      const msg = e2 instanceof Error ? e2.message : "Network request failed";
+      throw new Error(
+        `${msg} — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL, HTTPS, and that the backend allows this page’s origin in CORS_ALLOWED_ORIGINS.`
+      );
+    }
+  }
+}
+
+/**
+ * Collapses concurrent identical in-flight requests (e.g. two components mounting at once, each
+ * calling the same read) into one network call — every caller shares the same promise instead of
+ * each firing its own fetch. Purely an overlap-collapse, not a cache: the map entry is removed
+ * before the shared promise settles for any of its callers (the `.finally` below runs first), so a
+ * call issued after the in-flight one has already resolved always goes out fresh, never serving a
+ * stale value.
+ */
+const inFlightRequests = new Map<string, Promise<unknown>>();
+
+function dedupeInFlight<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const existing = inFlightRequests.get(key);
+  if (existing) return existing as Promise<T>;
+  const promise = run().finally(() => {
+    inFlightRequests.delete(key);
+  });
+  inFlightRequests.set(key, promise);
+  return promise;
+}
+
+export async function api<T = unknown>(
+  path: string,
+  options: RequestInitWithBody = {}
+): Promise<T> {
+  const method = (options.method ?? "GET").toString().toUpperCase();
+  // Scoped strictly to GET — two "identical" mutating calls are not guaranteed interchangeable, so
+  // dedup must never silently collapse a POST/PUT/PATCH/DELETE. Also skipped whenever the caller
+  // supplies its own AbortSignal (e.g. getIntegrationAuthUrl's 20s timeout): sharing one in-flight
+  // request across callers means only the FIRST caller's `options` — signal included — actually
+  // reaches fetch(), so a second caller's own cancellation/timeout would otherwise be silently
+  // dropped in favor of a different caller's. Every other GET in this file passes no signal, so this
+  // exclusion costs nothing for them.
+  if (method !== "GET" || options.signal) return apiRequest<T>(path, options);
+  return dedupeInFlight(`GET:${path}`, () => apiRequest<T>(path, options));
+}
+
+async function apiRequest<T = unknown>(path: string, options: RequestInitWithBody): Promise<T> {
+  const { body, ...rest } = options;
+  const headers: HeadersInit = {
+    "Content-Type": "application/json",
+    ...(rest.headers as Record<string, string>),
+  };
+  const res = await fetchWithNetworkErrorMessage(`${API_BASE}${path}`, {
+    ...rest,
+    headers,
+    credentials: "include",
+    ...(body !== undefined && { body: JSON.stringify(body) }),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorBody;
+    throw new Error(formatApiError(res.status, err));
+  }
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text.trim()) return undefined as T;
+  return JSON.parse(text) as T;
+}
+
+export async function authMe(): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+} | null> {
+  try {
+    return await api<{
+      userId: string;
+      email: string | null;
+      name: string | null;
+      firstName: string | null;
+      lastName: string | null;
+      mobileNumber: string | null;
+      profileComplete: boolean;
+      isPlatformAdmin?: boolean;
+      hasPassword?: boolean;
+    }>("/api/auth/me");
+  } catch {
+    return null;
+  }
+}
+
+export async function updateProfile(data: { firstName?: string; lastName?: string; mobileNumber?: string }): Promise<{
+  userId: string;
+  email: string | null;
+  name: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  mobileNumber: string | null;
+  profileComplete: boolean;
+  isPlatformAdmin?: boolean;
+  hasPassword?: boolean;
+}> {
+  return api("/api/auth/me", { method: "PATCH", body: data });
+}
+
+export async function completeProfile(data: { firstName: string; lastName: string; mobileNumber?: string }): Promise<void> {
+  await api("/api/auth/complete-profile", { method: "POST", body: data });
+}
+
+// --- Platform Admin APIs ---
+
+export type BrandingSettings = {
+  productName: string;
+  logoUrl: string;
+};
+
+export async function getBranding(): Promise<BrandingSettings> {
+  return api<BrandingSettings>("/api/branding");
+}
+
+export async function getAdminList() {
+  return api<
+    Array<{
+      id: string;
+      userId: string;
+      role: string;
+      email: string;
+      name: string | null;
+      avatarUrl: string | null;
+      createdAt: string;
+      grantedBy?: { email: string; name: string };
+    }>
+  >("/api/admin/admins");
+}
+
+export async function addPlatformAdmin(
+  email: string
+): Promise<{ id: string; userId: string; email: string; role: string }> {
+  return api("/api/admin/admins", { method: "POST", body: { email } });
+}
+
+export async function removePlatformAdmin(adminId: string): Promise<void> {
+  await api(`/api/admin/admins/${adminId}`, { method: "DELETE" });
+}
+
+export async function requestOtp(email: string): Promise<void> {
+  await api("/api/auth/otp/request", { method: "POST", body: { email } });
+}
+
+export async function getSetupStatus(): Promise<{ required: boolean }> {
+  return api<{ required: boolean }>("/api/setup/status");
+}
+
+export async function createFirstAdmin(data: {
+  email: string;
+  password: string;
+  orgName: string;
+  demoData: boolean;
+}): Promise<{ userId: string; organizationId: string; projectId: string }> {
+  return api("/api/setup/first-admin", { method: "POST", body: data });
+}
+
+export async function loginWithPassword(email: string, password: string): Promise<{ ok: boolean; userId: string }> {
+  return api("/api/auth/password/login", { method: "POST", body: { email, password } });
+}
+
+export async function verifyOtp(email: string, code: string): Promise<{ ok: boolean; userId: string }> {
+  return api("/api/auth/otp/verify", { method: "POST", body: { email, code } });
+}
+
+export async function requestPasswordReset(email: string): Promise<void> {
+  await api("/api/auth/password/forgot", { method: "POST", body: { email } });
+}
+
+export async function checkPasswordResetToken(token: string): Promise<{ valid: boolean }> {
+  return api(`/api/auth/password/reset/${encodeURIComponent(token)}`);
+}
+
+export async function resetPassword(token: string, password: string): Promise<{ ok: boolean }> {
+  return api("/api/auth/password/reset", { method: "POST", body: { token, password } });
+}
+
+export async function changePassword(currentPassword: string | null, newPassword: string): Promise<void> {
+  await api("/api/auth/password/change", {
+    method: "POST",
+    body: { currentPassword: currentPassword ?? undefined, newPassword }
+  });
+}
+
+export async function startSignup(data: {
+  firstName: string;
+  lastName: string;
+  mobileNumber?: string;
+  email: string;
+  password: string;
+}): Promise<void> {
+  await api("/api/auth/signup/start", { method: "POST", body: data });
+}
+
+export async function verifySignup(email: string, code: string): Promise<{ ok: boolean; userId: string }> {
+  return api("/api/auth/signup/verify", { method: "POST", body: { email, code } });
+}
+
+export async function startInviteRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string; password: string }
+): Promise<void> {
+  await api(`/api/invitations/${token}/register/start`, { method: "POST", body: data });
+}
+
+export async function verifyInviteRegistration(
+  token: string,
+  code: string
+): Promise<{ ok: boolean; userId: string; organizationId: string }> {
+  return api(`/api/invitations/${token}/register/verify`, { method: "POST", body: { code } });
+}
+
+export async function startInviteOtpRegistration(
+  token: string,
+  data: { firstName: string; lastName: string; mobileNumber?: string }
+): Promise<void> {
+  await api(`/api/invitations/${token}/register/otp/start`, { method: "POST", body: data });
+}
+
+export async function verifyInviteOtpRegistration(
+  token: string,
+  code: string
+): Promise<{ ok: boolean; userId: string; organizationId: string }> {
+  return api(`/api/invitations/${token}/register/otp/verify`, { method: "POST", body: { code } });
+}
+
+export async function logout(): Promise<void> {
+  await api("/api/auth/logout", { method: "POST" });
+}
+
+export interface OnboardingResponse {
+  organizationId: string;
+  projectId: string;
+  projectKey: string;
+}
+
+export interface CreateWorkspaceResponse {
+  organizationId: string;
+}
+
+export async function createWorkspace(data: {
+  orgName: string;
+  /** ISO 3166-1 alpha-2. Soft signal for currency detection at checkout. */
+  country?: string;
+}): Promise<CreateWorkspaceResponse> {
+  return api<CreateWorkspaceResponse>("/api/onboarding/workspace", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function createOrgAndProject(data: {
+  orgName: string;
+  projectKey: string;
+  projectName: string;
+  projectDescription?: string;
+}): Promise<OnboardingResponse> {
+  return api<OnboardingResponse>("/api/onboarding/org-and-project", {
+    method: "POST",
+    body: data,
+  });
+}
+
+// Workspace (organization) – team members at workspace level; project access is by allocation
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  slug: string;
+  plan?: "launch" | "pro";
+  role?: string;
+  /** Self-reported ISO 3166-1 alpha-2 country; null when never provided. */
+  country?: string | null;
+  /** IANA zone that plan/run due dates ("due today", "overdue") are judged in. */
+  timezone?: string;
+  createdAt: string;
+}
+
+export interface WorkspaceMember {
+  userId: string;
+  email: string;
+  name: string;
+  role: string;
+  joinedAt: string;
+}
+
+export type WorkspaceRole = "owner" | "manager" | "qa_engineer";
+
+export async function getWorkspace(): Promise<WorkspaceInfo> {
+  return api<WorkspaceInfo>("/api/workspace");
+}
+
+// Omit `country` / `timezone` to leave them untouched; pass "" to clear country.
+export async function updateWorkspace(data: { name: string; country?: string; timezone?: string }): Promise<WorkspaceInfo> {
+  return api<WorkspaceInfo>("/api/workspace", {
+    method: "PATCH",
+    body: data,
+  });
+}
+
+// Billing (TestPilot Cloud plans) — pricing is per workspace, not per seat.
+export type BillingInterval = "monthly" | "annual";
+
+export interface BillingInfo {
+  /** False when server has no STRIPE_SECRET_KEY — billing UI should hide. */
+  enabled: boolean;
+  plan: "launch" | "pro";
+  billingInterval: BillingInterval | null;
+  status: string | null;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  /** Set while a subscription invoice is unpaid — Stripe is still retrying. */
+  paymentFailedAt: string | null;
+  /** When Launch limits start applying after a downgrade. */
+  graceEndsAt: string | null;
+  /** Downgraded, but still holding Pro-sized limits until graceEndsAt. */
+  inGracePeriod: boolean;
+  /** Grace window closed — Launch limits are now enforced. */
+  limitsEnforced: boolean;
+}
+
+export async function getBillingInfo(): Promise<BillingInfo> {
+  return api<BillingInfo>("/api/billing");
+}
+
+export type BillingCurrency = "usd" | "inr";
+
+export interface BillingPricing {
+  currency: BillingCurrency;
+  monthlyAmount: number | null;
+  annualAmount: number | null;
+  /** Whether THIS visitor may choose INR — the server decides from the detected country. */
+  inrAvailable: boolean;
+  /** A past payment has fixed the currency in Stripe; it can no longer be changed. */
+  currencyLocked: boolean;
+}
+
+// `currency` states a preference only — the server independently decides whether it's allowed
+// (INR requires being detected in India) and rejects it otherwise. Omit for pure auto-detection.
+export async function getBillingPricing(currency?: BillingCurrency): Promise<BillingPricing> {
+  const query = currency ? `?currency=${currency}` : "";
+  return api<BillingPricing>(`/api/billing/pricing${query}`);
+}
+
+// Pulls subscription state straight from Stripe. Called after checkout redirects back so the
+// upgrade lands even if the webhook is late, dropped, or not configured.
+export async function reconcileBilling(): Promise<BillingInfo> {
+  return api<BillingInfo>("/api/billing/reconcile", { method: "POST" });
+}
+
+export interface BillingHistoryEntry {
+  /** Machine-readable event, e.g. billing_upgraded / billing_payment_failed. */
+  action: string;
+  summary: string;
+  detail: Record<string, unknown>;
+  at: string;
+}
+
+export async function getBillingHistory(): Promise<BillingHistoryEntry[]> {
+  return api<BillingHistoryEntry[]>("/api/billing/history");
+}
+
+export interface BillingInvoice {
+  id: string;
+  number: string | null;
+  status: string | null;
+  /** Minor units (paise / cents). */
+  amountPaid: number;
+  amountDue: number;
+  currency: string;
+  createdAt: string;
+  hostedInvoiceUrl: string | null;
+  invoicePdf: string | null;
+}
+
+export async function getBillingInvoices(): Promise<BillingInvoice[]> {
+  return api<BillingInvoice[]>("/api/billing/invoices");
+}
+
+export async function createCheckoutSession(interval: BillingInterval, currency?: BillingCurrency): Promise<{ url: string }> {
+  return api<{ url: string }>("/api/billing/checkout-session", {
+    method: "POST",
+    body: { interval, currency },
+  });
+}
+
+export async function createPortalSession(): Promise<{ url: string }> {
+  return api<{ url: string }>("/api/billing/portal-session", { method: "POST" });
+}
+
+export interface PlanUsageSummary {
+  plan: "launch" | "pro";
+  projectCount: number;
+  /** The limits actually in force — Pro-sized while a downgraded workspace is in its grace window. */
+  projectLimit: number | null;
+  storageUsedBytes: number;
+  storageLimitBytes: number;
+  inGracePeriod: boolean;
+  graceEndsAt: string | null;
+  /** Where to send someone who needs more room than their plan allows. */
+  supportContactEmail: string;
+}
+
+export async function getBillingUsage(): Promise<PlanUsageSummary> {
+  return api<PlanUsageSummary>("/api/billing/usage");
+}
+
+export interface WorkspaceListItem extends WorkspaceInfo {
+  isActive: boolean;
+}
+
+export async function listWorkspaces(): Promise<WorkspaceListItem[]> {
+  return api<WorkspaceListItem[]>("/api/workspaces");
+}
+
+export async function createAdditionalWorkspace(data: {
+  orgName: string;
+}): Promise<CreateWorkspaceResponse> {
+  return api<CreateWorkspaceResponse>("/api/workspaces", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function switchWorkspace(id: string): Promise<WorkspaceInfo> {
+  return api<WorkspaceInfo>(`/api/workspaces/${id}/switch`, {
+    method: "POST",
+  });
+}
+
+export interface WorkspaceAiKey {
+  id: string;
+  name: string;
+  provider: string;
+  defaultModel?: string;
+  baseUrl?: string | null;
+  authHeaderName?: string | null;
+  authScheme?: string | null;
+  active: boolean;
+  maskedKey: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface WorkspaceAiProjectAllocation {
+  projectId: string;
+  projectKey: string;
+  projectName: string;
+  workspaceAiKeyId: string;
+}
+
+export interface WorkspaceAiKeysResponse {
+  keys: WorkspaceAiKey[];
+  projects: WorkspaceAiProjectAllocation[];
+}
+
+export async function listWorkspaceAiKeys(): Promise<WorkspaceAiKeysResponse> {
+  return api<WorkspaceAiKeysResponse>("/api/workspace/ai-keys");
+}
+
+export async function createWorkspaceAiKey(data: {
+  name: string;
+  provider: string;
+  apiKey: string;
+  defaultModel?: string;
+  baseUrl?: string;
+  authHeaderName?: string;
+  authScheme?: string;
+}): Promise<WorkspaceAiKey> {
+  return api<WorkspaceAiKey>("/api/workspace/ai-keys", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function deleteWorkspaceAiKey(keyId: string): Promise<void> {
+  await api(`/api/workspace/ai-keys/${keyId}`, { method: "DELETE" });
+}
+
+export interface AiProviderOption {
+  id: string;
+  label: string;
+  wire: "openai" | "anthropic" | "azure";
+  /** Prefills the base-URL field; null means the provider's wire default is used. */
+  defaultBaseUrl: string | null;
+  requiresBaseUrl: boolean;
+  optionalApiKey: boolean;
+  defaultModel: string;
+}
+
+export async function listAiProviders(): Promise<{ providers: AiProviderOption[] }> {
+  return api<{ providers: AiProviderOption[] }>("/api/workspace/ai-providers");
+}
+
+export interface ProviderModelOption {
+  id: string;
+  displayName: string;
+}
+
+export interface ProviderModelsResponse {
+  models: ProviderModelOption[];
+  /** "live" when read from the provider, "fallback" when the curated list was used. */
+  source: "live" | "fallback";
+  /** Why the fallback was used; empty for "live". */
+  reason: string;
+}
+
+/** Lists the models a given key can actually reach. Never throws for provider-side
+ *  failures — it degrades to a curated list so the settings form stays usable. */
+export async function listProviderModels(data: {
+  provider: string;
+  apiKey?: string;
+  keyId?: string;
+  baseUrl?: string;
+  authHeaderName?: string;
+  authScheme?: string;
+}): Promise<ProviderModelsResponse> {
+  return api<ProviderModelsResponse>("/api/workspace/ai-keys/models", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function allocateWorkspaceAiKeyToProject(data: {
+  projectId: string;
+  workspaceAiKeyId?: string;
+}): Promise<void> {
+  await api("/api/workspace/ai-keys/allocations", {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function listWorkspaceMembers(): Promise<WorkspaceMember[]> {
+  return api<WorkspaceMember[]>("/api/workspace/members");
+}
+
+export async function addWorkspaceMember(data: { email?: string; userId?: string; role?: string }): Promise<void> {
+  await api("/api/workspace/members", { method: "POST", body: data });
+}
+
+export async function removeWorkspaceMember(userId: string): Promise<void> {
+  await api(`/api/workspace/members/${userId}`, { method: "DELETE" });
+}
+
+export async function changeWorkspaceMemberRole(userId: string, role: string): Promise<void> {
+  await api("/api/workspace/members/role", { method: "POST", body: { userId, role } });
+}
+
+export interface InviteProject {
+  id: string;
+  name: string;
+}
+
+export interface WorkspaceInvitation {
+  id: string;
+  email: string;
+  role: string;
+  status: "pending" | "accepted" | "expired" | "cancelled";
+  expiresAt: string;
+  createdAt: string;
+  invitedByName: string | null;
+  invitedByEmail: string | null;
+  projects: InviteProject[];
+}
+
+export async function listWorkspaceInvitations(): Promise<WorkspaceInvitation[]> {
+  return api<WorkspaceInvitation[]>("/api/workspace/invitations");
+}
+
+export async function createWorkspaceInvitation(data: {
+  email: string;
+  role?: string;
+  projectIds?: string[];
+}): Promise<WorkspaceInvitation> {
+  return api<WorkspaceInvitation>("/api/workspace/invitations", { method: "POST", body: data });
+}
+
+export async function cancelWorkspaceInvitation(invitationId: string): Promise<void> {
+  await api(`/api/workspace/invitations/${invitationId}`, { method: "DELETE" });
+}
+
+export async function resendWorkspaceInvitation(invitationId: string): Promise<void> {
+  await api(`/api/workspace/invitations/${invitationId}/resend`, { method: "POST" });
+}
+
+/** @deprecated use cancelWorkspaceInvitation */
+export async function revokeWorkspaceInvitation(invitationId: string): Promise<void> {
+  return cancelWorkspaceInvitation(invitationId);
+}
+
+export interface InviteDetails {
+  id: string;
+  organizationId: string | null;
+  organizationName: string | null;
+  email: string;
+  role: string;
+  status: "pending" | "accepted" | "expired" | "cancelled" | "declined";
+  expiresAt: string;
+  acceptedAt: string | null;
+  createdAt: string;
+  projects: InviteProject[];
+  hasAccount: boolean;
+}
+
+export async function getInvitationByToken(token: string): Promise<InviteDetails> {
+  return api<InviteDetails>(`/api/invitations/${token}`);
+}
+
+export async function acceptInvitation(token: string): Promise<{ accepted: boolean; organizationId: string | null }> {
+  return api<{ accepted: boolean; organizationId: string | null }>(`/api/invitations/${token}/accept`, {
+    method: "POST",
+  });
+}
+
+export async function declineInvitation(token: string): Promise<{ declined: boolean }> {
+  return api<{ declined: boolean }>(`/api/invitations/${token}/decline`, {
+    method: "POST",
+  });
+}
+
+export async function registerFromInvitation(
+  token: string,
+  data: { name: string; password: string }
+): Promise<{ userId: string; organizationId: string }> {
+  return api<{ userId: string; organizationId: string }>(`/api/invitations/${token}/register`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export interface WorkspaceProjectAccessMember {
+  userId: string;
+  email: string;
+  name: string;
+  workspaceRole: string;
+  projectRoles: Record<string, string>;
+}
+
+export interface WorkspaceProjectInfo {
+  id: string;
+  key: string;
+  name: string;
+}
+
+export interface WorkspaceProjectAccessMatrix {
+  projects: WorkspaceProjectInfo[];
+  members: WorkspaceProjectAccessMember[];
+}
+
+export async function getWorkspaceProjectAccess(): Promise<WorkspaceProjectAccessMatrix> {
+  return api<WorkspaceProjectAccessMatrix>("/api/workspace/project-access");
+}
+
+export async function setWorkspaceProjectAccess(data: { projectId: string; userId: string; role: string }): Promise<void> {
+  await api("/api/workspace/project-access", { method: "PUT", body: data });
+}
+
+export async function removeWorkspaceProjectAccess(data: { projectId: string; userId: string }): Promise<void> {
+  await api("/api/workspace/project-access", { method: "DELETE", body: data });
+}
+
+// Projects
+export type ProjectType = "testpilot";
+
+/** `color`/`glyph` null means "not overridden" — the card falls back to the generated placeholder. */
+export interface ProjectIcon {
+  color: string | null;
+  glyph: string | null;
+}
+
+export interface ProjectSummary {
+  id: string;
+  key: string;
+  name: string;
+  description: string;
+  projectType: ProjectType;
+  role: string;
+  createdAt: string;
+  icon: ProjectIcon | null;
+}
+
+export async function listProjects(): Promise<ProjectSummary[]> {
+  return api<ProjectSummary[]>("/api/projects");
+}
+
+// Raw columns from the `notifications` table (see migrations/V6_notifications.sql) — the backend
+// route returns rows as-is, unlike the camelCase DTOs above.
+export interface AppNotification {
+  id: string;
+  type: string;
+  title: string;
+  body: string | null;
+  link_entity_type: string | null;
+  link_entity_id: string | null;
+  read_at: string | null;
+  created_at: string;
+}
+
+export async function listNotifications(): Promise<AppNotification[]> {
+  return api<AppNotification[]>("/api/notifications");
+}
+
+export async function markAllNotificationsRead(): Promise<void> {
+  await api<unknown>("/api/notifications/read-all", { method: "POST" });
+}
+
+export async function markNotificationRead(id: string): Promise<void> {
+  return api<void>(`/api/notifications/${id}/read`, { method: "POST" });
+}
+
+/**
+ * Every projects-list card's stats in one response, replacing the five per-project calls the
+ * screen used to fan out (test cases, suites, activity, members, runs). See
+ * LegacyService.projectsOverview for why the fan-out had to go.
+ */
+export interface ProjectOverview extends ProjectSummary {
+  testCaseCount: number;
+  suiteCount: number;
+  teamMembers: { userId: string; name: string }[];
+  lastActivityAt: string | null;
+  status: "setup_required" | "configured" | "active";
+  runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
+  currentPassRate: number | null;
+}
+
+export async function listProjectsOverview(): Promise<ProjectOverview[]> {
+  return api<ProjectOverview[]>("/api/projects/overview");
+}
+
+export interface CreateProjectResponse {
+  id: string;
+  key: string;
+  name: string;
+  projectType: ProjectType;
+  createdAt: string;
+}
+
+export async function createProject(data: {
+  key?: string;
+  name: string;
+  description?: string;
+  projectType?: ProjectType;
+  icon?: { color?: string | null; glyph?: string | null } | null;
+}): Promise<CreateProjectResponse> {
+  return api<CreateProjectResponse>("/api/projects", { method: "POST", body: data });
+}
+
+export async function getProject(id: string): Promise<Record<string, unknown>> {
+  return api<Record<string, unknown>>(`/api/projects/${id}`);
+}
+
+export async function updateProject(
+  id: string,
+  data: {
+    name?: string;
+    description?: string;
+    settings?: string;
+    icon?: { color?: string | null; glyph?: string | null } | null;
+  }
+): Promise<void> {
+  await api(`/api/projects/${id}`, { method: "PATCH", body: data });
+}
+
+
+export async function deleteProject(id: string): Promise<void> {
+  await api(`/api/projects/${id}`, { method: "DELETE" });
+}
+
+export interface TestEnvironmentSetting {
+  name: string;
+  url: string;
+}
+
+/**
+ * The environments configured under project settings -> Test Environments, ready for a dropdown.
+ *
+ * `project.settings` arrives as a parsed object (jsonb column) from GET /api/projects/:id, but a
+ * JSON string is still tolerated. A parser that accepted only strings left the runs and test-plan
+ * dropdowns permanently empty. Entries missing a name or URL, and repeated names, are dropped.
+ */
+export function getTestRunEnvironments(settings: unknown): TestEnvironmentSetting[] {
+  let parsed: unknown = settings;
+  if (typeof settings === "string") {
+    try {
+      parsed = JSON.parse(settings);
+    } catch {
+      return [];
+    }
+  }
+  const raw = (parsed as { testRunEnvironments?: unknown } | null)?.testRunEnvironments;
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: TestEnvironmentSetting[] = [];
+  for (const item of raw) {
+    const candidate = (item ?? {}) as { name?: unknown; url?: unknown };
+    const name = typeof candidate.name === "string" ? candidate.name.trim() : "";
+    const url = typeof candidate.url === "string" ? candidate.url.trim() : "";
+    if (!name || !url || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, url });
+  }
+  return out;
+}
+
+export interface AiGeneratedDraft {
+  title: string;
+  preconditions: string;
+  stepsJson: string;
+  expectedSummary: string;
+  priority: string;
+  tags: string[];
+  /**
+   * Basecamp: "[Zyra] Severity and Component Are Missing in Generated Test Cases" — generated and
+   * persisted (normalizeAiDrafts/zyraBatchInsertTestCases) since before this field existed on this
+   * type; a draft from an older task can still lack it entirely, so treat absent the same as null.
+   */
+  severity?: string | null;
+  component?: string | null;
+  // The following are only ever present on a normalized update/archive entry (formatAiTask's
+  // server-side normalization of a non-create ai_generation_requests.generated_payload item — see
+  // ZYRA_IMPLEMENTATION_LOG.md). A plain task-board create draft never carries them.
+  action?: "proposed-create" | "proposed-update" | "proposed-archive" | string;
+  reason?: string;
+  externalId?: string;
+  /**
+   * The test-design technique(s) (ZYRA_TICKET_WORKFLOW.md §6/§8) that produced this case, already
+   * validated server-side against a fixed set (normalizeZyraTechniques) — never raw model output.
+   * Only ever present on a create-shaped draft (never update/archive, which don't go through
+   * generation). `["general"]` means no specific technique applied, not "uncategorized" — render
+   * accordingly (omit rather than show a meaningless badge). Absent entirely on an older draft
+   * from before this field existed.
+   */
+  techniques?: string[];
+}
+
+export interface GenerateAiTestCasesBody {
+  userStory: string;
+  acceptanceCriteria?: string;
+  prompt?: string;
+  style?: string;
+  count?: number;
+  provider?: "openai" | "anthropic";
+  model?: string;
+  includeHappyFlow?: boolean;
+  includeNegativeFlow?: boolean;
+  includeMultiTab?: boolean;
+  includeCrossBrowser?: boolean;
+  includeBoundary?: boolean;
+}
+
+export interface GenerateAiTestCasesResponse {
+  generationRequestId: string;
+  provider: "openai" | "anthropic";
+  drafts: AiGeneratedDraft[];
+  generatedCount: number;
+}
+
+export async function generateAiTestCases(
+  projectId: string,
+  data: GenerateAiTestCasesBody
+): Promise<GenerateAiTestCasesResponse> {
+  return api<GenerateAiTestCasesResponse>(`/api/projects/${projectId}/ai/generate-testcases`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export interface AiGenerationHistoryItem {
+  id: string;
+  // null for a system-initiated row (e.g. a scheduled sweep) — see
+  // V107_ai_generation_requests_system_actor.sql. Not rendered anywhere today; kept honest for
+  // whatever eventually reads it.
+  requestedBy: string | null;
+  provider: string;
+  model: string | null;
+  userStory: string;
+  acceptanceCriteria: string;
+  customPrompt: string;
+  style: string;
+  requestedCount: number;
+  includeHappyFlow: boolean;
+  includeNegativeFlow: boolean;
+  includeMultiTab: boolean;
+  includeCrossBrowser: boolean;
+  includeBoundary: boolean;
+  generatedCount: number;
+  generatedPayload: string;
+  savedCount: number;
+  saveEvents: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listAiGenerationHistory(
+  projectId: string,
+  params?: { limit?: number; offset?: number }
+): Promise<{ list: AiGenerationHistoryItem[] }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  const query = sp.toString();
+  return api<{ list: AiGenerationHistoryItem[] }>(
+    `/api/projects/${projectId}/ai/generation-history${query ? `?${query}` : ""}`
+  );
+}
+
+export async function trackAiGenerationSaved(
+  projectId: string,
+  requestId: string,
+  data: { suiteId?: string; testcaseIds: string[] }
+): Promise<void> {
+  await api(`/api/projects/${projectId}/ai/generation-history/${requestId}/save`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export interface ZyraTask {
+  id: string;
+  // "zyra_chat" for a chat-staged batch, "zyra_archive_sweep" for a sweep-staged one — not just
+  // "openai" | "anthropic" (real task-board generation calls), matching what the backend actually
+  // stores in ai_generation_requests.provider.
+  provider: "openai" | "anthropic" | "zyra_chat" | "zyra_archive_sweep" | string;
+  model: string | null;
+  userStory: string;
+  acceptanceCriteria: string;
+  customPrompt: string;
+  requestedCount: number;
+  generatedCount: number;
+  savedCount: number;
+  taskStatus: "todo" | "in_progress" | "in_review" | "failed" | "done" | string;
+  feedback: string;
+  context: string;
+  jiraIssueKeys: string[];
+  linearIssueKeys: string[];
+  /** Full Notion page ids (not the short display keys) queued as Zyra context. */
+  notionPageIds?: string[];
+  /** Display keys ("Notes 1") aligned with notionPageIds. */
+  notionPageKeys?: string[];
+  drafts: AiGeneratedDraft[];
+  sources: Array<{ type: string; title: string; detail: string }>;
+  activities: Array<{ actor: "user" | "agent" | string; stage: string; title: string; detail: string; createdAt: string; kind?: string }>;
+  tokenUsage: { input: number; output: number; total: number };
+  createdAt: string;
+  updatedAt: string;
+  /** "en" | "ru", set server-side from the script of what the user typed; drives the task view's UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: string;
+}
+
+export interface ZyraCapabilities {
+  generation: boolean;
+  knowledgeBase: boolean;
+  testcaseStorage: boolean;
+  suiteOperations: boolean;
+}
+
+export interface ZyraAgentState {
+  agent: {
+    name: string;
+    role: string;
+    active: boolean;
+    activationReason: string;
+    lastUsedAt: string | null;
+  };
+  settings: { testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities };
+  aiKey: {
+    id: string;
+    name: string;
+    provider: string;
+    defaultModel?: string | null;
+    baseUrl?: string | null;
+    authHeaderName?: string | null;
+    authScheme?: string | null;
+    maskedKey: string;
+  } | null;
+  tokenUsage: { total: number };
+  /**
+   * Test cases Zyra has created in this project, counted across chat mode AND task mode.
+   *
+   * Authoritative, and not derivable from `tasks`: a chat-staged batch that's still pending review
+   * (or was discarded without saving) has no rows in the live testcases table yet, so summing
+   * task.generatedCount over-counts drafts that were never actually saved.
+   */
+  testcasesCreated: number;
+  /**
+   * All-time SUM(saved_count)/SUM(generated_count) across every task-board run for this project
+   * (chat-created testcases and failed runs excluded — see zyraAgent() on the backend), not
+   * derived from `tasks` below, which is capped to the 50 most recently updated rows.
+   */
+  approvalRate: number | null;
+  tasks: ZyraTask[];
+}
+
+export interface ZyraChatTestcaseRow {
+  id?: string | null;
+  externalId?: string;
+  title: string;
+  priority?: string;
+  status?: string;
+  type?: string;
+  preconditions?: string;
+  expectedSummary?: string;
+  stepsJson?: unknown;
+  /**
+   * Absent (not "") on a row snapshotted onto a chat message before chatDraftRow carried it — the
+   * editor uses that difference to avoid overwriting a draft's real test data with a blank.
+   */
+  testData?: string;
+  /** See AiGeneratedDraft.severity/component — same fields, same server-side chatDraftRow/chatTestcaseRow normalization. */
+  severity?: string | null;
+  component?: string | null;
+  /**
+   * "proposed-create" | "proposed-update" | "proposed-archive" mark a row staged for review, not
+   * yet saved — see `draftIndex`/`reviewRequestId` below. Anything else (created/updated/archived/
+   * moved/suggested) is a row already reflected in the repository.
+   */
+  action?: string;
+  reason?: string;
+  /** Position of this row within its review request's drafts — only set on a "proposed-*" row. */
+  draftIndex?: number;
+  /** The ai_generation_requests id this proposal is staged under — only set on a "proposed-*" row. */
+  reviewRequestId?: string;
+  /**
+   * Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * generated case — resolved and verified server-side (see sanitizeZyraSourceRefs in
+   * legacy.service.ts), never a raw, unverified model claim. Always present, [] when the case was
+   * not grounded in any specific source.
+   */
+  sourceRefs?: ZyraSourceRef[];
+  /** See AiGeneratedDraft.techniques — same field, same server-side validation, same rendering rule. */
+  techniques?: string[];
+}
+
+export interface ZyraSourceRef {
+  type: "knowledge_document" | "knowledge_file" | "jira_ticket" | "testcase" | "bug";
+  id: string;
+  title: string;
+}
+
+/**
+ * Known `ZyraChatMessage.status` values relevant to the Continue affordance. The backend can still
+ * send other values (e.g. "sent", "completed") — `status` stays `string` below so an unrecognized one
+ * degrades to "no Continue button" rather than a type error.
+ */
+export const ZYRA_MESSAGE_TIMED_OUT = "timed_out";
+/** Set while a Continue resume is running in the background — see continueZyraChatMessage. */
+export const ZYRA_MESSAGE_RESUMING = "resuming";
+/** How many consecutive timeouts a resume chain tolerates before Continue requires `narrow: true`. */
+export const ZYRA_RESUME_ATTEMPT_CAP = 2;
+
+export interface ZyraChatMessage {
+  id: string;
+  sessionId: string;
+  projectId: string;
+  userId: string | null;
+  role: "user" | "assistant" | string;
+  content: string;
+  reasoningSummary: string | null;
+  actionType: string | null;
+  status: string;
+  testcases: ZyraChatTestcaseRow[];
+  activity: Array<{ actor?: string; title?: string; detail?: string; createdAt?: string }>;
+  createdAt: string;
+  /** Set when this message proposed create/update/archive operations awaiting review/Save. */
+  reviewRequestId?: string | null;
+  /** How many consecutive resume attempts this message's chain has already burned through. */
+  resumeAttempt: number;
+  /**
+   * What Zyra actually did for this request — see zyra-turn-trace.ts on the backend. On a user
+   * message it is that request's trace (written step by step while it runs); on an assistant
+   * message only when the reply answers no user message of its own (a plan batch, a resumed turn).
+   */
+  trace?: ZyraTurnTrace | null;
+  /** A question Zyra asked with clickable answers — answered by sending `choice` with the next message. */
+  options?: ZyraChatOptions | null;
+}
+
+/**
+ * Clickable answers to a question on an assistant message. `ticket_scope` asks how to handle a
+ * request spanning many tickets; `ticket_group` offers tickets a group at a time, each choice carrying
+ * the request it sends (`message`). `answeredId` is the choice already acted on.
+ */
+export interface ZyraChatOptions {
+  kind: "ticket_scope" | "ticket_group" | string;
+  choices: Array<{ id: string; label: string; description?: string; message?: string }>;
+  answeredId: string | null;
+}
+
+export type ZyraTraceStepStatus = "active" | "ok" | "empty" | "skipped" | "blocked" | "failed" | "timed_out";
+export type ZyraTraceOutcome = "running" | "completed" | "completed_with_errors" | "timed_out" | "failed";
+
+export interface ZyraTraceStep {
+  stage: string;
+  attempt: number;
+  status: ZyraTraceStepStatus;
+  meta?: Record<string, unknown>;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface ZyraTurnTrace {
+  version: 1;
+  outcome: ZyraTraceOutcome;
+  startedAt: string;
+  endedAt: string | null;
+  steps: ZyraTraceStep[];
+}
+
+export interface ZyraChatActivePlan {
+  planId: string;
+  status: "running" | "paused";
+  remainingScenarios: string[];
+  batchSize: number;
+  doneCount: number;
+  totalCount: number;
+  /** Scenarios that have a test case — what progress shows. doneCount is the batch cursor, which grows with retries. Absent on plans started before it existed. */
+  coveredCount?: number;
+  /** Tickets planned so far, of the synced tickets in scope — only on plans that walk tickets. */
+  ticketsDone?: number;
+  ticketsSynced?: number;
+}
+
+export interface ZyraChatSession {
+  id: string;
+  projectId: string;
+  userId: string | null;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messages?: ZyraChatMessage[];
+  activePlan?: ZyraChatActivePlan | null;
+  /** Only present on list responses; absent (falsy) on a session just returned from create/get. */
+  hasMessages?: boolean;
+  /** Set server-side from the script of what the user typed; drives the chat UI language (lib/zyra-i18n.ts). Missing/unknown renders as English. */
+  language?: "en" | "ru" | string;
+}
+
+export async function getZyraAgent(projectId: string): Promise<ZyraAgentState> {
+  return api<ZyraAgentState>(`/api/projects/${projectId}/agents/zyra`);
+}
+
+export interface NyraProject {
+  id: string;
+  name: string;
+  appUrl: string | null;
+  hasTestAccount: boolean;
+  username: string | null;
+  loginMethod: string | null;
+  createdAt: string | null;
+}
+
+export interface NyraCreateInput {
+  name: string;
+  appUrl: string;
+  testAccount?: { loginUrl?: string; username?: string; loginMethod?: "password"; password?: string };
+}
+
+export async function getNyraAgent(projectId: string): Promise<{ configured: boolean }> {
+  return api(`/api/projects/${projectId}/agents/nyra`);
+}
+
+export async function listNyraProjects(projectId: string): Promise<{ list: NyraProject[] }> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`);
+}
+
+export async function createNyraProject(projectId: string, data: NyraCreateInput): Promise<NyraProject> {
+  return api(`/api/projects/${projectId}/agents/nyra/projects`, { method: "POST", body: data });
+}
+
+export async function testZyraAiConnection(projectId: string): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
+  return api(`/api/projects/${projectId}/agents/zyra/test`);
+}
+
+export async function updateZyraSettings(
+  projectId: string,
+  data: { testcaseRange?: string; capabilities?: Partial<ZyraCapabilities> }
+): Promise<{ testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities }> {
+  return api<{ testcaseCount: number; testcaseRange: string; capabilities: ZyraCapabilities }>(`/api/projects/${projectId}/agents/zyra/settings`, {
+    method: "PATCH",
+    body: data,
+  });
+}
+
+export async function listZyraChatSessions(projectId: string): Promise<{ list: ZyraChatSession[] }> {
+  return api<{ list: ZyraChatSession[] }>(`/api/projects/${projectId}/agents/zyra/chat/sessions`);
+}
+
+export async function createZyraChatSession(projectId: string, data: { title?: string } = {}): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function getZyraChatSession(projectId: string, sessionId: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`);
+}
+
+export async function renameZyraChatSession(projectId: string, sessionId: string, title: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: { title },
+  });
+}
+
+export async function deleteZyraChatSession(projectId: string, sessionId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}`, { method: "DELETE" });
+}
+
+/**
+ * `opts.turnId`, if supplied, lets an already-open (or about-to-open) `GET .../turns/:turnId/events`
+ * SSE stream narrate this same request while it runs — see openZyraTurnProgress. Purely additive:
+ * the backend route has accepted this since the SSE service was built, this is just the first
+ * caller to actually send one. Omitting it reproduces today's behavior exactly.
+ */
+export async function sendZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  message: string,
+  opts: { turnId?: string } = {}
+): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: { message, turnId: opts.turnId },
+  });
+}
+
+/** User-message status while its background turn (startZyraChatMessage) is still running. */
+export const ZYRA_MESSAGE_PROCESSING = "processing";
+/** User-message status when its background turn failed before posting a reply. */
+export const ZYRA_MESSAGE_FAILED = "failed";
+
+/**
+ * Background form of sendZyraChatMessage — what the chat page uses. Resolves as soon as the server
+ * has recorded the message; the turn itself keeps running server-side. A turn can take minutes, and
+ * a request held open that long is cut off by Cloudflare at 100 s ("Failed to fetch") even though the
+ * backend goes on to save the reply. Watch completion by polling getZyraChatSession until the user
+ * message `userMessageId` leaves ZYRA_MESSAGE_PROCESSING (`opts.turnId`'s SSE stream is a bonus).
+ */
+export async function startZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  message: string,
+  opts: { turnId?: string; choice?: { messageId: string; optionId: string } } = {}
+): Promise<{ accepted: true; userMessageId: string; session: ZyraChatSession }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    body: { message, turnId: opts.turnId, background: true, ...(opts.choice ? { choice: opts.choice } : {}) },
+  });
+}
+
+/**
+ * Resumes a turn whose provider call timed out (message.status === ZYRA_MESSAGE_TIMED_OUT) — picks
+ * the SAME turn back up server-side (skipping the routing call if it had already resolved a
+ * suite/count before generation stalled) rather than re-sending the user's message from scratch.
+ *
+ * Fire-and-forget: this resolves quickly with `accepted` telling the caller whether ITS click is
+ * the one driving the resume (`true`) or someone else already claimed it (`false`, e.g. a
+ * double-click or another tab) — either way `session` already reflects current reality (the
+ * target message's `status` is `resuming`/`resumed`/`expired`), so the caller should render from
+ * that rather than from any local "did I click it" state. The actual resume can take minutes;
+ * poll `getZyraChatSession` (or watch `opts.turnId`'s SSE progress stream, if provided) for the
+ * eventual `completed`/`timed_out` outcome instead of awaiting it here.
+ *
+ * `opts.narrow: true` resumes at a smaller batch (`ZYRA_RETRY_BATCH`, 5) instead of the turn's
+ * original size — required once `resumeAttempt >= ZYRA_RESUME_ATTEMPT_CAP`, otherwise the request
+ * is rejected with `code: "zyra_resume_cap_exceeded"`.
+ */
+export async function continueZyraChatMessage(
+  projectId: string,
+  sessionId: string,
+  messageId: string,
+  opts: { turnId?: string; narrow?: boolean } = {}
+): Promise<{ session: ZyraChatSession; accepted: boolean }> {
+  return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages/${messageId}/continue`, {
+    method: "POST",
+    body: { turnId: opts.turnId, narrow: opts.narrow },
+  });
+}
+
+export type ZyraTurnProgressEvent =
+  | { kind: "stage"; stage: string; meta?: Record<string, unknown> }
+  /** Merges `meta` into the latest step named `stage` ("*" = the open one). */
+  | { kind: "update"; stage: string; meta?: Record<string, unknown> }
+  /** A test case staged into the turn's review batch the moment the model finished it. */
+  | { kind: "draft"; meta?: { reviewRequestId?: string; row?: ZyraChatTestcaseRow; staged?: number; total?: number } }
+  | { kind: "complete"; payload: unknown }
+  | { kind: "error"; message: string }
+  | { kind: "unknown" };
+
+/**
+ * Live events of a session's background plan batches (openZyraPlanEvents): a batch's review panel
+ * appearing (its message is posted with its first draft), each test case staged into it, the batch
+ * finishing. Best-effort, like the turn stream — the session itself stays the source of truth.
+ */
+export type ZyraPlanEvent =
+  | { kind: "batchStarted"; reviewRequestId: string }
+  | { kind: "draft"; reviewRequestId: string; row: ZyraChatTestcaseRow; staged: number; total: number }
+  | { kind: "batch"; reviewRequestId?: string | null }
+  | { kind: "ping" }
+  | { kind: "unknown" };
+
+export function openZyraPlanEvents(projectId: string, sessionId: string): EventSource {
+  return new EventSource(`${API_BASE}/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/plan/events`, { withCredentials: true });
+}
+
+/**
+ * Best-effort live narration for one turn ("routing…", "generating…") — a pure enhancement over
+ * an already-running request (send or continue) that supplied this same `turnId`. Never the source
+ * of truth: the caller must still poll/re-fetch the session for the actual result, since this
+ * stream can legitimately say nothing (feature flag off, the turn already finished, a network
+ * blip) without that meaning anything went wrong. `withCredentials` is required — this is a
+ * cross-origin request to API_BASE, and a plain EventSource does not send the session cookie
+ * cross-origin without it.
+ */
+export function openZyraTurnProgress(projectId: string, sessionId: string, turnId: string): EventSource {
+  return new EventSource(
+    `${API_BASE}/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/turns/${turnId}/events`,
+    { withCredentials: true }
+  );
+}
+
+export async function stopZyraChatPlan(projectId: string, sessionId: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/stop-plan`, {
+    method: "POST",
+  });
+}
+
+export async function resumeZyraChatPlan(projectId: string, sessionId: string): Promise<ZyraChatSession> {
+  return api<ZyraChatSession>(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/resume-plan`, {
+    method: "POST",
+  });
+}
+
+export async function createZyraTask(
+  projectId: string,
+  data: {
+    story: string;
+    context?: string;
+    acceptanceCriteria?: string;
+    jiraIssueKeys?: string[];
+    linearIssueKeys?: string[];
+    notionPageIds?: string[];
+    knowledgeItemIds?: string[];
+    count?: number;
+  }
+): Promise<GenerateAiTestCasesResponse & { task: ZyraTask; tokenUsage: { input: number; output: number; total: number } }> {
+  return api(`/api/projects/${projectId}/agents/zyra/tasks`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function getZyraTask(projectId: string, taskId: string): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}`);
+}
+
+export async function sendZyraFeedback(
+  projectId: string,
+  taskId: string,
+  data: string | { feedback: string; referenceNote?: string; jiraIssueKeys?: string[]; linearIssueKeys?: string[]; notionPageIds?: string[] }
+): Promise<GenerateAiTestCasesResponse & { task: ZyraTask; tokenUsage: { input: number; output: number; total: number } }> {
+  return api(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/feedback`, {
+    method: "POST",
+    body: typeof data === "string" ? { feedback: data } : data,
+  });
+}
+
+export async function deleteZyraTaskDraft(projectId: string, taskId: string, draftIndex: number): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/drafts/${draftIndex}`, {
+    method: "DELETE",
+  });
+}
+
+/** Edit one pending draft's fields before Save — the review step's inline-edit action. */
+export async function editZyraTaskDraft(
+  projectId: string,
+  taskId: string,
+  draftIndex: number,
+  fields: Record<string, unknown>
+): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/drafts/${draftIndex}`, {
+    method: "PATCH",
+    body: fields,
+  });
+}
+
+export async function closeZyraTask(projectId: string, taskId: string): Promise<ZyraTask> {
+  return api<ZyraTask>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/close`, {
+    method: "POST",
+  });
+}
+
+/** One ticket comment a Zyra save produced (integration_ticket_comments). */
+export interface ZyraTicketComment {
+  id: string;
+  provider: "jira" | "linear" | "notion";
+  issueKey: string;
+  status: "pending" | "posted" | "failed" | "skipped_disabled" | "skipped_not_connected";
+  reason: string | null;
+  testcaseCount: number;
+  postedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listZyraTaskTicketComments(projectId: string, taskId: string): Promise<ZyraTicketComment[]> {
+  const res = await api<{ list: ZyraTicketComment[] }>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments`);
+  return res.list || [];
+}
+
+/** Re-sends a failed ticket comment; resolves with its outcome (posted, or failed with the reason). */
+export async function retryZyraTicketComment(projectId: string, taskId: string, commentId: string): Promise<ZyraTicketComment> {
+  return api<ZyraTicketComment>(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/ticket-comments/${commentId}/retry`, {
+    method: "POST",
+  });
+}
+
+export async function saveZyraTask(
+  projectId: string,
+  taskId: string,
+  data: { selectedDraftIndexes: number[]; suiteId?: string; suiteName?: string }
+): Promise<{
+  savedCount: number;
+  suiteId: string | null;
+  testcases: { id: string; externalId: string; title: string; createdAt: string }[];
+  /** Chat-staged batches only: drafts left un-saved by a partial selection, still pending review. */
+  remaining?: number;
+}> {
+  return api(`/api/projects/${projectId}/agents/zyra/tasks/${taskId}/save`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function listProjectMembers(projectId: string): Promise<{ userId: string; email: string; name: string; role: string; joinedAt: string }[]> {
+  return api(`/api/projects/${projectId}/members`);
+}
+
+export async function addProjectMember(projectId: string, data: { userId: string; role: string }): Promise<void> {
+  await api(`/api/projects/${projectId}/members`, { method: "POST", body: data });
+}
+
+export async function removeProjectMember(projectId: string, userId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/members/${userId}`, { method: "DELETE" });
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  scopes: string[];
+  tokenPrefix: string;
+  lastUsedAt: string | null;
+  createdAt: string;
+  /** Null only for a token that predates expiry; new tokens always carry one. */
+  expiresAt: string | null;
+}
+export interface ApiTokenWithSecret extends ApiToken {
+  token: string;
+}
+
+export async function listApiKeys(projectId: string): Promise<ApiToken[]> {
+  return api<ApiToken[]>(`/api/projects/${projectId}/apikeys`);
+}
+
+export async function createApiKey(
+  projectId: string,
+  data: { name: string; scopes?: string[]; expiresInDays?: number }
+): Promise<ApiTokenWithSecret> {
+  return api<ApiTokenWithSecret>(`/api/projects/${projectId}/apikeys`, { method: "POST", body: data });
+}
+
+export async function revokeApiKey(projectId: string, keyId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/apikeys/${keyId}`, { method: "DELETE" });
+}
+
+export function getMcpUrl(projectId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/mcp`;
+}
+
+// Suites
+
+/** Sentinel `suiteId` filter value meaning "test cases with no suite assigned". Matches the backend's UNASSIGNED_SUITE_ID. */
+export const UNASSIGNED_SUITE_ID = "none";
+
+export interface SuiteNode {
+  id: string;
+  parentId: string | null;
+  name: string;
+  /** Free text shown on the suite; "" when none. */
+  description: string;
+  /** What must be true before running the suite's cases; "" when none. */
+  preconditions: string;
+  position: number;
+  createdAt: string;
+  /** Direct children of this suite only. For the tree badge / rollup math, use recursiveTestCaseCount instead. */
+  testCaseCount: number;
+  /** This suite's own test cases plus every descendant suite's, at any depth. */
+  recursiveTestCaseCount: number;
+}
+
+export async function listSuites(projectId: string): Promise<SuiteNode[]> {
+  return api<SuiteNode[]>(`/api/projects/${projectId}/suites`);
+}
+
+export async function createSuite(
+  projectId: string,
+  data: { name: string; description?: string; preconditions?: string; parentId?: string; position?: number },
+): Promise<SuiteNode> {
+  return api<SuiteNode>(`/api/projects/${projectId}/suites`, { method: "POST", body: data });
+}
+
+/** parentId: the backend writes it verbatim (no COALESCE), so always send the current parent (or null for root) with any edit that should not move the suite. */
+export async function updateSuite(
+  suiteId: string,
+  data: { name?: string; description?: string; preconditions?: string; parentId?: string | null; position?: number },
+): Promise<void> {
+  await api(`/api/suites/${suiteId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteSuite(suiteId: string, mode: "deleteTestcases" | "moveToDefault" = "moveToDefault"): Promise<void> {
+  await api(`/api/suites/${suiteId}?mode=${mode}`, { method: "DELETE" });
+}
+
+// Test cases
+export interface TestCaseListItem {
+  id: string;
+  externalId: string;
+  title: string;
+  priority: string;
+  type: string;
+  automationStatus: string;
+  automationTags?: string;
+  status: string;
+  suiteId: string | null;
+  ownerId: string | null;
+  updatedAt: string;
+  jiraIssueKey?: string | null;
+  jiraUrl?: string | null;
+  linearIssueKey?: string | null;
+  linearUrl?: string | null;
+  /** Full Notion page id (not the short `notion:xxxxxxxx` display key) — how a case links to a page. */
+  notionPageId?: string | null;
+  notionUrl?: string | null;
+  severity?: string | null;
+  component?: string | null;
+  customFieldValues?: Record<string, unknown>;
+  /** Which knowledge-base doc/file, Jira ticket, existing test case, or bug actually informed this
+   * case when Zyra generated it — see ZyraSourceRef. Empty/absent for every manually-created,
+   * imported, or duplicated case, since only Zyra ever populates this. */
+  sourceRefs?: ZyraSourceRef[];
+  /** The project custom tags assigned to this case, sorted by name. */
+  customTags?: { id: string; name: string }[];
+}
+
+export async function listTestCases(
+  projectId: string,
+  params?: {
+    limit?: number;
+    offset?: number;
+    suiteId?: string;
+    /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+    includeDescendants?: boolean;
+    status?: string;
+    priority?: string;
+    type?: string;
+    automationStatus?: string;
+    jiraIssueKey?: string;
+    linearIssueKey?: string;
+    notionPageId?: string;
+    search?: string;
+    /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
+    customFieldFilters?: string;
+    /** Custom tag ids — a case matches when it carries any one of them. */
+    customTagIds?: string[];
+    /** Repository table column sort. Omitted (the default) keeps the server's creation-order default. */
+    sortBy?: "id" | "title" | "priority";
+    sortDir?: "asc" | "desc";
+  }
+): Promise<{ list: TestCaseListItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.suiteId) sp.set("suiteId", params.suiteId);
+  if (params?.includeDescendants) sp.set("includeDescendants", "true");
+  if (params?.status) sp.set("status", params.status);
+  if (params?.priority) sp.set("priority", params.priority);
+  if (params?.type) sp.set("type", params.type);
+  if (params?.automationStatus) sp.set("automationStatus", params.automationStatus);
+  if (params?.jiraIssueKey) sp.set("jiraIssueKey", params.jiraIssueKey);
+  if (params?.linearIssueKey) sp.set("linearIssueKey", params.linearIssueKey);
+  if (params?.notionPageId) sp.set("notionPageId", params.notionPageId);
+  if (params?.search) sp.set("search", params.search);
+  if (params?.customFieldFilters) sp.set("customFieldFilters", params.customFieldFilters);
+  if (params?.customTagIds?.length) sp.set("customTagIds", params.customTagIds.join(","));
+  if (params?.sortBy) sp.set("sortBy", params.sortBy);
+  if (params?.sortDir) sp.set("sortDir", params.sortDir);
+  const path = `/api/projects/${projectId}/testcases?${sp}`;
+  // This function hand-rolls its own fetch (X-Total-Count header, a different error shape) instead
+  // of going through api() above, so it needs its own dedupeInFlight call to get the same
+  // overlap-collapse — the single-request-heaviest read in the app (suite clicks, filter/page
+  // changes, and selectAllMatchingCases' own loop) and the one bypass worth retrofitting.
+  return dedupeInFlight(`GET:${path}`, async () => {
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000"}${path}`, { credentials: "include" });
+    const list = await res.json();
+    if (!res.ok) {
+      const err = (list as { error?: string }).error || res.statusText;
+      throw new Error(err || String(res.status));
+    }
+    const normalizedList = Array.isArray(list) ? list : [];
+    const totalHeader = res.headers.get("X-Total-Count");
+    let total = totalHeader != null ? parseInt(totalHeader, 10) : normalizedList.length;
+    if (Number.isNaN(total)) {
+      total = normalizedList.length;
+    }
+    return { list: normalizedList, total };
+  });
+}
+
+export async function getTestCase(projectId: string, testcaseId: string): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}`);
+}
+
+export async function createTestCase(projectId: string, data: Record<string, unknown>): Promise<{ id: string; externalId: string; title: string; createdAt: string }> {
+  return api(`/api/projects/${projectId}/testcases`, { method: "POST", body: data });
+}
+
+// Server-side batch creation, used by import. Keep batches at or under the backend's
+// MAX_BULK_TESTCASES (500) — larger sheets should be sent as several calls.
+export const BULK_CREATE_BATCH_SIZE = 200;
+
+export async function bulkCreateTestCases(
+  projectId: string,
+  data: { testcases: Record<string, unknown>[]; testcaseIdPrefix?: string }
+): Promise<{ created: { id: string; externalId: string; title: string }[]; createdCount: number }> {
+  return api(`/api/projects/${projectId}/testcases/bulk-create`, { method: "POST", body: data });
+}
+
+export async function updateTestCase(projectId: string, testcaseId: string, data: Record<string, unknown>): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/${testcaseId}`, { method: "PUT", body: data });
+}
+
+export async function deleteTestCase(projectId: string, testcaseId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/${testcaseId}`, { method: "DELETE" });
+}
+
+export async function duplicateTestCase(projectId: string, testcaseId: string): Promise<{ id: string; externalId: string; title: string }> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/duplicate`, { method: "POST" });
+}
+
+export async function bulkUpdateTestCases(projectId: string, data: { testcaseIds: string[]; priority?: string; suiteId?: string; status?: string; ownerId?: string; automationStatus?: string; severity?: string }): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/bulk-update`, { method: "POST", body: data });
+}
+
+export async function bulkDeleteTestCases(projectId: string, data: { testcaseIds: string[] }): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/bulk-delete`, { method: "POST", body: data });
+}
+
+// Custom fields (Pro plan feature) ------------------------------------------------
+
+export type CustomFieldType = "text" | "long_text" | "boolean" | "single_select" | "multi_select" | "number" | "date";
+export type CustomFieldStatus = "active" | "inactive" | "archived";
+
+export interface CustomFieldOption {
+  id: string;
+  label: string;
+  active: boolean;
+  order: number;
+}
+
+export interface CustomFieldConfig {
+  placeholder?: string | null;
+  maxLength?: number | null;
+  displayFormat?: "yes_no" | "true_false";
+  options?: CustomFieldOption[];
+  defaultOptionId?: string | null;
+  defaultOptionIds?: string[];
+  minSelected?: number | null;
+  maxSelected?: number | null;
+  min?: number | null;
+  max?: number | null;
+  decimalsAllowed?: boolean;
+  unit?: string | null;
+  allowPastDates?: boolean;
+  allowFutureDates?: boolean;
+  defaultValue?: unknown;
+}
+
+export interface CustomFieldDefinition {
+  id: string;
+  projectId: string;
+  key: string;
+  name: string;
+  description: string | null;
+  fieldType: CustomFieldType;
+  status: CustomFieldStatus;
+  required: boolean;
+  displayOrder: number;
+  config: CustomFieldConfig;
+  isUsed: boolean;
+  createdBy: string | null;
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CustomFieldValue {
+  id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  fieldType: CustomFieldType;
+  status: CustomFieldStatus;
+  required: boolean;
+  displayOrder: number;
+  config: CustomFieldConfig;
+  value: unknown;
+}
+
+export type CustomFieldFilterOperator =
+  | "contains"
+  | "does_not_contain"
+  | "equals"
+  | "is_empty"
+  | "is_not_empty"
+  | "is"
+  | "is_not"
+  | "includes_any"
+  | "includes_all"
+  | "yes"
+  | "no"
+  | "greater_than"
+  | "less_than"
+  | "between"
+  | "before"
+  | "after"
+  | "on"
+  | "is_overdue";
+
+export interface CustomFieldFilterCondition {
+  definitionId: string;
+  operator: CustomFieldFilterOperator;
+  value?: unknown;
+  valueTo?: unknown;
+}
+
+export function buildCustomFieldFiltersQueryParam(conditions: CustomFieldFilterCondition[]): string | undefined {
+  return conditions.length ? JSON.stringify(conditions) : undefined;
+}
+
+export async function listCustomFieldDefinitions(
+  projectId: string,
+  opts?: { statuses?: CustomFieldStatus[] }
+): Promise<CustomFieldDefinition[]> {
+  const qs = opts?.statuses?.length ? `?status=${opts.statuses.join(",")}` : "";
+  return api<CustomFieldDefinition[]>(`/api/projects/${projectId}/custom-fields/definitions${qs}`);
+}
+
+export async function getCustomFieldDefinition(projectId: string, definitionId: string): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}`);
+}
+
+export async function createCustomFieldDefinition(
+  projectId: string,
+  data: {
+    name: string;
+    description?: string | null;
+    fieldType: CustomFieldType;
+    required?: boolean;
+    active?: boolean;
+    config?: CustomFieldConfig;
+  }
+): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions`, { method: "POST", body: data });
+}
+
+export async function updateCustomFieldDefinition(
+  projectId: string,
+  definitionId: string,
+  data: Partial<{ name: string; description: string | null; required: boolean; config: CustomFieldConfig }>
+): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}`, { method: "PATCH", body: data });
+}
+
+export async function reorderCustomFieldDefinitions(projectId: string, orderedIds: string[]): Promise<void> {
+  await api(`/api/projects/${projectId}/custom-fields/definitions/reorder`, { method: "POST", body: { orderedIds } });
+}
+
+export async function setCustomFieldDefinitionStatus(
+  projectId: string,
+  definitionId: string,
+  status: CustomFieldStatus
+): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/status`, {
+    method: "PATCH",
+    body: { status }
+  });
+}
+
+export async function deleteCustomFieldDefinition(projectId: string, definitionId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}`, { method: "DELETE" });
+}
+
+export async function restoreCustomFieldDefinition(projectId: string, definitionId: string): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/restore`, { method: "POST" });
+}
+
+export async function addCustomFieldOption(projectId: string, definitionId: string, label: string): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/options`, {
+    method: "POST",
+    body: { label }
+  });
+}
+
+export async function setCustomFieldOptionActive(
+  projectId: string,
+  definitionId: string,
+  optionId: string,
+  active: boolean
+): Promise<CustomFieldDefinition> {
+  return api<CustomFieldDefinition>(`/api/projects/${projectId}/custom-fields/definitions/${definitionId}/options/${optionId}`, {
+    method: "PATCH",
+    body: { active }
+  });
+}
+
+export async function getCustomFieldValues(projectId: string, testcaseId: string): Promise<CustomFieldValue[]> {
+  return api<CustomFieldValue[]>(`/api/projects/${projectId}/testcases/${testcaseId}/custom-field-values`);
+}
+
+/** custom_tags.name is VARCHAR(40). */
+export const CUSTOM_TAG_NAME_MAX_LENGTH = 40;
+
+export interface CustomTag {
+  id: string;
+  projectId: string;
+  name: string;
+  createdAt: string;
+}
+
+export async function listCustomTags(projectId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/custom-tags`);
+}
+
+export async function createCustomTag(projectId: string, data: { name: string }): Promise<CustomTag> {
+  return api<CustomTag>(`/api/projects/${projectId}/custom-tags`, { method: "POST", body: data });
+}
+
+export async function updateCustomTag(projectId: string, tagId: string, data: { name: string }): Promise<CustomTag> {
+  return api<CustomTag>(`/api/projects/${projectId}/custom-tags/${tagId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteCustomTag(projectId: string, tagId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/custom-tags/${tagId}`, { method: "DELETE" });
+}
+
+export async function getTestCaseTags(projectId: string, testcaseId: string): Promise<CustomTag[]> {
+  return api<CustomTag[]>(`/api/projects/${projectId}/testcases/${testcaseId}/tags`);
+}
+
+export interface LinkedIssueTaskStatus {
+  taskId: string;
+  status: string;
+}
+
+export async function listLinkedJiraKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-jira-keys`);
+}
+
+export async function listLinkedLinearKeys(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-linear-keys`);
+}
+
+/** Notion test cases link by full page id, so `keys` are page ids (a ticket row's `externalId`). */
+export async function listLinkedNotionPages(projectId: string): Promise<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }> {
+  return api<{ keys: string[]; counts: Record<string, number>; tasks: Record<string, LinkedIssueTaskStatus> }>(`/api/projects/${projectId}/testcases/linked-notion-pages`);
+}
+
+// Test case import/export
+export interface TestCaseExportFilters {
+  suiteId?: string;
+  /** Include test cases filed under any descendant of suiteId too, not just suiteId itself. No effect without suiteId. */
+  includeDescendants?: boolean;
+  status?: string;
+  priority?: string;
+  type?: string;
+  automationStatus?: string;
+  jiraIssueKey?: string;
+  linearIssueKey?: string;
+  notionPageId?: string;
+  search?: string;
+  /** JSON-stringified CustomFieldFilterCondition[] — see buildCustomFieldFiltersQueryParam(). */
+  customFieldFilters?: string;
+  /** Custom tag ids — a case matches when it carries any one of them. */
+  customTagIds?: string[];
+  /**
+   * Explicit test case ids — the repository's row checkboxes. When present, the export is scoped
+   * to exactly these ids and every other filter field above (suiteId, status, search, ...) is
+   * ignored: "export the N I selected" means exactly those rows, not those rows intersected with
+   * whatever the filter panel currently shows. See getExportUrl.
+   */
+  ids?: string[];
+  /** Repository table column sort. Omitted keeps the server's default (ID sequence) order. */
+  sortBy?: "id" | "title" | "priority";
+  sortDir?: "asc" | "desc";
+}
+
+// Mirrors the repository screen's own filters AND its current column sort (see loadSelectedSuiteCases'
+// listTestCases call and suiteCasesSort) so "Export" produces exactly what's currently
+// selected/filtered/sorted on screen, not the whole project in an unrelated order — an unfiltered,
+// unsorted export is still the default when `filters` is omitted.
+//
+// A non-empty `ids` short-circuits every other filter field: a user who ticked specific rows and
+// hit Export means exactly those rows, regardless of the suite/status/search filters still active
+// in the panel behind them. The column sort still applies, matching the on-screen row order.
+export function getExportUrl(projectId: string, format: "csv" | "xlsx", filters?: TestCaseExportFilters): string {
+  const sp = new URLSearchParams();
+  if (filters?.ids?.length) {
+    sp.set("ids", filters.ids.join(","));
+  } else {
+    if (filters?.suiteId) sp.set("suiteId", filters.suiteId);
+    if (filters?.includeDescendants) sp.set("includeDescendants", "true");
+    if (filters?.status) sp.set("status", filters.status);
+    if (filters?.priority) sp.set("priority", filters.priority);
+    if (filters?.type) sp.set("type", filters.type);
+    if (filters?.automationStatus) sp.set("automationStatus", filters.automationStatus);
+    if (filters?.jiraIssueKey) sp.set("jiraIssueKey", filters.jiraIssueKey);
+    if (filters?.linearIssueKey) sp.set("linearIssueKey", filters.linearIssueKey);
+    if (filters?.notionPageId) sp.set("notionPageId", filters.notionPageId);
+    if (filters?.search) sp.set("search", filters.search);
+    if (filters?.customFieldFilters) sp.set("customFieldFilters", filters.customFieldFilters);
+    if (filters?.customTagIds?.length) sp.set("customTagIds", filters.customTagIds.join(","));
+  }
+  if (filters?.sortBy) sp.set("sortBy", filters.sortBy);
+  if (filters?.sortDir) sp.set("sortDir", filters.sortDir);
+  const qs = sp.toString();
+  return `${API_BASE}/api/projects/${projectId}/testcases/export/${format}${qs ? `?${qs}` : ""}`;
+}
+
+export function getTemplateUrl(projectId: string, format: "csv" | "xlsx"): string {
+  return `${API_BASE}/api/projects/${projectId}/testcases/import/template?format=${format}`;
+}
+
+export interface ImportResult {
+  imported: number;
+  errors: { row: number; message: string }[];
+  total: number;
+  // Suites the import created a new child under — the caller should expand these in the
+  // suite tree so imported subfolders aren't left collapsed and undiscovered.
+  expandSuiteIds?: string[];
+}
+
+/**
+ * One mapped spreadsheet row, ready to insert. `rowNumber` is the line in the user's file, carried
+ * through so the server can report an error against the row they can actually go and look at.
+ */
+export interface ImportTestCaseRow {
+  rowNumber: number;
+  title: string;
+  description?: string;
+  preconditions?: string;
+  postconditions?: string;
+  steps?: { stepNumber: number; action: string; expectedResult: string }[];
+  testData?: string;
+  priority?: string;
+  severity?: string;
+  type?: string;
+  status?: string;
+  suite?: string;
+  component?: string;
+  estimatedDuration?: string;
+  automationStatus?: string;
+  attachments?: string;
+  // definitionId -> already-coerced value. The modal resolves select labels to option ids before
+  // sending, since it is the side that loaded the option lists to build the mapping UI.
+  customFieldValues?: Record<string, unknown>;
+}
+
+/**
+ * Commits a parsed import in one request.
+ *
+ * The modal used to POST createTestCase per row, which made a large file that many serial round
+ * trips — and had the browser paginate the entire project first just to spot duplicate titles. Both
+ * of those are the server's job now; the browser still parses the workbook and maps the columns.
+ */
+export async function importTestCases(
+  projectId: string,
+  data: { rows: ImportTestCaseRow[]; defaultSuiteId?: string }
+): Promise<ImportResult> {
+  return api<ImportResult>(`/api/projects/${projectId}/testcases/import`, { method: "POST", body: data });
+}
+
+export interface AutomationSession {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  userId: string;
+  status: string;
+  startedAt: string;
+  endedAt: string | null;
+  currentUrl: string | null;
+  browserContextMeta: string | null;
+  lastScreenshotPath: string | null;
+  updatedAt: string;
+  runtime?: {
+    activeCommandId: string | null;
+    queuedCount: number;
+    isRunning: boolean;
+  };
+  events: Array<{
+    id: string;
+    commandId: string | null;
+    eventType: string;
+    rawCommand: string | null;
+    parsedAction?: Record<string, unknown> | null;
+    executionResult?: Record<string, unknown> | null;
+    screenshotPath: string | null;
+    createdAt: string;
+  }>;
+}
+
+export async function startAutomationSession(
+  projectId: string,
+  testcaseId: string,
+  data?: { startUrl?: string }
+): Promise<{ id: string; startedAt: string }> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/sessions`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function sendAutomationCommand(
+  projectId: string,
+  sessionId: string,
+  command: string
+): Promise<{
+  commandId: string;
+  requiresClarification: boolean;
+  clarificationQuestion?: string;
+  queued?: boolean;
+  queueDepth?: number;
+  result?: Record<string, unknown>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands`, {
+    method: "POST",
+    body: { command },
+  });
+}
+
+export async function stopAutomationCommand(
+  projectId: string,
+  sessionId: string
+): Promise<{
+  stopRequested: boolean;
+  activeCommandId: string | null;
+  queuedCount: number;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/commands/stop`, {
+    method: "POST",
+  });
+}
+
+export async function getAutomationSession(projectId: string, sessionId: string): Promise<AutomationSession> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}`);
+}
+
+export async function getAutomationStreamState(projectId: string, sessionId: string): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/stream`);
+}
+
+export interface RecordingAction {
+  type: string;
+  action: string;
+  playwright: string;
+  targetDescription?: string;
+  value?: string;
+  url?: string;
+}
+
+/** Unified timeline entry — every recording interaction in chronological order. */
+export interface TimelineEntry {
+  seq: number;
+  kind: "action" | "reasoning" | "result";
+  ts: string;
+  stepId?: string | null;
+  url?: string | null;
+  tool?: string | null;
+  action?: string | null;
+  playwright?: string | null;
+  target?: string | null;
+  value?: string | null;
+  description?: string | null;
+  text?: string | null;
+  toolName?: string | null;
+  data?: Record<string, unknown> | null;
+  message?: string | null;
+  assertions?: string[];
+}
+
+/** Summary stats computed from the unified timeline. */
+export interface RecordingStats {
+  totalEntries: number;
+  actionCount: number;
+  reasoningCount: number;
+  resultCount: number;
+  clickCount: number;
+  typeCount: number;
+  navigateCount: number;
+  waitCount: number;
+  pressCount: number;
+  scrollCount: number;
+  assertCount: number;
+  playwrightLineCount: number;
+}
+
+export interface RecordingSummary {
+  runId: string;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  totalEvents: number;
+  observeCount: number;
+  actCount: number;
+  successfulActCount: number;
+  extractCount: number;
+  navigateCount: number;
+  compiledActionCount: number;
+}
+
+export interface ReasoningEntry {
+  text: string;
+  timestamp: string;
+  stepId: string | null;
+  url: string | null;
+  toolName: string | null;
+  _seq: number;
+}
+
+export interface RecordingState {
+  sessionId: string;
+  hasRecording: boolean;
+  message?: string;
+  summary?: RecordingSummary;
+  actions?: RecordingAction[];
+  reasoningLog?: ReasoningEntry[];
+  partialScript?: string;
+}
+
+export async function getAutomationRecording(projectId: string, sessionId: string): Promise<RecordingState> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording`);
+}
+
+export async function compileAutomationRecording(
+  projectId: string,
+  sessionId: string,
+  options?: { scenario?: string; addHeader?: boolean }
+): Promise<{ sessionId: string; runId: string; script: string; summary: RecordingSummary; recording: Record<string, unknown> }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/recording/compile`, {
+    method: "POST",
+    body: options ?? {},
+  });
+}
+
+export interface PersistedRecording {
+  id: string;
+  projectId: string;
+  testcaseId: string | null;
+  sessionId: string | null;
+  commandId: string | null;
+  runId: string;
+  scenarioName: string | null;
+  state: string;
+  startedAt: string | null;
+  stoppedAt: string | null;
+  timeline?: TimelineEntry[];
+  stats: RecordingStats;
+  playwrightScript: string | null;
+  startUrl: string | null;
+  finalUrl: string | null;
+  durationMs: number;
+  success: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listRecordingsByTestcase(
+  projectId: string,
+  testcaseId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/automation/recordings${params}`);
+}
+
+export async function listRecordingsByProject(
+  projectId: string,
+  limit?: number
+): Promise<PersistedRecording[]> {
+  const params = limit ? `?limit=${limit}` : "";
+  return api(`/api/projects/${projectId}/automation/recordings${params}`);
+}
+
+export async function getPersistedRecording(
+  projectId: string,
+  recordingId: string
+): Promise<PersistedRecording> {
+  return api(`/api/projects/${projectId}/automation/recordings/${recordingId}`);
+}
+
+export async function resetAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: { startUrl?: string }
+): Promise<{ sessionId: string; currentUrl?: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/reset`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function finalizeAutomationSession(
+  projectId: string,
+  sessionId: string,
+  data?: {
+    testName?: string;
+    framework?: string;
+    repo?: string;
+    path?: string;
+    script?: string;
+    steps?: Array<{ stepNumber?: number; action?: string; expectedResult?: string }>;
+  }
+): Promise<{ status: string; script: string }> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/finalize`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function cancelAutomationSession(projectId: string, sessionId: string): Promise<void> {
+  await api(`/api/projects/${projectId}/automation/sessions/${sessionId}/cancel`, { method: "POST" });
+}
+
+export async function sendAutomationManualAction(
+  projectId: string,
+  sessionId: string,
+  data: {
+    actionType: "click" | "type" | "press" | "drag" | "scroll";
+    xRatio?: number;
+    yRatio?: number;
+    toXRatio?: number;
+    toYRatio?: number;
+    deltaX?: number;
+    deltaY?: number;
+    text?: string;
+    key?: string;
+    targetHint?: string;
+  }
+): Promise<Record<string, unknown>> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/manual-actions`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function runAutomationPlaywrightScript(
+  projectId: string,
+  sessionId: string,
+  data: {
+    script: string;
+    scriptVersion?: number | null;
+    startUrl?: string;
+    actionDelayMs?: number;
+  }
+): Promise<{
+  status: "passed" | "failed" | string;
+  currentUrl?: string;
+  errorMessage?: string | null;
+  screenshotPath?: string | null;
+  tracePath?: string | null;
+  videoPath?: string | null;
+  durationMs?: number;
+  logs?: Array<Record<string, unknown>>;
+}> {
+  return api(`/api/projects/${projectId}/automation/sessions/${sessionId}/run-script`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export function getAutomationSessionTraceUrl(projectId: string, sessionId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/automation/sessions/${sessionId}/trace`;
+}
+
+// Plans
+export async function listPlans(projectId: string): Promise<PlanListItem[]> {
+  return api(`/api/projects/${projectId}/plans`);
+}
+
+export async function getPlan(planId: string): Promise<Record<string, unknown>> {
+  return api(`/api/plans/${planId}`);
+}
+
+export async function createPlan(projectId: string, data: { name: string; description?: string; targetRelease?: string; startDate?: string; dueDate?: string | null }): Promise<{ id: string }> {
+  return api(`/api/projects/${projectId}/plans`, { method: "POST", body: data });
+}
+
+// dueDate: a day sets it, null clears it, omitted leaves it. startDate cannot be cleared.
+export async function updatePlan(planId: string, data: { name?: string; description?: string; targetRelease?: string; startDate?: string; dueDate?: string | null }): Promise<void> {
+  await api(`/api/plans/${planId}`, { method: "PATCH", body: data });
+}
+
+export async function deletePlan(planId: string): Promise<void> {
+  await api(`/api/plans/${planId}`, { method: "DELETE" });
+}
+
+export interface PlanItem {
+  id: string;
+  suiteId: string | null;
+  testcaseId: string | null;
+  position: number;
+  tcExternalId: string | null;
+  tcTitle: string | null;
+  tcPriority: string | null;
+  suiteName: string | null;
+  lastStatus: string | null;
+}
+
+export async function listPlanItems(planId: string): Promise<PlanItem[]> {
+  return api(`/api/plans/${planId}/items`);
+}
+
+export async function addPlanItem(planId: string, data: { suiteId?: string; testcaseId?: string; position?: number }): Promise<void> {
+  await api(`/api/plans/${planId}/items`, { method: "POST", body: data });
+}
+
+export async function removePlanItem(planId: string, itemId: string): Promise<void> {
+  await api(`/api/plans/${planId}/items/${itemId}`, { method: "DELETE" });
+}
+
+// Plan Runs & Progress
+export interface PlanRunItem {
+  id: string;
+  externalId: string;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  createdAt: string;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  untested: number;
+}
+
+export interface PlanProgress {
+  runCount: number;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  untested: number;
+  executed: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has a settled verdict yet. */
+  passRate: number | null;
+  /** (Passed + Failed + Blocked + Skipped) / totalCases. */
+  completionPercent: number;
+}
+
+export interface PlanListItem {
+  id: string;
+  externalId: string;
+  name: string;
+  description: string;
+  targetRelease: string;
+  ownerId: string | null;
+  createdAt: string;
+  caseCount: number;
+  runCount: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  lastRunAt: string | null;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
+}
+
+export async function listPlanRuns(planId: string): Promise<PlanRunItem[]> {
+  return api(`/api/plans/${planId}/runs`);
+}
+
+export async function getPlanProgress(planId: string): Promise<PlanProgress> {
+  return api(`/api/plans/${planId}/progress`);
+}
+
+export async function associateRunWithPlan(cycleId: string, planId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: { planId } });
+}
+
+export async function dissociateRunFromPlan(cycleId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: { clearPlan: true } });
+}
+
+// Test Runs (Cycles)
+export interface TestRunListItem {
+  id: string;
+  externalId: string;
+  planId: string | null;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  createdAt: string;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
+  totalCases: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  untested: number;
+  /**
+   * Automation provenance (Basecamp 10189985971). `source` is 'manual' for every run a person
+   * creates; the rest are only ever set by the automation ingest and are null on a manual run.
+   */
+  source?: "manual" | "automation";
+  triggeredBy?: string | null;
+  commitSha?: string | null;
+  branchName?: string | null;
+  buildUrl?: string | null;
+  closedAt?: string | null;
+  closeStatus?: "completed" | "incomplete" | null;
+  lastResultAt?: string | null;
+  /** Carried over from another test tool: work time (not wall clock), wall-clock length, and free labels. */
+  timeSpentMs?: number | null;
+  elapsedMs?: number | null;
+  tags?: string[];
+}
+
+export interface TestRunDetail {
+  id: string;
+  externalId: string;
+  projectId: string;
+  planId: string | null;
+  name: string;
+  description: string;
+  status: string;
+  environment: string;
+  buildVersion: string;
+  releaseName: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  ownerId: string | null;
+  shareToken: string | null;
+  shareEnabled: boolean;
+  /** Planned start / due calendar days ("YYYY-MM-DD"). Null on items created before dates existed; dueDate null = no due date. */
+  startDate?: string | null;
+  dueDate?: string | null;
+  /** Where the due date stands in the workspace's timezone; null when there is none or the item is finished. */
+  dueState?: "due_soon" | "due_today" | "overdue" | null;
+  isOverdue?: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /**
+   * Automation provenance (Basecamp 10189985971). `source` is 'manual' for every run a person
+   * creates; the rest are only ever set by the automation ingest and are null on a manual run.
+   */
+  source?: "manual" | "automation";
+  triggeredBy?: string | null;
+  commitSha?: string | null;
+  branchName?: string | null;
+  buildUrl?: string | null;
+  closedAt?: string | null;
+  closeStatus?: "completed" | "incomplete" | null;
+  lastResultAt?: string | null;
+  /** Carried over from another test tool: work time (not wall clock), wall-clock length, and free labels. */
+  timeSpentMs?: number | null;
+  elapsedMs?: number | null;
+  tags?: string[];
+}
+
+export interface ExecutionItem {
+  id: string;
+  cycleItemId: string;
+  testcaseId: string;
+  snapshotTitle?: string;
+  title: string;
+  externalId: string;
+  priority: string;
+  type: string;
+  suiteId?: string | null;
+  description?: string;
+  preconditions?: string;
+  postconditions?: string;
+  steps?: unknown;
+  testData?: string;
+  expectedResult?: string;
+  automationStatus?: string;
+  automationTags?: string;
+  status: string;
+  assigneeId: string | null;
+  actualResult: string;
+  executedAt: string | null;
+  defectKey: string;
+  defectUrl: string;
+  /**
+   * Set by the automation ingest only. `reportedBy` is 'human' for every result a person records,
+   * so a row can be labelled as automated without joining back through the run -- and a tester's
+   * later correction of an automated result flips it back, which is the point.
+   *
+   * `errorMessage` is deliberately separate from `actualResult`: that column is the tester's own
+   * prose and an SDK never writes it.
+   */
+  durationMs?: number | null;
+  retryCount?: number;
+  errorMessage?: string | null;
+  errorStack?: string | null;
+  reportedBy?: "human" | "automation";
+  /** Carried over from another test tool: each step's outcome, and the earlier results of this case in this run (oldest first). */
+  stepResults?: Array<{ position: number; status: string; comment?: string }> | null;
+  history?: Array<{ status: string; executedAt?: string | null; durationMs?: number | null; comment?: string | null; errorStack?: string | null; reportedBy?: "human" | "automation" }> | null;
+  /** Count only -- the file list is fetched per execution via listExecutionEvidence. */
+  evidenceCount?: number;
+}
+
+export interface AutomatedRunResult {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  totalCases: number;
+  executionProvider?: string;
+  maxParallel?: number;
+}
+
+export interface AutomatedRunLiveStatusItem {
+  executionId: string;
+  title: string;
+  externalId: string;
+  status: "queued" | "running" | "passed" | "failed" | "manual" | "cancelled";
+  index: number;
+  message?: string;
+}
+
+export interface AutomatedRunLiveStatus {
+  runId: string;
+  cycleId: string;
+  status: "running" | "completed" | "failed";
+  startedAt: string;
+  endedAt?: string;
+  currentExecutionId?: string;
+  totalCases: number;
+  completed: number;
+  passed: number;
+  failed: number;
+  executionProvider?: string;
+  maxParallel?: number;
+  error?: string;
+  items: AutomatedRunLiveStatusItem[];
+}
+
+export interface ExecutionAutomationLogItem {
+  kind?: string;
+  stepId?: string;
+  action?: string;
+  status?: string;
+  message?: string;
+  selectorUsed?: string;
+  currentUrl?: string;
+  durationMs?: number;
+  screenshotPath?: string;
+  screenshotUrl?: string;
+  detail?: Record<string, unknown>;
+  ts?: string;
+}
+
+export interface ExecutionAutomationReport {
+  id?: string;
+  cycleId?: string;
+  executionId: string;
+  status: string;
+  startedAt?: string;
+  endedAt?: string;
+  logs: ExecutionAutomationLogItem[];
+  videoAvailable: boolean;
+  videoUrl?: string | null;
+  traceAvailable?: boolean;
+  traceUrl?: string | null;
+  tracePath?: string | null;
+  screenshotPath?: string | null;
+  screenshotUrl?: string | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TestRunSchedule {
+  id: string;
+  projectId: string;
+  cycleId: string;
+  name: string;
+  enabled: boolean;
+  scheduleType: "one_time" | "recurring";
+  runAt: string | null;
+  intervalMinutes: number | null;
+  timezone: string;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  lastStatus: string | null;
+  lastError: string | null;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// `limit` returns only the newest N runs, counted without reading the older ones' executions.
+export async function listTestRuns(projectId: string, opts: { limit?: number } = {}): Promise<TestRunListItem[]> {
+  return api(`/api/projects/${projectId}/cycles${opts.limit ? `?limit=${opts.limit}` : ""}`);
+}
+
+export async function getTestRun(cycleId: string): Promise<TestRunDetail> {
+  return api(`/api/cycles/${cycleId}`);
+}
+
+export async function createTestRun(projectId: string, data: { name: string; description?: string; environment: string; buildVersion?: string; startDate?: string; dueDate?: string | null }): Promise<{ id: string; name: string; status: string; createdAt: string }> {
+  return api(`/api/projects/${projectId}/cycles`, { method: "POST", body: data });
+}
+
+// dueDate: a day sets it, null clears it, omitted leaves it. startDate cannot be cleared.
+export async function updateTestRun(cycleId: string, data: { name?: string; description?: string; environment?: string; buildVersion?: string; status?: string; startDate?: string; dueDate?: string | null }): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteTestRun(cycleId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}`, { method: "DELETE" });
+}
+
+export async function addTestCasesToRun(
+  cycleId: string,
+  testcaseIds: string[]
+): Promise<{ requested: number; added: number; skipped: number }> {
+  return api(`/api/cycles/${cycleId}/testcases`, { method: "POST", body: { testcaseIds } });
+}
+
+export async function removeTestCaseFromRun(cycleId: string, testcaseId: string): Promise<void> {
+  await api(`/api/cycles/${cycleId}/testcases/${testcaseId}`, { method: "DELETE" });
+}
+
+export async function removeTestCasesFromRun(
+  cycleId: string,
+  testcaseIds: string[]
+): Promise<{ requested: number; removed: number }> {
+  return api(`/api/cycles/${cycleId}/testcases/bulk-delete`, { method: "POST", body: { testcaseIds } });
+}
+
+export async function createCycleFromPlan(projectId: string, data: { planId: string; name?: string; environment: string; buildVersion?: string }): Promise<{ id: string }> {
+  return api(`/api/projects/${projectId}/cycles/from-plan`, { method: "POST", body: data });
+}
+
+export async function listCycleExecutions(cycleId: string): Promise<ExecutionItem[]> {
+  return api(`/api/cycles/${cycleId}/executions`);
+}
+
+export async function updateExecution(cycleId: string, executionId: string, data: { status?: string; assigneeId?: string | null; actualResult?: string; defectKey?: string; defectUrl?: string }): Promise<void> {
+  await api(`/api/cycles/${cycleId}/executions/${executionId}`, { method: "PATCH", body: data });
+}
+
+export async function bulkAssignExecutions(cycleId: string, data: { executionIds: string[]; assigneeId: string | null }): Promise<{ updated: number; assigneeId: string | null }> {
+  return api(`/api/cycles/${cycleId}/executions/bulk-assign`, { method: "POST", body: data });
+}
+
+export async function getExecutionAutomationReport(cycleId: string, executionId: string): Promise<ExecutionAutomationReport> {
+  return api<ExecutionAutomationReport>(`/api/cycles/${cycleId}/executions/${executionId}/automation-report`);
+}
+
+export function getExecutionAutomationVideoUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-video`;
+}
+
+export function getExecutionAutomationTraceUrl(cycleId: string, executionId: string): string {
+  return `${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/automation-trace`;
+}
+
+export async function executeAutomatedTestRun(cycleId: string): Promise<AutomatedRunResult> {
+  return api<AutomatedRunResult>(`/api/cycles/${cycleId}/execute-automated`, { method: "POST" });
+}
+
+export async function getAutomatedRunStatus(cycleId: string, runId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/${runId}/status`);
+}
+
+export async function getLatestAutomatedRunStatus(cycleId: string): Promise<AutomatedRunLiveStatus> {
+  return api<AutomatedRunLiveStatus>(`/api/cycles/${cycleId}/execute-automated/latest/status`);
+}
+
+export async function listTestRunSchedules(projectId: string): Promise<TestRunSchedule[]> {
+  return api<TestRunSchedule[]>(`/api/projects/${projectId}/cycles/schedules`);
+}
+
+export async function createTestRunSchedule(
+  projectId: string,
+  data: {
+    cycleId: string;
+    name: string;
+    scheduleType: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<TestRunSchedule> {
+  return api<TestRunSchedule>(`/api/projects/${projectId}/cycles/schedules`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function updateTestRunSchedule(
+  scheduleId: string,
+  data: {
+    cycleId?: string;
+    name?: string;
+    scheduleType?: "one_time" | "recurring";
+    runAt?: string;
+    intervalMinutes?: number;
+    timezone?: string;
+    enabled?: boolean;
+  }
+): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteTestRunSchedule(scheduleId: string): Promise<void> {
+  await api(`/api/cycles/schedules/${scheduleId}`, { method: "DELETE" });
+}
+
+// Sharing
+export interface ShareState {
+  shareToken: string;
+  shareEnabled: boolean;
+}
+
+export async function toggleTestRunShare(cycleId: string, enabled: boolean): Promise<ShareState> {
+  return api<ShareState>(`/api/cycles/${cycleId}/share`, { method: "POST", body: { enabled } });
+}
+
+export async function getPublicSharedRun(token: string): Promise<TestRunDetail & { shareEnabled: boolean }> {
+  return api(`/api/public/shared-runs/${token}`);
+}
+
+export async function getPublicSharedExecutions(token: string): Promise<ExecutionItem[]> {
+  return api(`/api/public/shared-runs/${token}/executions`);
+}
+
+// Keep old names as aliases for backward compat
+export const listCycles = listTestRuns;
+export const getCycle = getTestRun;
+
+// Bugs
+export interface BugLink {
+  id: string;
+  testcaseId: string | null;
+  testcaseTitle: string | null;
+  testcaseExternalId: string | null;
+  cycleId: string | null;
+  cycleName: string | null;
+  executionId: string | null;
+}
+
+export interface BugLinkInput {
+  testcaseId?: string | null;
+  cycleId?: string | null;
+  executionId?: string | null;
+}
+
+export interface BugAttachment {
+  id: string;
+  fileName: string;
+  contentType: string;
+  fileSize: number;
+  createdAt: string;
+}
+
+export type BugSeverity = "Critical" | "High" | "Medium" | "Low";
+
+/*
+ * Priority is nullable and separate from severity: severity is how bad the defect is, priority is
+ * how soon it gets worked on (Basecamp 10226247009). null means untriaged — a real state, distinct
+ * from any of P0..P3.
+ */
+export type BugPriority = "P0" | "P1" | "P2" | "P3";
+
+export interface BugItem {
+  id: string;
+  /** Per-project sequential key, e.g. "E2E-BUG-14" — always present, unlike integrationIssueKey
+   *  which is only set once the bug is linked to an external tracker (Jira/Linear). */
+  externalId: string;
+  title: string;
+  description: string;
+  externalUrl: string;
+  status: string;
+  /** null = not selected (V130), the same convention as priority. */
+  severity: BugSeverity | null;
+  priority: BugPriority | null;
+  executionId: string | null;
+  testcaseId: string | null;
+  cycleId: string | null;
+  reportedBy: string | null;
+  reporterName: string;
+  reporterEmail: string;
+  assigneeId: string | null;
+  assigneeName: string | null;
+  assigneeType?: "user" | "agent" | null;
+  /** Calendar day as "YYYY-MM-DD" (no time, no timezone); null = no due date. */
+  dueDate: string | null;
+  integrationProvider: "JIRA" | "LINEAR" | null;
+  integrationIssueKey: string | null;
+  betterbugsUrl: string | null;
+  links: BugLink[];
+  attachments: BugAttachment[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listBugs(
+  projectId: string,
+  params?: { status?: string; cycleId?: string; assigneeId?: string; testcaseId?: string }
+): Promise<BugItem[]> {
+  const sp = new URLSearchParams();
+  if (params?.status) sp.set("status", params.status);
+  if (params?.cycleId) sp.set("cycleId", params.cycleId);
+  if (params?.assigneeId) sp.set("assigneeId", params.assigneeId);
+  if (params?.testcaseId) sp.set("testcaseId", params.testcaseId);
+  const query = sp.toString();
+  return api(`/api/projects/${projectId}/bugs${query ? `?${query}` : ""}`);
+}
+
+export async function getBug(bugId: string): Promise<BugItem> {
+  return api(`/api/bugs/${bugId}`);
+}
+
+/**
+ * Project-scoped bug lookup: accepts either the bug's uuid or its external id (e.g. "PRO-BUG-12"),
+ * so the Bug Details page's URL can be addressed and shared by the stable, human-readable id.
+ */
+export async function getProjectBug(projectId: string, bugId: string): Promise<BugItem> {
+  return api(`/api/projects/${projectId}/bugs/${bugId}`);
+}
+
+/**
+ * One comment on a bug, or a reply to one (V131). The list is flat and oldest first; replies carry
+ * their thread's top comment as `parentCommentId` and nest only one level deep. No resolution.
+ */
+export interface BugComment {
+  id: string;
+  bugId: string;
+  /** null for a top-level comment. */
+  parentCommentId: string | null;
+  authorId: string | null;
+  /** Name, else email; "Unknown" once the author's account is gone. */
+  authorName: string;
+  /** Markdown — render with renderMarkdown (lib/markdown.ts), never as raw HTML. */
+  body: string;
+  /** True once the text or the files have been changed after posting. */
+  isEdited: boolean;
+  /** The author may edit until this moment (an hour after posting); the server enforces it. */
+  editableUntil: string;
+  /** The comment's own files; downloaded through the same route as bug evidence. */
+  attachments: BugAttachment[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+const bugCommentsPath = (projectId: string, bugId: string) => `/api/projects/${projectId}/bugs/${bugId}/comments`;
+
+/** A comment write that carries files goes as multipart; the server reads `body` and the rest from fields. */
+async function sendBugCommentForm(path: string, method: "POST" | "PATCH", form: FormData): Promise<BugComment> {
+  const res = await fetchWithNetworkErrorMessage(`${API_BASE}${path}`, { method, credentials: "include", body: form });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as ApiErrorBody;
+    throw new Error(formatApiError(res.status, err));
+  }
+  return res.json();
+}
+
+export async function listBugComments(projectId: string, bugId: string): Promise<{ list: BugComment[]; total: number }> {
+  return api(bugCommentsPath(projectId, bugId));
+}
+
+/** With `parentCommentId` the comment is a reply; it must name a top-level comment (one level deep). */
+export async function createBugComment(
+  projectId: string,
+  bugId: string,
+  body: string,
+  files: File[] = [],
+  parentCommentId: string | null = null
+): Promise<BugComment> {
+  if (!files.length) {
+    return api(bugCommentsPath(projectId, bugId), { method: "POST", body: { body, ...(parentCommentId ? { parentCommentId } : {}) } });
+  }
+  const form = new FormData();
+  form.append("body", body);
+  if (parentCommentId) form.append("parentCommentId", parentCommentId);
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(bugCommentsPath(projectId, bugId), "POST", form);
+}
+
+/** Author only. Omitted fields are left as they are. */
+export async function updateBugComment(
+  projectId: string,
+  bugId: string,
+  commentId: string,
+  changes: { body?: string; removeAttachmentIds?: string[]; files?: File[] }
+): Promise<BugComment> {
+  const path = `${bugCommentsPath(projectId, bugId)}/${commentId}`;
+  const { files = [], ...json } = changes;
+  if (!files.length) return api(path, { method: "PATCH", body: json });
+  const form = new FormData();
+  if (json.body !== undefined) form.append("body", json.body);
+  if (json.removeAttachmentIds?.length) form.append("removeAttachmentIds", JSON.stringify(json.removeAttachmentIds));
+  for (const file of files) form.append("files", file);
+  return sendBugCommentForm(path, "PATCH", form);
+}
+
+/** The author, or a project owner/manager. */
+export async function deleteBugComment(projectId: string, bugId: string, commentId: string): Promise<void> {
+  await api(`${bugCommentsPath(projectId, bugId)}/${commentId}`, { method: "DELETE" });
+}
+
+export async function createBug(projectId: string, data: {
+  title: string;
+  description?: string;
+  externalUrl?: string;
+  severity?: BugSeverity;
+  priority?: BugPriority | null;
+  // null/omitted both mean unassigned on create; there is no "clear" distinction to make yet.
+  assigneeId?: string | null;
+  dueDate?: string | null;
+  integrationProvider?: "JIRA" | "LINEAR" | null;
+  integrationIssueKey?: string | null;
+  betterbugsUrl?: string | null;
+  links: BugLinkInput[];
+}): Promise<BugItem> {
+  return api(`/api/projects/${projectId}/bugs`, { method: "POST", body: data });
+}
+
+export async function updateBug(bugId: string, data: {
+  title?: string;
+  description?: string;
+  externalUrl?: string;
+  status?: string;
+  // null clears it back to not selected; omitted leaves the stored value alone.
+  severity?: BugSeverity | null;
+  // null clears it back to untriaged; omitted leaves the stored value alone.
+  priority?: BugPriority | null;
+  // null clears the assignee; omitted leaves the stored value alone.
+  assigneeId?: string | null;
+  // null clears the due date; omitted leaves the stored value alone.
+  dueDate?: string | null;
+  integrationProvider?: "JIRA" | "LINEAR" | null;
+  integrationIssueKey?: string | null;
+  betterbugsUrl?: string | null;
+  links?: BugLinkInput[];
+}): Promise<BugItem> {
+  return api(`/api/bugs/${bugId}`, { method: "PATCH", body: data });
+}
+
+export async function deleteBug(bugId: string): Promise<void> {
+  await api(`/api/bugs/${bugId}`, { method: "DELETE" });
+}
+
+export async function addBugLink(bugId: string, link: BugLinkInput): Promise<BugItem> {
+  return api(`/api/bugs/${bugId}/links`, { method: "POST", body: link });
+}
+
+export async function removeBugLink(bugId: string, linkId: string): Promise<BugItem> {
+  return api(`/api/bugs/${bugId}/links/${linkId}`, { method: "DELETE" });
+}
+
+/**
+ * Uploads bug attachments in batches of EVIDENCE_MAX_FILES_PER_REQUEST — the server rejects a
+ * request carrying more files than that outright, so a batch larger than the limit is split into
+ * multiple sequential requests against the same bug rather than sent as one request that fails.
+ * `onBatchUploaded` fires after each batch persists, so a caller can drop those files from
+ * whatever "still needs uploading" state it retries from, instead of re-sending files that already
+ * made it to the bug if a later batch fails.
+ */
+export async function uploadBugAttachments(
+  projectId: string,
+  bugId: string,
+  files: File[],
+  onBatchUploaded?: (batch: File[]) => void
+): Promise<{ list: BugAttachment[]; total: number }> {
+  const list: BugAttachment[] = [];
+  for (let i = 0; i < files.length; i += EVIDENCE_MAX_FILES_PER_REQUEST) {
+    const batch = files.slice(i, i + EVIDENCE_MAX_FILES_PER_REQUEST);
+    const formData = new FormData();
+    for (const file of batch) formData.append("files", file);
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/bugs/${bugId}/attachments`, {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error((err as { error?: string }).error || String(res.status));
+    }
+    const batchResult = (await res.json()) as { list: BugAttachment[]; total: number };
+    list.push(...batchResult.list);
+    onBatchUploaded?.(batch);
+  }
+  return { list, total: list.length };
+}
+
+export async function deleteExecutionEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<void> {
+  await api(`/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}`, { method: "DELETE" });
+}
+
+export async function deleteBugAttachment(attachmentId: string): Promise<void> {
+  await api(`/api/bugs/attachments/${attachmentId}`, { method: "DELETE" });
+}
+
+export function getBugAttachmentDownloadUrl(projectId: string, attachmentId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/bugs/attachments/${attachmentId}/download`;
+}
+
+// Workspace analytics (dashboard – all projects in workspace)
+export interface WorkspaceAnalytics {
+  projectCount: number;
+  testCaseCount: number;
+  suiteCount: number;
+  planCount: number;
+  cycleCount: number;
+  /** Every execution status, in the backend's canonical order, including those at 0. */
+  executionStatus: Record<string, number>;
+  /** Whole-number share of executionTotal per status; sums to exactly 100 (all 0 when there are none). */
+  executionStatusPercent: Record<string, number>;
+  executionTotal: number;
+}
+
+export async function getWorkspaceAnalytics(): Promise<WorkspaceAnalytics> {
+  return api<WorkspaceAnalytics>("/api/workspace/analytics");
+}
+
+// Project analytics (optional project-level view)
+export interface ProjectAnalytics {
+  testCaseCount: number;
+  suiteCount: number;
+  planCount: number;
+  cycleCount: number;
+  executionStatus: Record<string, number>;
+  executionTotal: number;
+}
+
+export async function getProjectAnalytics(projectId: string): Promise<ProjectAnalytics> {
+  return api<ProjectAnalytics>(`/api/projects/${projectId}/analytics`);
+}
+
+// ── Report: Execution Report ──
+export interface ExecutionReportRow {
+  groupId: string;
+  groupName: string;
+  Passed: number;
+  Failed: number;
+  Blocked: number;
+  Skipped: number;
+  Untested: number;
+  Retest: number;
+  total: number;
+}
+
+export interface ExecutionReportResponse {
+  filterBy: string;
+  filterValue: string | null;
+  rows: ExecutionReportRow[];
+}
+
+export async function getExecutionReport(
+  projectId: string,
+  params?: { filterBy?: string; filterValue?: string }
+): Promise<ExecutionReportResponse> {
+  const sp = new URLSearchParams();
+  if (params?.filterBy) sp.set("filterBy", params.filterBy);
+  if (params?.filterValue) sp.set("filterValue", params.filterValue);
+  const query = sp.toString();
+  return api<ExecutionReportResponse>(
+    `/api/projects/${projectId}/reports/execution${query ? `?${query}` : ""}`
+  );
+}
+
+// ── Report: Requirement Traceability Matrix ──
+export interface RequirementMatrixRow {
+  testcaseId: string;
+  externalId: string;
+  testcaseTitle: string;
+  priority: string;
+  testcaseStatus: string;
+  suiteName: string | null;
+  runId: string | null;
+  runName: string | null;
+  runStatus: string | null;
+  executionId: string | null;
+  executionStatus: string | null;
+  executedAt: string | null;
+  bugId: string | null;
+  bugTitle: string | null;
+  bugStatus: string | null;
+  bugUrl: string | null;
+}
+
+// Paged by test case: `total` is the number of matching test cases, not rows.
+export async function getRequirementMatrix(
+  projectId: string,
+  opts: { limit: number; offset: number; search?: string },
+): Promise<{ rows: RequirementMatrixRow[]; total: number }> {
+  const qs = new URLSearchParams({ limit: String(opts.limit), offset: String(opts.offset) });
+  if (opts.search) qs.set("search", opts.search);
+  return api<{ rows: RequirementMatrixRow[]; total: number }>(
+    `/api/projects/${projectId}/reports/requirement-matrix?${qs}`,
+  );
+}
+
+// ── Report: Repository Summary ──
+export interface RepositorySummary {
+  /** Live, non-Archived cases — the same set the repository list shows. byStatus/bySuite sum to it. */
+  totalTestCases: number;
+  /** Live Archived cases, counted separately from totalTestCases (the "N archived" chip). */
+  archivedTestCases: number;
+  bySuite: { name: string; count: number }[];
+  byStatus: { name: string; count: number }[];
+  addedByDate: { date: string; count: number }[];
+  updatedToday: number;
+  updatedThisWeek: number;
+  updatedThisMonth: number;
+  byPriority: { name: string; count: number }[];
+}
+
+export async function getRepositorySummary(projectId: string): Promise<RepositorySummary> {
+  return api<RepositorySummary>(`/api/projects/${projectId}/reports/repository-summary`);
+}
+
+// ── Report: shared cycle pass-rate series ──
+export interface CyclePassRatePoint {
+  id: string;
+  name: string;
+  createdAt: string;
+  total: number;
+  passed: number;
+  failed: number;
+  blocked: number;
+  skipped: number;
+  /** Passed + Failed + Blocked + Skipped (Untested/Retest excluded). */
+  executed: number;
+  /** (executed / total) * 100. */
+  executionProgress: number;
+  /** Passed / (Passed + Failed + Blocked); null when nothing has settled. */
+  passRate: number | null;
+}
+
+// ── Report: Overview ──
+export interface SuiteHealthRow {
+  suiteName: string;
+  executed: number;
+  skipped: number;
+  executionProgress: number;
+  passedPct: number;
+  failedPct: number;
+  blockedPct: number;
+}
+
+export interface ReportsOverview {
+  passRateTrend: CyclePassRatePoint[];
+  trendDelta: number;
+  suiteHealth: SuiteHealthRow[];
+  aiSummary: string;
+  flakyCount: number;
+  coverageGapCount: number;
+  untestedP1Count: number;
+}
+
+export async function getReportsOverview(projectId: string): Promise<ReportsOverview> {
+  return api<ReportsOverview>(`/api/projects/${projectId}/reports/overview`);
+}
+
+// ── Report: AI Insights ──
+export interface FlakyTestRow {
+  testcaseId: string;
+  externalId: string;
+  title: string;
+  suiteName: string;
+  runs: { runName: string; status: string }[];
+  flipCount: number;
+  flakinessLabel: "High" | "Medium" | "Low";
+}
+
+export interface CoverageRow {
+  suiteName: string;
+  total: number;
+  covered: number;
+  pct: number;
+}
+
+export interface ReportsInsights {
+  healthScore: number;
+  healthLabel: string;
+  flakyTests: FlakyTestRow[];
+  coverageGaps: CoverageRow[];
+  coverageBySuite: CoverageRow[];
+  untestedP1Count: number;
+}
+
+export async function getReportsInsights(projectId: string): Promise<ReportsInsights> {
+  return api<ReportsInsights>(`/api/projects/${projectId}/reports/insights`);
+}
+
+// ── Report: Trends ──
+export interface ReportsTrends {
+  passRateTrend: CyclePassRatePoint[];
+  trendDelta: number;
+  executionVelocity: { name: string; count: number }[];
+  bugDiscoveryRate: { week: string; count: number }[];
+}
+
+export async function getReportsTrends(projectId: string): Promise<ReportsTrends> {
+  return api<ReportsTrends>(`/api/projects/${projectId}/reports/trends`);
+}
+
+// ── Report: export ──
+// One file per report view, mirroring what the screen is showing — including the Execution Report
+// tab's active filter, so exporting while looking at one plan doesn't hand back every plan.
+// Downloaded through a plain <a href> like the test case export, which keeps the session cookie on
+// the request and lets the browser name the file from Content-Disposition.
+export type ReportExportView = "overview" | "execution" | "matrix" | "repository" | "insights" | "trends";
+
+export function getReportsExportUrl(
+  projectId: string,
+  view: ReportExportView,
+  format: "csv" | "xlsx",
+  params?: { filterBy?: string; filterValue?: string }
+): string {
+  const sp = new URLSearchParams({ view });
+  if (params?.filterBy) sp.set("filterBy", params.filterBy);
+  if (params?.filterValue) sp.set("filterValue", params.filterValue);
+  return `${API_BASE}/api/projects/${projectId}/reports/export/${format}?${sp.toString()}`;
+}
+
+// ── Project Home dashboard summary ──
+export interface ProjectDashboardSummary {
+  testCases: { total: number; addedThisWeek: number };
+  passRate: { value: number | null; deltaThisWeek: number | null };
+  executionProgress: { value: number };
+  // total counts every open bug; noSeverity is the part of it with no severity selected, which
+  // bySeverity's four buckets don't include.
+  openBugs: { total: number; bySeverity: { Critical: number; High: number; Medium: number; Low: number }; noSeverity?: number };
+  coverage: { pct: number | null; totalRequirements: number };
+  plans: number;
+  suites: number;
+  activeRuns: number;
+}
+
+export async function getProjectDashboardSummary(projectId: string): Promise<ProjectDashboardSummary> {
+  return api<ProjectDashboardSummary>(`/api/projects/${projectId}/dashboard`);
+}
+
+// ── App integrations (Jira, Linear, Notion) ──
+// Connecting/configuring an app is workspace-scoped (one connection per organization per
+// provider) — see settings/integrations. Mapping which remote project/team feeds a given TestPilot
+// project, syncing, and browsing tickets stays project-scoped, mirrored per provider below.
+
+export type IntegrationProvider = "jira" | "linear" | "notion";
+
+export const INTEGRATION_PROVIDER_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
+
+/** Label for a stored `sourceProvider` string; anything unrecognised (legacy rows) was always Jira. */
+export function integrationProviderLabel(provider: string | null | undefined): string {
+  return INTEGRATION_PROVIDER_LABELS[provider as IntegrationProvider] ?? "Jira";
+}
+
+/** Short display label for a Notion page id, matching the backend's `notion:xxxxxxxx` key. */
+export function notionPageKey(pageId: string): string {
+  return `notion:${pageId.replace(/-/g, "").slice(0, 8)}`;
+}
+
+/** Every ticket a Zyra task was built from, as display keys (Notion page ids shown by their short key). */
+export function zyraTaskTicketKeys(task: Pick<ZyraTask, "jiraIssueKeys" | "linearIssueKeys" | "notionPageIds" | "notionPageKeys">): string[] {
+  return [...task.jiraIssueKeys, ...(task.linearIssueKeys ?? []), ...(task.notionPageIds ?? []).map((id, i) => task.notionPageKeys?.[i] || notionPageKey(id))];
+}
+
+/**
+ * Read-only view of how the deployment is configured for this provider. Credentials come from the
+ * backend environment (`<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET`) and cannot be set from the UI, so
+ * `configured` is simply whether connecting is possible at all. `redirectUri` is exposed so a
+ * self-hosted operator can see which callback URL to register in the provider console.
+ */
+export interface IntegrationOAuthConfig {
+  configured: boolean;
+  clientId: string;
+  redirectUri: string;
+}
+
+// Timed so the Connect button can never stay stuck mid-click waiting on a hung backend — the
+// popup is already open by the time this is called, so a hang here would otherwise leave the
+// button disabled with no way out short of a page reload.
+const INTEGRATION_CALL_TIMEOUT_MS = 20_000;
+
+export async function getIntegrationAuthUrl(provider: IntegrationProvider): Promise<{ url: string }> {
+  return api<{ url: string }>(`/api/workspace/integrations/${provider}/auth-url`, {
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function getIntegrationConfig(provider: IntegrationProvider): Promise<IntegrationOAuthConfig> {
+  return api<IntegrationOAuthConfig>(`/api/workspace/integrations/${provider}/config`);
+}
+
+// `state` is the signed value the backend put on the authorize URL; it must be handed back
+// verbatim so the backend can confirm this callback belongs to the workspace that started it.
+export async function integrationCallback(
+  provider: IntegrationProvider,
+  code: string,
+  state: string
+): Promise<{ connectionId: string; siteUrl: string }> {
+  return api(`/api/workspace/integrations/${provider}/callback`, {
+    method: "POST",
+    body: { code, state },
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function disconnectIntegration(provider: IntegrationProvider): Promise<void> {
+  await api(`/api/workspace/integrations/${provider}/disconnect`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export interface IntegrationConnectionStatus {
+  connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
+  id?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string | null;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: { projectId: string; projectName: string; projectKey: string }[];
+}
+
+export async function getIntegrationStatus(provider: IntegrationProvider): Promise<IntegrationConnectionStatus> {
+  return api<IntegrationConnectionStatus>(`/api/workspace/integrations/${provider}/status`);
+}
+
+// ── Jira (project-scoped mapping/sync/tickets) ──
+
+export interface JiraConnection {
+  connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
+  id?: string;
+  cloudId?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: JiraConnectedProject[];
+  // Every Jira project this TestPilot project has ever been linked to (disabled, never deleted) — lets
+  // the Requirements page offer a "previously linked" source alongside the current one.
+  history?: JiraConnectedProject[];
+}
+
+export interface JiraConnectedProject {
+  id: string;
+  jiraProjectId: string;
+  jiraProjectKey: string;
+  jiraProjectName: string;
+  createdAt: string;
+}
+
+export interface JiraProject {
+  id: string;
+  key: string;
+  name: string;
+  style: string;
+  connected: boolean;
+}
+
+export interface JiraTicket {
+  id: string;
+  jiraIssueId: string;
+  jiraIssueKey: string;
+  summary: string;
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  jiraUrl: string;
+  jiraCreatedAt: string | null;
+  jiraUpdatedAt: string | null;
+  syncedAt: string | null;
+}
+
+export async function getJiraStatus(projectId: string): Promise<JiraConnection> {
+  return api<JiraConnection>(`/api/projects/${projectId}/jira/status`);
+}
+
+export async function listJiraProjects(projectId: string): Promise<JiraProject[]> {
+  return api<JiraProject[]>(`/api/projects/${projectId}/jira/projects`);
+}
+
+export async function connectJiraProjects(
+  projectId: string,
+  projects: { id: string; key: string; name: string }[]
+): Promise<void> {
+  await api(`/api/projects/${projectId}/jira/projects`, { method: "POST", body: { projects } });
+}
+
+// ── Integration sync runs ──
+// Sync is queued, not synchronous: POST returns a run to poll rather than a finished count.
+
+export type SyncRunStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
+export type SyncRunStage = "queued" | "connecting" | "fetching_tickets" | "building_documents" | "done" | "failed";
+
+export interface SyncRun {
+  id: string;
+  provider: string;
+  status: SyncRunStatus;
+  stage: SyncRunStage;
+  remoteProjectKey: string | null;
+  /** The mapped Jira project / Linear Team or Project name. Null for runs recorded before it was stored. */
+  remoteProjectName: string | null;
+  totalTickets: number;
+  processedTickets: number;
+  failedTickets: number;
+  documentsCreated: number;
+  documentsUpdated: number;
+  commentsSynced: number;
+  decisionSummaries: number;
+  error: string | null;
+  triggeredByName: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+}
+
+export interface StartSyncResult {
+  run: SyncRun;
+  /** True when a run was already in flight and this request joined it instead of starting another. */
+  alreadyRunning: boolean;
+}
+
+export function isSyncRunActive(run: SyncRun | null | undefined): boolean {
+  return !!run && (run.status === "queued" || run.status === "running");
+}
+
+export async function syncJiraTickets(projectId: string): Promise<StartSyncResult> {
+  return api<StartSyncResult>(`/api/projects/${projectId}/jira/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function getIntegrationSyncStatus(projectId: string, provider: IntegrationProvider): Promise<{ run: SyncRun | null }> {
+  return api<{ run: SyncRun | null }>(`/api/projects/${projectId}/integrations/${provider}/sync-status`);
+}
+
+export async function getIntegrationSyncHistory(projectId: string): Promise<{ runs: SyncRun[] }> {
+  return api<{ runs: SyncRun[] }>(`/api/projects/${projectId}/integrations/sync-history`);
+}
+
+export async function addJiraComment(
+  projectId: string,
+  issueKey: string,
+  comment: string,
+  testCases?: { id: string; title: string }[]
+): Promise<void> {
+  await api(`/api/projects/${projectId}/jira/comment`, {
+    method: "POST",
+    body: { issueKey, comment, testCases },
+  });
+}
+
+export interface TicketListParams {
+  limit?: number;
+  offset?: number;
+  search?: string;
+  issueType?: string;
+  status?: string;
+  coverage?: "covered" | "uncovered";
+  // Omitted: tickets from whatever's currently mapped. Set to one of JiraConnection.history's /
+  // LinearConnection.history's remote ids to browse a specific past (no-longer-mapped) source
+  // instead — nothing here is ever deleted, so old sources stay reachable this way.
+  remoteId?: string;
+}
+
+function ticketListParamsToSearch(params?: TicketListParams): URLSearchParams {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.search) sp.set("search", params.search);
+  if (params?.issueType) sp.set("issueType", params.issueType);
+  if (params?.status) sp.set("status", params.status);
+  if (params?.coverage) sp.set("coverage", params.coverage);
+  if (params?.remoteId) sp.set("remoteId", params.remoteId);
+  return sp;
+}
+
+export async function listJiraTickets(
+  projectId: string,
+  params?: TicketListParams
+): Promise<{ list: JiraTicket[]; total: number }> {
+  const query = ticketListParamsToSearch(params).toString();
+  return api<{ list: JiraTicket[]; total: number }>(
+    `/api/projects/${projectId}/jira/tickets${query ? `?${query}` : ""}`
+  );
+}
+
+// One synced ticket by exact key, scoped to the project rather than to its currently enabled Jira
+// mapping (unlike listJiraTickets) — the scope Zyra reads tickets in, so a cited ticket always opens.
+export async function getJiraTicket(projectId: string, issueKey: string): Promise<JiraTicket> {
+  return api<JiraTicket>(`/api/projects/${projectId}/jira/tickets/${encodeURIComponent(issueKey)}`);
+}
+
+export interface IssueSearchResult {
+  provider: "JIRA" | "LINEAR";
+  key: string;
+  summary: string;
+  status: string;
+  url: string;
+}
+
+export async function searchJiraIssuesLive(projectId: string, search: string): Promise<{ list: IssueSearchResult[] }> {
+  const sp = new URLSearchParams();
+  if (search) sp.set("search", search);
+  return api(`/api/projects/${projectId}/jira/search-issues?${sp.toString()}`);
+}
+
+// ── Linear (project-scoped mapping/sync/tickets) ──
+// Linear's unit of work is a "team" rather than a "project" — the shape below mirrors Jira's
+// so the two providers can share UI, but the field names stay Linear-accurate.
+
+export interface LinearConnection {
+  connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
+  id?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: LinearConnectedTeam[];
+  // Every Linear team/project this TestPilot project has ever been linked to (disabled, never deleted)
+  // — lets the Requirements page offer a "previously linked" source alongside the current one.
+  history?: LinearConnectedTeam[];
+}
+
+export interface LinearConnectedTeam {
+  id: string;
+  linearTeamId: string;
+  linearTeamKey: string;
+  linearTeamName: string;
+  entityType?: "team" | "project";
+  createdAt: string;
+}
+
+export interface LinearTeam {
+  id: string;
+  key: string;
+  name: string;
+  style: string;
+  connected: boolean;
+  // Present on every row now that the picker lists Linear Teams and Projects together (Teams are
+  // Linear's mandatory, every-issue-belongs-to-one container; Projects are an optional, often
+  // cross-team grouping) — optional only so this type stays a strict superset of the pre-feature
+  // shape.
+  entityType?: "team" | "project";
+}
+
+export interface LinearTicket {
+  id: string;
+  linearIssueId: string;
+  linearIssueKey: string;
+  summary: string;
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  linearUrl: string;
+  linearCreatedAt: string | null;
+  linearUpdatedAt: string | null;
+  syncedAt: string | null;
+}
+
+export async function getLinearStatus(projectId: string): Promise<LinearConnection> {
+  return api<LinearConnection>(`/api/projects/${projectId}/linear/status`);
+}
+
+export async function listLinearTeams(projectId: string): Promise<LinearTeam[]> {
+  return api<LinearTeam[]>(`/api/projects/${projectId}/linear/teams`);
+}
+
+export async function connectLinearTeams(
+  projectId: string,
+  projects: { id: string; key: string; name: string; entityType?: "team" | "project" }[]
+): Promise<void> {
+  await api(`/api/projects/${projectId}/linear/teams`, { method: "POST", body: { projects } });
+}
+
+export async function syncLinearTickets(projectId: string): Promise<StartSyncResult> {
+  return api<StartSyncResult>(`/api/projects/${projectId}/linear/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function addLinearComment(projectId: string, issueKey: string, comment: string): Promise<void> {
+  await api(`/api/projects/${projectId}/linear/comment`, { method: "POST", body: { issueKey, comment } });
+}
+
+export async function listLinearTickets(
+  projectId: string,
+  params?: TicketListParams
+): Promise<{ list: LinearTicket[]; total: number }> {
+  const query = ticketListParamsToSearch(params).toString();
+  return api<{ list: LinearTicket[]; total: number }>(
+    `/api/projects/${projectId}/linear/tickets${query ? `?${query}` : ""}`
+  );
+}
+
+export async function searchLinearIssuesLive(projectId: string, search: string): Promise<{ list: IssueSearchResult[] }> {
+  const sp = new URLSearchParams();
+  if (search) sp.set("search", search);
+  return api(`/api/projects/${projectId}/linear/search-issues?${sp.toString()}`);
+}
+
+// ── Notion (project-scoped mapping/sync/pages) ──
+// Notion's unit of work is a "database" (a table of pages). One database feeds a TestPilot project and
+// each of its pages is mirrored as a ticket. Test cases link by the full page id; the short
+// `notion:xxxxxxxx` key is a display label only.
+
+export interface NotionConnection {
+  connected: boolean;
+  /** Set when the connection exists but this deployment can no longer renew it — reconnect to fix. */
+  needsReconnect?: boolean;
+  authError?: string | null;
+  id?: string;
+  siteUrl?: string;
+  tokenExpiresAt?: string;
+  connectedBy?: string;
+  createdAt?: string;
+  connectedProjects?: NotionConnectedDatabase[];
+  // Every database this TestPilot project has ever been linked to (disabled, never deleted).
+  history?: NotionConnectedDatabase[];
+}
+
+export interface NotionConnectedDatabase {
+  id: string;
+  notionDatabaseId: string;
+  notionDatabaseName: string;
+  createdAt: string;
+}
+
+/** A database the TestPilot integration has been shared with. */
+export interface NotionDatabase {
+  id: string;
+  name: string;
+  url: string;
+  connected: boolean;
+}
+
+export interface NotionPage {
+  id: string;
+  notionPageId: string;
+  /** Short display label, `notion:xxxxxxxx`. */
+  notionPageKey: string;
+  summary: string;
+  /** Markdown. */
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  notionUrl: string;
+  notionCreatedAt: string | null;
+  notionUpdatedAt: string | null;
+  syncedAt: string | null;
+}
+
+export async function getNotionStatus(projectId: string): Promise<NotionConnection> {
+  return api<NotionConnection>(`/api/projects/${projectId}/notion/status`);
+}
+
+/** Empty when nothing has been shared with the TestPilot integration in Notion yet. */
+export async function listNotionDatabases(projectId: string): Promise<NotionDatabase[]> {
+  return api<NotionDatabase[]>(`/api/projects/${projectId}/notion/databases`);
+}
+
+export async function connectNotionDatabase(
+  projectId: string,
+  database: { databaseId: string; databaseName: string }
+): Promise<void> {
+  await api(`/api/projects/${projectId}/notion/databases`, { method: "POST", body: database });
+}
+
+export async function syncNotionPages(projectId: string): Promise<StartSyncResult> {
+  return api<StartSyncResult>(`/api/projects/${projectId}/notion/sync`, {
+    method: "POST",
+    signal: AbortSignal.timeout(INTEGRATION_CALL_TIMEOUT_MS)
+  });
+}
+
+export async function addNotionComment(projectId: string, pageId: string, comment: string): Promise<void> {
+  await api(`/api/projects/${projectId}/notion/comment`, { method: "POST", body: { pageId, comment } });
+}
+
+export async function listNotionPages(
+  projectId: string,
+  params?: TicketListParams
+): Promise<{ list: NotionPage[]; total: number }> {
+  const query = ticketListParamsToSearch(params).toString();
+  return api<{ list: NotionPage[]; total: number }>(
+    `/api/projects/${projectId}/notion/pages${query ? `?${query}` : ""}`
+  );
+}
+
+/** A live Notion search hit. Kept apart from IssueSearchResult: Notion is not a bug tracker, so it never feeds the bug pickers. */
+export interface NotionSearchResult {
+  provider: "NOTION";
+  /** Short display label, `notion:xxxxxxxx`. */
+  key: string;
+  /** The full page id a test case links by. */
+  pageId: string;
+  summary: string;
+  status: string;
+  url: string;
+}
+
+export async function searchNotionPagesLive(projectId: string, search: string): Promise<{ list: NotionSearchResult[] }> {
+  const sp = new URLSearchParams();
+  if (search) sp.set("search", search);
+  return api(`/api/projects/${projectId}/notion/search-pages?${sp.toString()}`);
+}
+
+// ── Requirements page: cross-source (Jira + Linear + Notion) aggregates ──
+
+export interface TicketSourceStats {
+  total: number;
+  covered: number;
+  uncovered: number;
+  types: string[];
+  statuses: string[];
+}
+
+export interface RequirementsSummary {
+  all: TicketSourceStats;
+  jira: TicketSourceStats;
+  linear: TicketSourceStats;
+  notion: TicketSourceStats;
+}
+
+export async function getRequirementsSummary(projectId: string): Promise<RequirementsSummary> {
+  return api<RequirementsSummary>(`/api/projects/${projectId}/tickets/summary`);
+}
+
+export interface AllSourcesTicket {
+  id: string;
+  source: "jira" | "linear" | "notion";
+  key: string;
+  /** What a test case links to: the issue key for Jira/Linear, the full page id for Notion (`key` is only its short label). */
+  externalId: string;
+  summary: string;
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  url: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  hasCoverage: boolean;
+}
+
+export async function listAllTickets(
+  projectId: string,
+  params?: TicketListParams
+): Promise<{ list: AllSourcesTicket[]; total: number }> {
+  const query = ticketListParamsToSearch(params).toString();
+  return api<{ list: AllSourcesTicket[]; total: number }>(
+    `/api/projects/${projectId}/tickets${query ? `?${query}` : ""}`
+  );
+}
+
+// ── Knowledge Base ──
+
+export interface KnowledgeFolder {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  parentFolderId: string | null;
+  name: string;
+  description: string | null;
+  isRoot: boolean;
+  createdBy: string | null;
+  updatedBy: string | null;
+  isDeleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface KnowledgeFolderTreeNode extends KnowledgeFolder {
+  children: KnowledgeFolderTreeNode[];
+}
+
+export type KnowledgeDocumentType =
+  | "general"
+  | "requirement_note"
+  | "test_data_note"
+  | "api_note"
+  | "release_note"
+  | "ai_memory";
+export type KnowledgeDocumentStatus = "draft" | "published" | "approved" | "rejected";
+
+export interface KnowledgeDocument {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  folderId: string;
+  title: string;
+  contentJson: unknown;
+  contentHtml: string | null;
+  contentText: string | null;
+  documentType: KnowledgeDocumentType;
+  status: KnowledgeDocumentStatus;
+  isAiGenerated: boolean;
+  sourceProvider: string | null;
+  sourceExternalId: string | null;
+  sourceUrl: string | null;
+  /** "mirror" = provider-owned, overwritten every sync. "notes" = the human-owned sibling. */
+  sourceRole: "mirror" | "notes" | null;
+  sourceSyncedBy: string | null;
+  sourceSyncedAt: string | null;
+  /** True for provider mirrors: the editor is locked and the API rejects updates. */
+  isReadOnly: boolean;
+  /** Display name of whoever last ran the sync that wrote this document. Detail endpoint only. */
+  syncedByName?: string | null;
+  /** Zyra's own memory document: not directly editable, changed one entry at a time. Detail endpoint only. */
+  isManagedByZyra?: boolean;
+  /** Its entries, newest first, plus any text above the first entry (id "unstructured"). Only when isManagedByZyra. */
+  zyraMemory?: { unstructured: string; entries: Array<{ id: string; note: string }> };
+  createdBy: string | null;
+  updatedBy: string | null;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  isDeleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface KnowledgeFile {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  folderId: string;
+  fileName: string;
+  originalFileName: string;
+  mimeType: string | null;
+  fileExtension: string | null;
+  fileSize: number | null;
+  storageKey: string | null;
+  uploadedBy: string | null;
+  isDeleted: boolean;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export type KnowledgeBreadcrumbEntry = { id: string; name: string };
+
+export type KnowledgeItem = (KnowledgeFolder | KnowledgeDocument | KnowledgeFile) & {
+  type: "folder" | "document" | "file";
+  updatedByName?: string | null;
+  updatedByEmail?: string | null;
+};
+
+export interface KnowledgeDocumentVersion {
+  id: string;
+  versionNumber: number;
+  title: string;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+// Folders
+
+export function getKnowledgeFolderTree(projectId: string): Promise<KnowledgeFolderTreeNode> {
+  return api<KnowledgeFolderTreeNode>(`/api/projects/${projectId}/knowledge-base/folders/tree`);
+}
+
+export interface KnowledgeBaseSummary {
+  folders: number;
+  documents: number;
+  files: number;
+  total: number;
+}
+
+export function getKnowledgeBaseSummary(projectId: string): Promise<KnowledgeBaseSummary> {
+  return api<KnowledgeBaseSummary>(`/api/projects/${projectId}/knowledge-base/summary`);
+}
+
+export function getKnowledgeFolderExportUrl(projectId: string, folderId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/knowledge-base/folders/${folderId}/export`;
+}
+
+export function getKnowledgeFolder(
+  projectId: string,
+  folderId: string
+): Promise<KnowledgeFolder & { breadcrumb: KnowledgeBreadcrumbEntry[] }> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}`);
+}
+
+export function listKnowledgeFolderItems(
+  projectId: string,
+  folderId: string,
+  params?: { search?: string }
+): Promise<{ folder: KnowledgeFolder & { breadcrumb: KnowledgeBreadcrumbEntry[] }; items: KnowledgeItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.search) sp.set("search", params.search);
+  const query = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}/items${query ? `?${query}` : ""}`);
+}
+
+export function createKnowledgeFolder(
+  projectId: string,
+  data: { name: string; description?: string; parentFolderId?: string }
+): Promise<KnowledgeFolder> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders`, { method: "POST", body: data });
+}
+
+export function updateKnowledgeFolder(
+  projectId: string,
+  folderId: string,
+  data: { name?: string; description?: string }
+): Promise<KnowledgeFolder> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}`, { method: "PATCH", body: data });
+}
+
+export function moveKnowledgeFolder(projectId: string, folderId: string, parentFolderId: string): Promise<KnowledgeFolder> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}/move`, {
+    method: "PATCH",
+    body: { parentFolderId },
+  });
+}
+
+export function deleteKnowledgeFolder(projectId: string, folderId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}`, { method: "DELETE" });
+}
+
+export function restoreKnowledgeFolder(projectId: string, folderId: string): Promise<KnowledgeFolder> {
+  return api(`/api/projects/${projectId}/knowledge-base/folders/${folderId}/restore`, { method: "PATCH" });
+}
+
+// Documents
+
+export function listKnowledgeDocuments(
+  projectId: string,
+  params?: { documentType?: string }
+): Promise<{ list: KnowledgeDocument[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.documentType) sp.set("documentType", params.documentType);
+  const query = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/documents${query ? `?${query}` : ""}`);
+}
+
+export function createKnowledgeDocument(
+  projectId: string,
+  data: { folderId: string; title: string; documentType?: string; contentJson?: unknown; contentHtml?: string; contentText?: string }
+): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents`, { method: "POST", body: data });
+}
+
+export function getKnowledgeDocument(
+  projectId: string,
+  documentId: string
+): Promise<KnowledgeDocument & { breadcrumb: KnowledgeBreadcrumbEntry[] }> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`);
+}
+
+// The Update History popover/modal on any Knowledge Base document — a synced ticket's sync-pipeline
+// timeline, or a manually-created document's synthesized add/update/review timeline. Both shapes
+// are identical to this caller; see getKnowledgeDocumentHistory in legacy.service.ts.
+export interface KnowledgeChangedField {
+  label: string;
+  oldExcerpt: string;
+  newExcerpt: string;
+  oldLength: number;
+  newLength: number;
+  truncated: boolean;
+}
+
+export interface KnowledgeDocumentHistoryEntry {
+  id: string;
+  eventType: "created" | "updated";
+  changedSummary: string | null;
+  changedFields: KnowledgeChangedField[];
+  createdAt: string;
+  actorName: string;
+  /** Set only for a manual document's version-diff entry — lets the row offer "Restore". */
+  versionId: string | null;
+}
+
+export function getKnowledgeDocumentHistory(
+  projectId: string,
+  documentId: string,
+  page: { limit?: number; offset?: number } = {}
+): Promise<{ events: KnowledgeDocumentHistoryEntry[]; hasMore: boolean }> {
+  const sp = new URLSearchParams();
+  if (page.limit != null) sp.set("limit", String(page.limit));
+  if (page.offset != null) sp.set("offset", String(page.offset));
+  const qs = sp.toString();
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/history${qs ? `?${qs}` : ""}`);
+}
+
+export function updateKnowledgeDocument(
+  projectId: string,
+  documentId: string,
+  data: Partial<{ title: string; contentJson: unknown; contentHtml: string; contentText: string; documentType: string; status: string }>
+): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`, { method: "PATCH", body: data });
+}
+
+export function moveKnowledgeDocument(projectId: string, documentId: string, folderId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/move`, { method: "PATCH", body: { folderId } });
+}
+
+export function duplicateKnowledgeDocument(projectId: string, documentId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/duplicate`, { method: "POST" });
+}
+
+export function deleteKnowledgeDocument(projectId: string, documentId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}`, { method: "DELETE" });
+}
+
+/** Zyra AI Memory: replace one entry's note, keeping its timestamp. Owner/manager only. */
+export function updateZyraMemoryEntry(projectId: string, documentId: string, entryId: string, note: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/memory-entries/${encodeURIComponent(entryId)}`, {
+    method: "PATCH",
+    body: { note },
+  });
+}
+
+/** Zyra AI Memory: remove one entry. Owner/manager only. */
+export function deleteZyraMemoryEntry(projectId: string, documentId: string, entryId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/memory-entries/${encodeURIComponent(entryId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function restoreKnowledgeDocument(projectId: string, documentId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/restore`, { method: "PATCH" });
+}
+
+export function listKnowledgeDocumentVersions(
+  projectId: string,
+  documentId: string
+): Promise<{ list: KnowledgeDocumentVersion[]; total: number }> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/versions`);
+}
+
+export function restoreKnowledgeDocumentVersion(projectId: string, documentId: string, versionId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/restore-version`, {
+    method: "POST",
+    body: { versionId },
+  });
+}
+
+export function approveAiMemory(projectId: string, documentId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/approve-ai-memory`, { method: "PATCH" });
+}
+
+export function rejectAiMemory(projectId: string, documentId: string): Promise<KnowledgeDocument> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/reject-ai-memory`, { method: "PATCH" });
+}
+
+// Document comments
+// Stored separately from the document body, so they work on read-only provider mirrors whose
+// body is rewritten by every sync.
+
+export interface KnowledgeDocumentComment {
+  id: string;
+  documentId: string;
+  parentCommentId: string | null;
+  authorId: string | null;
+  authorName: string;
+  body: string;
+  /** Quoted passage this thread is anchored to, or null for a document-level comment. */
+  anchorText: string | null;
+  anchorStart: number | null;
+  anchorEnd: number | null;
+  isResolved: boolean;
+  resolvedBy: string | null;
+  resolvedByName: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** One level of nesting only — replies never have replies of their own. */
+  replies: KnowledgeDocumentComment[];
+}
+
+export function listKnowledgeDocumentComments(
+  projectId: string,
+  documentId: string
+): Promise<{ list: KnowledgeDocumentComment[]; total: number; openCount: number }> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/comments`);
+}
+
+export function createKnowledgeDocumentComment(
+  projectId: string,
+  documentId: string,
+  input: { body: string; parentCommentId?: string; anchorText?: string; anchorStart?: number; anchorEnd?: number }
+): Promise<KnowledgeDocumentComment> {
+  return api(`/api/projects/${projectId}/knowledge-base/documents/${documentId}/comments`, { method: "POST", body: input });
+}
+
+export function updateKnowledgeDocumentComment(
+  projectId: string,
+  commentId: string,
+  input: { body?: string; isResolved?: boolean }
+): Promise<KnowledgeDocumentComment> {
+  return api(`/api/projects/${projectId}/knowledge-base/comments/${commentId}`, { method: "PATCH", body: input });
+}
+
+export function deleteKnowledgeDocumentComment(projectId: string, commentId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/knowledge-base/comments/${commentId}`, { method: "DELETE" });
+}
+
+// Files
+
+// Matches the backend's FilesInterceptor("files", 10, ...) cap per request — files beyond this
+// count in a single multipart request are dropped by multer, so larger selections are split into
+// sequential batches here instead of raising the per-request limit (which holds every file for a
+// batch in memory until the whole batch validates).
+const KB_UPLOAD_BATCH_SIZE = 10;
+
+async function uploadKnowledgeFileBatch(
+  projectId: string,
+  folderId: string,
+  files: File[]
+): Promise<{ list: KnowledgeFile[]; total: number }> {
+  const formData = new FormData();
+  formData.append("folderId", folderId);
+  for (const file of files) formData.append("files", file);
+  const res = await fetchWithNetworkErrorMessage(
+    `${API_BASE}/api/projects/${projectId}/knowledge-base/files/upload`,
+    { method: "POST", credentials: "include", body: formData }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((err as { error?: string }).error || String(res.status));
+  }
+  return res.json();
+}
+
+export async function uploadKnowledgeFiles(
+  projectId: string,
+  folderId: string,
+  files: File[],
+  onProgress?: (uploaded: number, total: number) => void
+): Promise<{ list: KnowledgeFile[]; total: number }> {
+  const list: KnowledgeFile[] = [];
+  for (let i = 0; i < files.length; i += KB_UPLOAD_BATCH_SIZE) {
+    const batch = files.slice(i, i + KB_UPLOAD_BATCH_SIZE);
+    const result = await uploadKnowledgeFileBatch(projectId, folderId, batch);
+    list.push(...result.list);
+    onProgress?.(Math.min(i + batch.length, files.length), files.length);
+  }
+  return { list, total: list.length };
+}
+
+export function getKnowledgeFile(
+  projectId: string,
+  fileId: string
+): Promise<KnowledgeFile & { breadcrumb: KnowledgeBreadcrumbEntry[] }> {
+  return api(`/api/projects/${projectId}/knowledge-base/files/${fileId}`);
+}
+
+export function updateKnowledgeFile(projectId: string, fileId: string, originalFileName: string): Promise<KnowledgeFile> {
+  return api(`/api/projects/${projectId}/knowledge-base/files/${fileId}`, {
+    method: "PATCH",
+    body: { originalFileName },
+  });
+}
+
+export function moveKnowledgeFile(projectId: string, fileId: string, folderId: string): Promise<KnowledgeFile> {
+  return api(`/api/projects/${projectId}/knowledge-base/files/${fileId}/move`, { method: "PATCH", body: { folderId } });
+}
+
+export function deleteKnowledgeFile(projectId: string, fileId: string): Promise<{ success: boolean }> {
+  return api(`/api/projects/${projectId}/knowledge-base/files/${fileId}`, { method: "DELETE" });
+}
+
+export function restoreKnowledgeFile(projectId: string, fileId: string): Promise<KnowledgeFile> {
+  return api(`/api/projects/${projectId}/knowledge-base/files/${fileId}/restore`, { method: "PATCH" });
+}
+
+export function getKnowledgeFileDownloadUrl(projectId: string, fileId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/knowledge-base/files/${fileId}/download`;
+}
+
+export function getKnowledgeFilePreviewUrl(projectId: string, fileId: string): string {
+  return `${API_BASE}/api/projects/${projectId}/knowledge-base/files/${fileId}/preview`;
+}
+
+// Search
+
+export function searchKnowledgeBase(
+  projectId: string,
+  params: { q: string; type?: string; date?: string }
+): Promise<{ list: KnowledgeItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  sp.set("q", params.q);
+  if (params.type) sp.set("type", params.type);
+  if (params.date) sp.set("date", params.date);
+  return api(`/api/projects/${projectId}/knowledge-base/search?${sp.toString()}`);
+}
+
+// ── Activity Feed ──
+
+export interface ActivityLogItem {
+  id: string;
+  actorId: string | null;
+  actorEmail: string | null;
+  actorName: string | null;
+  actorKind: "user" | "agent" | null;
+  action: string;
+  entityType: string;
+  entityId: string | null;
+  entityName: string | null;
+  diff: string | null;
+  createdAt: string;
+}
+
+export async function listActivity(
+  projectId: string,
+  params?: { limit?: number; offset?: number; entityType?: string; entityId?: string; actorId?: string; search?: string; since?: string }
+): Promise<{ list: ActivityLogItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.entityType) sp.set("entityType", params.entityType);
+  if (params?.entityId) sp.set("entityId", params.entityId);
+  if (params?.actorId) sp.set("actorId", params.actorId);
+  if (params?.search) sp.set("search", params.search);
+  if (params?.since) sp.set("since", params.since);
+  const query = sp.toString();
+  return api<{ list: ActivityLogItem[]; total: number }>(
+    `/api/projects/${projectId}/activity${query ? `?${query}` : ""}`
+  );
+}
+
+export interface ActivitySummary {
+  weekly: { created: number; updated: number; aiActions: number; deleted: number; total: number };
+  activeMembers: {
+    actorId: string;
+    actorName: string | null;
+    actorEmail: string | null;
+    actorKind: "user" | "agent" | null;
+    count: number;
+  }[];
+  byEntityType: { entityType: string; count: number }[];
+}
+
+export async function getActivitySummary(projectId: string): Promise<ActivitySummary> {
+  return api<ActivitySummary>(`/api/projects/${projectId}/activity/summary`);
+}
+
+// ── Workspace Activity (master feed, owner-only) ──
+
+export interface WorkspaceActivityLogItem extends ActivityLogItem {
+  projectId: string | null;
+  projectName: string | null;
+}
+
+export async function listWorkspaceActivity(params?: {
+  limit?: number;
+  offset?: number;
+  entityType?: string;
+  actorId?: string;
+  projectId?: string;
+  search?: string;
+  since?: string;
+}): Promise<{ list: WorkspaceActivityLogItem[]; total: number }> {
+  const sp = new URLSearchParams();
+  if (params?.limit != null) sp.set("limit", String(params.limit));
+  if (params?.offset != null) sp.set("offset", String(params.offset));
+  if (params?.entityType) sp.set("entityType", params.entityType);
+  if (params?.actorId) sp.set("actorId", params.actorId);
+  if (params?.projectId) sp.set("projectId", params.projectId);
+  if (params?.search) sp.set("search", params.search);
+  if (params?.since) sp.set("since", params.since);
+  const query = sp.toString();
+  return api<{ list: WorkspaceActivityLogItem[]; total: number }>(
+    `/api/workspace/activity${query ? `?${query}` : ""}`
+  );
+}
+
+export async function getWorkspaceActivitySummary(): Promise<ActivitySummary> {
+  return api<ActivitySummary>("/api/workspace/activity/summary");
+}
+
+// ── Automation ingest (Basecamp 10189985971) ──────────────────────────────────
+//
+// Replaces the previous "TestPilot Test Manager reports module" block: ~30 client functions
+// (listTestPilotRuns, ingestTestPilotPlaywright, the alert-rule CRUD, share links, key rotation) plus
+// their types, none of which was imported anywhere, and only six of which had any backend at all
+// — the rest called routes that did not exist.
+//
+// It was not merely dead, it encoded the opposite design: TestPilotRunCase was keyed on `specName` +
+// `title` and getTestPilotTestHistory looked history up by test name, which is precisely the
+// name-matching the card's §3 rules out ("breaks silently on refactors, and produces results
+// attached to the wrong case with no visible error"), and its runs lived outside `cycles` so they
+// could never appear in the runs list, the traceability matrix or a test case's own history.
+//
+// Automation results are now ordinary runs and executions, linked by the test case's external id.
+
+/** What kind of file a piece of evidence is, which decides how the viewer renders it. */
+export type EvidenceKind = "screenshot" | "video" | "trace" | "log" | "api";
+
+export interface ExecutionEvidence {
+  id: string;
+  kind: EvidenceKind | null;
+  fileName: string;
+  fileSize: number | null;
+  contentType: string | null;
+  createdAt?: string;
+}
+
+export interface AutomationRunResult {
+  caseId: string | null;
+  title: string;
+  executionId: string;
+  status: string;
+  durationMs: number | null;
+  retryCount: number;
+  errorMessage: string | null;
+  executedAt: string | null;
+  reportedBy: "human" | "automation";
+  evidence: ExecutionEvidence[];
+}
+
+export interface AutomationRunSummary {
+  runId: string;
+  name: string;
+  status: string;
+  source: "manual" | "automation";
+  triggeredBy: string | null;
+  commitSha: string | null;
+  branch: string | null;
+  buildUrl: string | null;
+  externalId: string | null;
+  environment: string | null;
+  buildVersion: string | null;
+  releaseName: string | null;
+  startedAt: string | null;
+  endedAt: string | null;
+  closedAt: string | null;
+  closeStatus: "completed" | "incomplete" | null;
+  lastResultAt: string | null;
+  createdAt: string;
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+    blocked: number;
+    untested: number;
+  };
+}
+
+export interface AutomationRunDetail extends AutomationRunSummary {
+  results: AutomationRunResult[];
+}
+
+export async function getAutomationRun(projectId: string, runId: string): Promise<AutomationRunDetail> {
+  return api<AutomationRunDetail>(`/api/projects/${projectId}/automation/runs/${runId}`);
+}
+
+// ── Execution evidence ────────────────────────────────────────────────────────
+//
+// The backend has served POST/GET /api/cycles/:cycleId/executions/:executionId/attachments since
+// the bug-evidence work, and nothing in the frontend has ever called either — so evidence has been
+// storable, billable against the plan's storage allowance, and unviewable. These two are what the
+// run screens use to show it.
+
+export async function listExecutionEvidence(
+  cycleId: string,
+  executionId: string
+): Promise<{ list: ExecutionEvidence[]; total: number }> {
+  return api<{ list: ExecutionEvidence[]; total: number }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments`
+  );
+}
+
+/*
+ * Playwright trace viewing.
+ *
+ * A trace .zip is not something a browser can open; the thing that renders it is Playwright's own
+ * web app at trace.playwright.dev, which runs wholly in the visitor's browser and fetches the
+ * archive itself — cross-origin, with no cookies. So the ordinary evidence download URL is no use
+ * to it (session-authorized, and it redirects to a private presigned URL). These mint a short-lived
+ * signed link instead and turn it into the viewer URL.
+ *
+ * The trace bytes go from our API to the person's own browser. trace.playwright.dev uploads
+ * nothing and stores nothing — it is a static page — but the link it is handed does grant access to
+ * that one archive until it expires, which is why the token is scoped to a single attachment and
+ * lives for an hour rather than indefinitely.
+ */
+export async function createExecutionTraceLink(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ token: string; expiresAt: string }> {
+  return api<{ token: string; expiresAt: string }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-link`
+  );
+}
+
+/** The parsed JSON of one `api` evidence file (an envelope or a HAR), for the request/response viewer. */
+export async function getExecutionApiEvidence(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<{ fileName: string; data: unknown }> {
+  return api<{ fileName: string; data: unknown }>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/api-content`
+  );
+}
+
+/** The URL the viewer fetches: our API, redeeming the signed token, with CORS for that one origin. */
+export function publicTraceUrl(token: string): string {
+  return `${API_BASE}/api/public/trace/${token}`;
+}
+
+/** Playwright's hosted viewer, pointed at a trace of ours. Used for both the iframe and the tab. */
+export function playwrightTraceViewerUrl(traceUrl: string): string {
+  return `https://trace.playwright.dev/?trace=${encodeURIComponent(traceUrl)}`;
+}
+
+export async function uploadExecutionEvidence(
+  cycleId: string,
+  executionId: string,
+  files: File[]
+): Promise<{ list: ExecutionEvidence[]; total: number }> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  const token = typeof window !== "undefined" ? readStoredValue("token") : null;
+  const res = await fetch(`${API_BASE}/api/cycles/${cycleId}/executions/${executionId}/attachments`, {
+    method: "POST",
+    credentials: "include",
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    body: form,
+  });
+  if (!res.ok) {
+    // The backend answers a rejected upload with { error } naming the file and the limit; surface
+    // that rather than a generic message, since "which file and why" is the whole point of it.
+    const text = await res.text();
+    let message = "Failed to upload evidence";
+    try {
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed?.error) message = parsed.error;
+    } catch {
+      if (text) message = text;
+    }
+    throw new Error(message);
+  }
+  return res.json() as Promise<{ list: ExecutionEvidence[]; total: number }>;
+}
