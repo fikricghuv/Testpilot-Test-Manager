@@ -1,0 +1,314 @@
+/**
+ * The Phase 1 notification matrix: one entry per scenario, with the exact message wording from the
+ * product's notification matrix and its High/Medium/Low priority.
+ *
+ * Priority is business metadata only. There is deliberately no `priority` column on `notifications`
+ * (no migration was wanted for it), so it lives here, next to the wording it belongs to, and is
+ * not persisted or returned by the API.
+ */
+
+export type NotificationPriority = "High" | "Medium" | "Low";
+
+export type NotificationType =
+  | "workspace_invitation"
+  | "workspace_invitation_accepted"
+  | "workspace_role_changed"
+  | "workspace_removed"
+  | "project_invitation"
+  | "project_invitation_accepted"
+  | "project_removed"
+  | "project_role_changed"
+  | "test_run_assigned"
+  | "test_case_failed"
+  | "test_case_blocked"
+  | "test_case_status_changed"
+  | "test_run_started"
+  | "test_run_completed"
+  | "test_run_reopened"
+  | "test_run_due_soon"
+  | "test_run_due_today"
+  | "test_run_overdue"
+  | "test_plan_due_soon"
+  | "test_plan_due_today"
+  | "test_plan_overdue"
+  | "bug_assigned"
+  | "bug_reassigned"
+  | "bug_status_changed"
+  | "bug_mentioned"
+  | "comment_reply"
+  | "zyra_generation_ready"
+  | "zyra_generation_failed"
+  | "zyra_task_failed"
+  | "zyra_review_completed"
+  | "zyra_coverage_completed"
+  | "kb_document_ready"
+  | "kb_document_failed"
+  | "kb_document_updated"
+  | "kb_document_deleted"
+  | "integration_connected"
+  | "integration_disconnected"
+  | "integration_auth_expired"
+  | "integration_sync_completed"
+  | "integration_sync_failed"
+  | "integration_issue_linked"
+  | "requirement_updated";
+
+/**
+ * Not implemented — the extension point for the integration notifications (connected, disconnected,
+ * authentication expired, sync completed / failed, issue or page linked). They are provider-generic
+ * on purpose: Jira, Linear and Notion all share the one set of event types and differ only in the
+ * `provider` that fills the message, so adding Notion (as V133 added it to the integration tables)
+ * is a new member of this union, not a new notification system. When they are built they add types
+ * to NotificationType and message/link entries below, and go through LegacyService.notifyUsers like
+ * every Phase 1 scenario; recipients are "connecting user / project admins", resolved at the call site.
+ */
+export type IntegrationProvider = "jira" | "linear" | "notion";
+
+export const NOTIFICATION_PRIORITY: Record<NotificationType, NotificationPriority> = {
+  workspace_invitation: "High",
+  workspace_invitation_accepted: "Medium",
+  workspace_role_changed: "High",
+  workspace_removed: "High",
+  project_invitation: "High",
+  project_invitation_accepted: "Medium",
+  project_removed: "High",
+  project_role_changed: "High",
+  test_run_assigned: "High",
+  test_case_failed: "High",
+  test_case_blocked: "High",
+  // Not a row of the original matrix (which only names Failed / Blocked): added on request so an
+  // assignee hears about any other status change on their case. Priority follows bug_status_changed.
+  test_case_status_changed: "Medium",
+  // The run's own lifecycle — the Start Execution / Mark Completed / Reopen buttons.
+  test_run_started: "Medium",
+  test_run_completed: "Medium",
+  test_run_reopened: "Medium",
+  // Due-date reminders for plans and runs (see due-date-sweep): a heads-up is Medium, the day itself
+  // and a missed date are High.
+  test_run_due_soon: "Medium",
+  test_run_due_today: "High",
+  test_run_overdue: "High",
+  test_plan_due_soon: "Medium",
+  test_plan_due_today: "High",
+  test_plan_overdue: "High",
+  bug_assigned: "High",
+  bug_reassigned: "High",
+  bug_status_changed: "Medium",
+  bug_mentioned: "High",
+  // The matrix's Collaboration "Reply to comment" row.
+  comment_reply: "Medium",
+  // Phase 2 — Zyra. "Generation completed" (Medium) and "Review required" (High) are one event in
+  // this product (a generated batch lands in `in_review`; there is no separate "complete" state), so
+  // they send a single notification, with the higher priority and the more actionable wording.
+  zyra_generation_ready: "High",
+  // Likewise "Generation failed" and "Task failed" for the task-board generator. `zyra_task_failed`
+  // is the chat plan that pauses on an error, the one other unattended Zyra job.
+  zyra_generation_failed: "High",
+  zyra_task_failed: "High",
+  zyra_review_completed: "Medium",
+  zyra_coverage_completed: "Medium",
+  // Phase 2 — Knowledge Base and integrations (Jira / Linear / Notion share every integration type).
+  kb_document_ready: "Medium",
+  kb_document_failed: "High",
+  kb_document_updated: "Low",
+  kb_document_deleted: "Medium",
+  integration_connected: "Medium",
+  integration_disconnected: "High",
+  integration_auth_expired: "High",
+  integration_sync_completed: "Low",
+  integration_sync_failed: "High",
+  integration_issue_linked: "Low",
+  // A requirement is a ticket synced from Jira / Linear / Notion. "Requirement sync completed / failed"
+  // are the integration_sync_* notifications above: the Requirements page's "Sync all sources" is the
+  // same sync run, so there is one notification per run, not two.
+  requirement_updated: "Medium"
+};
+
+/** `notifications.title` is VARCHAR(255). */
+const TITLE_MAX = 255;
+
+export function clipNotificationTitle(message: string): string {
+  return message.length <= TITLE_MAX ? message : `${message.slice(0, TITLE_MAX - 1)}…`;
+}
+
+const ROLE_LABELS: Record<string, string> = { owner: "Owner", manager: "Manager", qa_engineer: "QA Engineer" };
+
+export function roleLabel(role: string): string {
+  return ROLE_LABELS[role] ?? role;
+}
+
+/**
+ * How a test run is named in a message: "TR-12 (Sprint 4)" when it has an ID, just "Sprint 4" when
+ * it does not. `cycles.external_id` is only set for runs created by automation ingest — a run made
+ * in the UI has none — so the ID is shown where it exists rather than invented here.
+ */
+export function runLabel(name: string, externalId?: string | null): string {
+  const id = (externalId ?? "").trim();
+  return id ? `${id} (${name})` : name;
+}
+
+function clipText(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * What a Zyra generation was about, for a notification body: "PROJ-123 – Login Flow" for one ticket
+ * (just the key when its title is unknown), "PROJ-1, PROJ-2 and 2 more" for several, the quoted start
+ * of the user story when no ticket was involved, "" when there is nothing to name.
+ */
+export function zyraSubject(tickets: Array<{ key: string; title?: string | null }>, story?: string | null): string {
+  const seen = new Set<string>();
+  const unique = tickets.filter((t) => {
+    const key = (t.key ?? "").trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (unique.length === 1) {
+    const title = clipText(unique[0].title ?? "", 80);
+    return title ? `${unique[0].key.trim()} – ${title}` : unique[0].key.trim();
+  }
+  if (unique.length > 1) {
+    const shown = unique.slice(0, 2).map((t) => t.key.trim()).join(", ");
+    return unique.length > 2 ? `${shown} and ${unique.length - 2} more` : shown;
+  }
+  const excerpt = clipText(story ?? "", 60);
+  return excerpt ? `"${excerpt}"` : "";
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+export const notificationMessages = {
+  workspaceInvitation: (workspaceName: string) => `You've been invited to join ${workspaceName}.`,
+  workspaceInvitationAccepted: (userName: string, workspaceName: string) => `${userName} accepted your invitation to ${workspaceName}.`,
+  workspaceRoleChanged: (workspaceName: string, role: string) => `Your role in ${workspaceName} has been changed to ${roleLabel(role)}.`,
+  workspaceRemoved: (workspaceName: string) => `You have been removed from ${workspaceName}.`,
+  projectInvitation: (projectName: string) => `You've been invited to join ${projectName}.`,
+  projectInvitationAccepted: (userName: string, projectName: string) => `${userName} accepted your invitation to ${projectName}.`,
+  projectRemoved: (projectName: string) => `You have been removed from ${projectName}.`,
+  projectRoleChanged: (projectName: string, role: string) => `Your role in ${projectName} has been changed to ${roleLabel(role)}.`,
+  testRunAssigned: (runName: string) => `You've been assigned to test run ${runName}.`,
+  testCaseFailed: (tcId: string, runName: string) => `${tcId} failed in test run ${runName}.`,
+  testCaseBlocked: (tcId: string, runName: string) => `${tcId} is blocked in test run ${runName}.`,
+  testRunStarted: (runName: string) => `Test run ${runName} has started.`,
+  testRunCompleted: (runName: string) => `Test run ${runName} has been completed.`,
+  testRunReopened: (runName: string) => `Test run ${runName} has been reopened.`,
+  /** "Test run Sprint 4 is due tomorrow." — `what` is "Test run" or "Test plan". */
+  dueReminder: (what: "Test run" | "Test plan", name: string, phase: "due_soon" | "due_today" | "overdue"): string =>
+    phase === "due_soon" ? `${what} ${name} is due tomorrow.` : phase === "due_today" ? `${what} ${name} is due today.` : `${what} ${name} is overdue.`,
+  /** The second line: project, due date and where the item stands. */
+  dueReminderBody: (projectName: string, dueDay: string, status: string) => `Project: ${projectName} · Due: ${dueDay} · Status: ${status}`,
+  testCaseStatusChanged: (tcId: string, status: string, runName: string) => `${tcId} status changed to ${status} in test run ${runName}.`,
+  /** One bulk status change, however many of the assignee's cases it covered. */
+  testCasesStatusChangedBulk: (count: number, status: string, runName: string) =>
+    `${count} of your test cases in test run ${runName} were marked ${status}.`,
+  bugAssigned: (bugId: string) => `Bug ${bugId} has been assigned to you.`,
+  bugReassigned: (bugId: string) => `Bug ${bugId} has been reassigned to you.`,
+  bugStatusChanged: (bugId: string, status: string) => `Bug ${bugId} status changed to ${status}.`,
+  bugMentioned: (userName: string, bugId: string) => `${userName} mentioned you on bug ${bugId}.`,
+  commentReplied: (userName: string) => `${userName} replied to your comment.`,
+  zyraGenerationReady: (count: number, subject = ""): { title: string; body: string } => {
+    const about = subject ? ` for ${subject}` : "";
+    // A batch with nothing in it has nothing to review, so it must not say "ready for review".
+    return count > 0
+      ? { title: "Test Cases Ready for Review", body: `Zyra generated ${plural(count, "test case")}${about}. Review and save the test case${count === 1 ? "" : "s"}.` }
+      : { title: "No Test Cases Generated", body: `Zyra did not generate any test cases${about}. Open the task to review it and try again.` };
+  },
+  zyraGenerationFailed: (subject = ""): { title: string; body: string } => ({
+    title: "Test Case Generation Failed",
+    body: `Zyra could not generate test cases${subject ? ` for ${subject}` : ""}. Open the task to see what went wrong and try again.`
+  }),
+  /** The daily archive sweep's notification: Zyra tasks waiting on a human in one project. */
+  zyraTasksAwaitingReview: (count: number, projectName?: string | null): { title: string; body: string } => {
+    const name = clipText(projectName ?? "", 80);
+    // "Acme Project" already says it is a project; anything else gets the word added.
+    const where = name ? ` for the ${/\bproject$/i.test(name) ? name : `${name} project`}` : "";
+    return { title: "Tasks Awaiting Your Review", body: `You have ${plural(count, "task")} awaiting review${where}. Please review and take action.` };
+  },
+  zyraTaskFailed: () => "Zyra task failed. Please retry or review the details.",
+  zyraReviewCompleted: () => "Review completed for Zyra-generated test cases.",
+  zyraCoverageCompleted: () => "Zyra has completed coverage analysis.",
+  kbDocumentReady: (name: string) => `${name} is ready to use with Zyra.`,
+  kbDocumentFailed: (name: string) => `We couldn't process ${name}.`,
+  kbDocumentUpdated: (name: string) => `${name} has been updated.`,
+  kbDocumentDeleted: (name: string) => `${name} has been deleted from the Knowledge Base.`,
+  integrationConnected: (provider: IntegrationProvider) => `${integrationLabel(provider)} has been connected successfully.`,
+  integrationDisconnected: (provider: IntegrationProvider) => `${integrationLabel(provider)} has been disconnected.`,
+  integrationAuthExpired: (provider: IntegrationProvider) => `Your ${integrationLabel(provider)} connection needs to be reconnected.`,
+  // A sync belongs to one project (each project maps its own Jira project / Linear team / Notion
+  // database), so the message names it.
+  integrationSyncCompleted: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync completed successfully for ${projectName}.`,
+  integrationSyncFailed: (provider: IntegrationProvider, projectName: string) => `${integrationLabel(provider)} sync failed for ${projectName}. Please review the connection.`,
+  integrationIssueLinked: (issueId: string) => `${issueId} has been linked successfully.`,
+  requirementUpdated: (requirementId: string) => `Requirement ${requirementId} has been updated.`
+};
+
+/**
+ * Zyra has no separate "coverage analysis" feature: "Find coverage gaps" in the chat is a canned
+ * prompt ("Analyze existing test cases and identify the most important areas of missing coverage."),
+ * and the reply is an ordinary chat answer. So a coverage analysis is recognised by what was asked.
+ * Deliberately narrow — "generate tests to improve coverage" is a generation request, not an analysis.
+ * English and Russian, the two languages the quick action is translated into.
+ */
+const COVERAGE_ANALYSIS_REQUEST = [
+  /\bcoverage\s+(gaps?|analysis|review|report)\b/i,
+  /\b(missing|insufficient|lacking)\s+coverage\b/i,
+  /\bareas?\s+of\s+(missing|low|poor)\s+coverage\b/i,
+  /пробел\p{L}*\s+в\s+покрыти/iu,
+  /не\s+хватает\s+покрытия/iu,
+  /анализ\p{L}*\s+покрытия/iu
+];
+
+export function isCoverageAnalysisRequest(message: string): boolean {
+  return COVERAGE_ANALYSIS_REQUEST.some((pattern) => pattern.test(message));
+}
+
+const INTEGRATION_LABELS: Record<IntegrationProvider, string> = { jira: "Jira", linear: "Linear", notion: "Notion" };
+
+/** "Jira" / "Linear" / "Notion" for a provider id; anything unrecognised is shown as given. */
+export function integrationLabel(provider: string): string {
+  return INTEGRATION_LABELS[provider as IntegrationProvider] ?? provider;
+}
+
+/**
+ * What a notification points at. `link_entity_id` is a single VARCHAR(255) column, so entities that
+ * only resolve inside a project are stored as `<projectId>:<entityId>` — the frontend's
+ * `resolveNotificationHref` is the one reader and splits on the first colon (uuids contain none).
+ * A removal, or an invitation not yet accepted, has no page of its own (the recipient cannot open
+ * the thing), so those point at the project list. A link is still needed: the bell renders a
+ * notification without one as inert text, and inert text can never be marked read — it would sit in
+ * the unread badge forever.
+ */
+export type NotificationLink = { linkEntityType: string; linkEntityId: string };
+
+export const notificationLinks = {
+  /**
+   * A pending invitation opens the same accept page the invitation email links to (`/invite/<token>`),
+   * so the token is the link id. It goes only to the invitee — the one person the email already went
+   * to — and is rewritten on resend, which rotates the token (see resendInvitation).
+   */
+  invitation: (rawToken: string): NotificationLink => ({ linkEntityType: "invitation", linkEntityId: rawToken }),
+  projectsList: (scopeId: string): NotificationLink => ({ linkEntityType: "projects_list", linkEntityId: scopeId }),
+  workspaceMembers: (organizationId: string): NotificationLink => ({ linkEntityType: "workspace_members", linkEntityId: organizationId }),
+  project: (projectId: string): NotificationLink => ({ linkEntityType: "project", linkEntityId: projectId }),
+  projectMembers: (projectId: string): NotificationLink => ({ linkEntityType: "project_members", linkEntityId: projectId }),
+  testRun: (projectId: string, cycleId: string): NotificationLink => ({ linkEntityType: "test_run", linkEntityId: `${projectId}:${cycleId}` }),
+  testPlan: (projectId: string, planId: string): NotificationLink => ({ linkEntityType: "test_plan", linkEntityId: `${projectId}:${planId}` }),
+  /** The project's Requirements page (the id is the project's). */
+  requirements: (projectId: string): NotificationLink => ({ linkEntityType: "requirements", linkEntityId: projectId }),
+  /** The Zyra chat page (the id is the project's). */
+  zyraChat: (projectId: string): NotificationLink => ({ linkEntityType: "zyra_chat", linkEntityId: projectId }),
+  zyraTask: (projectId: string, taskId: string): NotificationLink => ({ linkEntityType: "zyra_task", linkEntityId: `${projectId}:${taskId}` }),
+  /** The task board (the id is the project's) — what the archive sweep's notification already uses. */
+  zyraTaskBoard: (projectId: string): NotificationLink => ({ linkEntityType: "zyra_task_board", linkEntityId: projectId }),
+  /** The project's Knowledge Base list — where a deleted or unprocessable item's notification lands. */
+  knowledgeBase: (projectId: string): NotificationLink => ({ linkEntityType: "knowledge_base", linkEntityId: projectId }),
+  /** Workspace-level integration settings (a connection belongs to the workspace, not a project). */
+  integrations: (organizationId: string): NotificationLink => ({ linkEntityType: "integrations_settings", linkEntityId: organizationId }),
+  /** A project's own page for one integration (Settings → Jira / Linear / Notion), where its sync runs. */
+  projectIntegration: (projectId: string, provider: IntegrationProvider): NotificationLink => ({ linkEntityType: "project_integration", linkEntityId: `${projectId}:${provider}` }),
+  testCase: (projectId: string, testCaseId: string): NotificationLink => ({ linkEntityType: "testcase", linkEntityId: `${projectId}:${testCaseId}` }),
+  knowledgeDocument: (projectId: string, documentId: string): NotificationLink => ({ linkEntityType: "knowledge_document", linkEntityId: `${projectId}:${documentId}` }),
+  bug: (projectId: string, bugId: string): NotificationLink => ({ linkEntityType: "bug", linkEntityId: `${projectId}:${bugId}` })
+};

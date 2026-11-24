@@ -1,0 +1,189 @@
+# TestPilot Test Manager one-command local deployment.
+#
+# Start everything:
+#   docker-compose up --build -d
+#   docker compose up --build -d
+#
+# Database: set DATABASE_URL / DATABASE_USER / DATABASE_PASSWORD in .env
+# (e.g. Neon). No local Postgres container.
+#
+# App URLs:
+#   Frontend: http://localhost:1010
+#   Backend:  http://localhost:1011/health
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Durable AOF persistence so queued knowledge-base embedding jobs (BullMQ) survive a
+    # container restart instead of silently vanishing.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - testpilot_redisdata:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrator:
+    build:
+      context: ./Testpilot-Backend-Nest
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+    command: ["npm", "run", "migrate"]
+
+  backend:
+    build:
+      context: ./Testpilot-Backend-Nest
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      PORT: 7000
+      # Set by Jenkinsfile/Jenkinsfile.stage from `git rev-parse --short HEAD` before this file is
+      # invoked; "local" everywhere else. Surfaced on /health so two environments pointed at the
+      # same DATABASE_URL can be diffed in one curl instead of DB forensics.
+      GIT_SHA: ${GIT_SHA:-local}
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:1010}
+      # Optional: public address for links written into Jira/Linear comments. Unset = FRONTEND_URL.
+      # A localhost/private address produces plain test-case IDs instead of links.
+      PUBLIC_APP_URL: ${PUBLIC_APP_URL:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:1010,http://127.0.0.1:1010,http://localhost:3000,http://127.0.0.1:3000}
+      # Optional: derived from FRONTEND_URL + /integrations/callback when left unset.
+      JIRA_REDIRECT_URI: ${JIRA_REDIRECT_URI:-}
+      LINEAR_REDIRECT_URI: ${LINEAR_REDIRECT_URI:-}
+      NOTION_REDIRECT_URI: ${NOTION_REDIRECT_URI:-}
+      # Daily Basecamp analytics report (00:10 IST). PRODUCTION ONLY: the scheduler registers only when
+      # ANALYTICS_REPORT_ENABLED is exactly "true", and only the production Jenkinsfile sets it. Left
+      # false here so local, e2e and stage never post, even with BASECAMP_* present in .env.
+      ANALYTICS_REPORT_ENABLED: ${ANALYTICS_REPORT_ENABLED:-false}
+      BASECAMP_CLIENT_ID: ${BASECAMP_CLIENT_ID:-}
+      BASECAMP_CLIENT_SECRET: ${BASECAMP_CLIENT_SECRET:-}
+      BASECAMP_REFRESH_TOKEN: ${BASECAMP_REFRESH_TOKEN:-}
+      BASECAMP_ACCOUNT_ID: ${BASECAMP_ACCOUNT_ID:-}
+      BASECAMP_ANALYTICS_QUESTION_URL: ${BASECAMP_ANALYTICS_QUESTION_URL:-}
+      POSTMARK_API_TOKEN: ${POSTMARK_API_TOKEN:-}
+      POSTMARK_FROM_EMAIL: ${POSTMARK_FROM_EMAIL:-noreply@example.com}
+      # "live" = real delivery, and only production should say it. Left at "log" here, which never
+      # emails an OTP and only replays other emails through a Postmark SANDBOX server (verified with
+      # Postmark, not assumed), so a local or CI stack cannot bounce mail off invented addresses.
+      EMAIL_DELIVERY_MODE: ${EMAIL_DELIVERY_MODE:-log}
+      # Optional CC on the welcome email (see Testpilot-Backend-Nest/.env.example). No default on purpose.
+      WELCOME_EMAIL_CC: ${WELCOME_EMAIL_CC:-}
+      # Platform OAuth apps. Set these and workspace owners connect with one click — no
+      # per-workspace client id/secret entry.
+      JIRA_CLIENT_ID: ${JIRA_CLIENT_ID:-}
+      JIRA_CLIENT_SECRET: ${JIRA_CLIENT_SECRET:-}
+      LINEAR_CLIENT_ID: ${LINEAR_CLIENT_ID:-}
+      LINEAR_CLIENT_SECRET: ${LINEAR_CLIENT_SECRET:-}
+      NOTION_CLIENT_ID: ${NOTION_CLIENT_ID:-}
+      NOTION_CLIENT_SECRET: ${NOTION_CLIENT_SECRET:-}
+      # Optional: platform embeddings key (Voyage AI). When set it supplies every embedding, whatever
+      # chat provider a project uses. Unset = fall back to workspace OpenAI/Google/Mistral keys.
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_ID_PRO_MONTHLY: ${STRIPE_PRICE_ID_PRO_MONTHLY:-}
+      STRIPE_PRICE_ID_PRO_ANNUAL: ${STRIPE_PRICE_ID_PRO_ANNUAL:-}
+      STRIPE_PRICE_ID_PRO_MONTHLY_INR: ${STRIPE_PRICE_ID_PRO_MONTHLY_INR:-}
+      STRIPE_PRICE_ID_PRO_ANNUAL_INR: ${STRIPE_PRICE_ID_PRO_ANNUAL_INR:-}
+      BILLING_FORCE_COUNTRY: ${BILLING_FORCE_COUNTRY:-}
+      TRUST_PROXY_COUNTRY_HEADER: ${TRUST_PROXY_COUNTRY_HEADER:-false}
+      PLAN_GRACE_DAYS: ${PLAN_GRACE_DAYS:-30}
+      SUPPORT_CONTACT_EMAIL: ${SUPPORT_CONTACT_EMAIL:-support@tryqable.com}
+      # AES-256-GCM key for encrypting integration secrets at rest. Must be configured
+      # in .env (generate with: openssl rand -base64 32).
+      SECRETS_ENCRYPTION_KEY: ${SECRETS_ENCRYPTION_KEY:-}
+      OTP_EXPIRY_MINUTES: ${OTP_EXPIRY_MINUTES:-10}
+      ALLOW_PRIVATE_AI_HOSTS: ${ALLOW_PRIVATE_AI_HOSTS:-false}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_IP_MULTIPLIER: ${RATE_LIMIT_IP_MULTIPLIER:-1}
+      SESSION_DAYS: ${SESSION_DAYS:-30}
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_SIZE: ${MAX_UPLOAD_SIZE:-104857600}
+      # Object storage for Knowledge Base files. Defaults to local disk (the volume below) —
+      # no setup required. Set STORAGE_DRIVER=s3 plus the S3_* vars to use any S3-compatible
+      # service instead (AWS S3, MinIO, Cloudflare R2, DigitalOcean Spaces, Backblaze B2, ...).
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_BUCKET_FOLDER: ${S3_BUCKET_FOLDER:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-false}
+      S3_PRESIGNED_URL_TTL_SECONDS: ${S3_PRESIGNED_URL_TTL_SECONDS:-300}
+      # Langfuse tracing. Local/OSS only — stage and production do not run under compose and read
+      # these from their own environment. Every default is empty on purpose: with no keys the
+      # backend starts no exporter and makes no network call, and an empty LANGFUSE_BASE_URL makes
+      # it refuse to fall back to cloud.langfuse.com (see observability/langfuse.ts).
+      LANGFUSE_ENABLED: ${LANGFUSE_ENABLED:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-}
+      LANGFUSE_ENVIRONMENT: ${LANGFUSE_ENVIRONMENT:-development}
+      LANGFUSE_ALLOW_CLOUD: ${LANGFUSE_ALLOW_CLOUD:-}
+      # NYRA agent (Pro). Key is server-side only. From this container NYRA on the host is
+      # http://host.docker.internal:2905; leave both empty to show the agent as not configured.
+      NYRA_API_KEY: ${NYRA_API_KEY:-}
+      NYRA_BASE_URL: ${NYRA_BASE_URL:-}
+    ports:
+      - "${BACKEND_PORT:-1011}:7000"
+    volumes:
+      - backend_uploads:/app/uploads
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:7000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./Testpilot-Frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:1011}
+        NEXT_PUBLIC_BETTERBUGS_API_KEY: ${NEXT_PUBLIC_BETTERBUGS_API_KEY:-}
+        NEXT_PUBLIC_BETTERBUGS_PROJECT_ID: ${NEXT_PUBLIC_BETTERBUGS_PROJECT_ID:-}
+        # Stage only — set DSN + ENVIRONMENT=stage on stage .env; leave empty on prod
+        NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+        NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${NEXT_PUBLIC_SENTRY_ENVIRONMENT:-}
+        # PostHog — set on production (app.testpilot.io); leave empty on stage
+        NEXT_PUBLIC_POSTHOG_KEY: ${NEXT_PUBLIC_POSTHOG_KEY:-}
+        NEXT_PUBLIC_POSTHOG_HOST: ${NEXT_PUBLIC_POSTHOG_HOST:-}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:1011}
+    ports:
+      - "${FRONTEND_PORT:-1010}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  testpilot_redisdata:
+  backend_uploads:

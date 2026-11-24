@@ -1,0 +1,96 @@
+import { Body, Controller, Get, HttpCode, Param, Patch, Post, Req, Res, UnauthorizedException } from "@nestjs/common";
+import type { Response } from "express";
+import { AuthenticatedRequest } from "../common/request.types";
+import { validatePersonName } from "../common/person-name.util";
+import { validateMobileNumber } from "../common/mobile-number.util";
+import { AuthService } from "./auth.service";
+
+type EmailBody = { email?: string };
+type VerifyOtpBody = { email?: string; code?: string };
+type PasswordLoginBody = { email?: string; password?: string };
+type ResetPasswordBody = { token?: string; password?: string };
+type ChangePasswordBody = { currentPassword?: string; newPassword?: string };
+type UpdateProfileBody = { firstName?: string; lastName?: string; mobileNumber?: string };
+type CompleteProfileBody = { firstName?: string; lastName?: string; mobileNumber?: string };
+
+@Controller("/api/auth")
+export class AuthController {
+  constructor(private readonly auth: AuthService) {}
+
+  @Post("/otp/request")
+  @HttpCode(204)
+  requestOtp(@Body() body: EmailBody, @Req() req: AuthenticatedRequest) {
+    return this.auth.requestOtp(body.email, req);
+  }
+
+  @Post("/otp/verify")
+  verifyOtp(@Body() body: VerifyOtpBody, @Req() req: AuthenticatedRequest, @Res({ passthrough: true }) res: Response) {
+    return this.auth.verifyOtp(body.email, body.code, req, res);
+  }
+
+  @Post("/password/login")
+  loginWithPassword(
+    @Body() body: PasswordLoginBody,
+    @Req() req: AuthenticatedRequest,
+    @Res({ passthrough: true }) res: Response
+  ) {
+    return this.auth.loginWithPassword(body.email, body.password, req, res);
+  }
+
+  @Post("/password/forgot")
+  @HttpCode(204)
+  forgotPassword(@Body() body: EmailBody, @Req() req: AuthenticatedRequest) {
+    return this.auth.forgotPassword(body.email, req);
+  }
+
+  @Get("/password/reset/:token")
+  checkResetToken(@Param("token") token: string, @Req() req: AuthenticatedRequest) {
+    return this.auth.checkResetToken(token, req);
+  }
+
+  @Post("/password/reset")
+  resetPassword(@Body() body: ResetPasswordBody, @Req() req: AuthenticatedRequest) {
+    return this.auth.resetPassword(body.token, body.password, req);
+  }
+
+  @Post("/password/change")
+  @HttpCode(204)
+  changePassword(
+    @Body() body: ChangePasswordBody,
+    @Req() req: AuthenticatedRequest,
+    @Res({ passthrough: true }) res: Response
+  ) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    return this.auth.changePassword(req.userId, body.currentPassword, body.newPassword, req, res);
+  }
+
+  @Post("/logout")
+  @HttpCode(204)
+  logout(@Req() req: AuthenticatedRequest, @Res({ passthrough: true }) res: Response) {
+    return this.auth.logout(req, res);
+  }
+
+  @Get("/me")
+  me(@Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    return this.auth.me(req.userId);
+  }
+
+  @Patch("/me")
+  updateMe(@Body() body: UpdateProfileBody, @Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    const firstName = body.firstName !== undefined ? validatePersonName(body.firstName, "First name", 50) : undefined;
+    const lastName = body.lastName !== undefined ? validatePersonName(body.lastName, "Last name", 50) : undefined;
+    return this.auth.updateProfile(req.userId, firstName, lastName, body.mobileNumber);
+  }
+
+  @Post("/complete-profile")
+  @HttpCode(204)
+  completeProfile(@Body() body: CompleteProfileBody, @Req() req: AuthenticatedRequest) {
+    if (!req.userId) throw new UnauthorizedException("Not authenticated");
+    const firstName = validatePersonName(body.firstName, "First name", 50);
+    const lastName = validatePersonName(body.lastName, "Last name", 50);
+    const mobileNumber = validateMobileNumber(body.mobileNumber);
+    return this.auth.completeProfile(req.userId, firstName, lastName, mobileNumber);
+  }
+}

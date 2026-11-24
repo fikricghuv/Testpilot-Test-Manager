@@ -1,0 +1,13 @@
+TestPilot Test Manager
+Copyright 2026 TestPilot Contributors
+
+This product is a modified derivative work based on software originally
+developed by QAble Testlab (https://qable.io), Copyright 2026 QAble Testlab,
+licensed under the Apache License, Version 2.0.
+
+Summary of Modifications (2026-11-25):
+- Rebranded application UI, logos, and internal package/directory identifiers to TestPilot.
+- Applied security hardening to backend configuration, setup endpoint rate-limiting/token enforcement, and dependencies.
+- Redesigned frontend UI tokens, Zinc/Amber palette, and animation system.
+
+See LICENSE for the full Apache License 2.0 text and MODIFICATIONS.md for change details.

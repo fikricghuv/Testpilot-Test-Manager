@@ -1,0 +1,125 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+.cursor/
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output
+.next/
+**/.next/
+dist/
+build/
+**/target/
+*.class
+
+# Runtime logs and lock files
+*.log
+*.lck
+next-dev*.log
+
+# Environment files
+.env
+.env.*
+*.env
+!*.env.example
+
+# Secrets and credentials
+#
+# e2e/testpilot.config.json is deliberately NOT ignored. It is what `npx @testpilot/playwright-reporter
+# init` writes, and it carries baseUrl, projectId and a project API token. The first two are not
+# secrets and the SDK's README says to commit them; the token is, and it is committed here as an
+# accepted, deliberate decision (2026-08-28) so that every CI runner has all three values with no
+# credential plumbing — the alternative, two-of-three, is the SDK's `incomplete` state and fails the
+# run at collection time.
+#
+# What that costs, so a future reader can weigh it rather than rediscover it: the token has `write`
+# scope on project 41dba2a2-a60b-4917-8d63-9f8a86986703 only, it cannot read another project, and
+# rotating it (Project -> Settings -> API & MCP) does not remove it from this repo's history. If the
+# repo is ever opened up, rotate first. Precedence is inline options, then env, then this file, so
+# a runner that sets TESTPILOT_API_TOKEN still overrides the committed value without editing anything.
+#
+# Since V146 tokens EXPIRE (90 days by default; the one committed here was migrated to 90 days from
+# that migration). When it lapses the reporter's calls answer 401 and every CI run fails at
+# collection: mint a replacement under Project -> Settings -> API tokens and update the token in
+# e2e/testpilot.config.json. The "cannot read another project" limit above is enforced by
+# src/auth/api-token-policy.ts: a token reaches only its own project's testcases, suites, cycles,
+# mcp and automation routes.
+infra/kubernetes/**/secret.yaml
+infra/kubernetes/base/registry-secret.yaml
+*.pem
+*.key
+*.p12
+*.jks
+
+# Local uploaded/generated artifacts
+Testpilot-Backend/uploads/
+Testpilot-Backend/uploads/testpilot-artifacts/
+TestPilot-Automation-Agents/
+TestPilot-Test-Runner-Agents/
+TestPilot-Execution/
+
+# Local validation screenshots
+localhost-screenshot.png
+localhost-run-detail-screenshot.png
+localhost-test-detail-screenshot.png
+portal-testpilot-screenshot.png
+
+# Stale/local-only directories
+automation-agent/
+backend/
+frontend/
+
+# Playwright / e2e smoke suite artifacts
+test-results/
+playwright-report/
+.auth/
+
+# Personal, machine-local Claude Code overrides (never share across branches/teammates)
+CLAUDE.local.md
+
+# Personal Zyra workflow/agent working docs (not for the repo)
+Zyra Workflow Agents/
+
+# Superpowers brainstorming/spec working docs (not for the repo)
+docs/superpowers/
+# Qase to TestPilot migration scripts and ledgers (local only)
+migration-nevvon/
+
+# CI: npm cache written inside the Jenkins workspace by the quality-gates container
+.npm-cache/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+
+# AI coding agent & MCP local tooling
+.agents/
+.claude/
+.codex/
+.mcp.json
+CLAUDE.md
+**/CLAUDE.md
+**/AGENTS.md
+MEMORY.md
+skills-lock.json
+
+# E2E local run logs
+e2e/.run-logs/
+**/.run-logs/
+
+# Non-code reference PDFs & local uploads
+docs/QAble Quick Assure services.pdf
+Testpilot-Backend-Nest/uploads/
+
+# Build, coverage, and cache artifacts
+coverage/
+*.lcov
+.nyc_output/
+*.tsbuildinfo
+.eslintcache
+*.tmp
+*.bak
+*.swp

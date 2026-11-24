@@ -1,0 +1,1172 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useParams } from "@/lib/routeParams";
+import { useEffect, useRef, useState, useCallback } from "react";
+import Link from "next/link";
+import React from "react";
+import { IconRefresh, IconSettings, IconPlug } from "@tabler/icons-react";
+import {
+  getJiraStatus,
+  getLinearStatus,
+  getNotionStatus,
+  createZyraTask,
+  listJiraTickets,
+  listLinearTickets,
+  listNotionPages,
+  listAllTickets,
+  listLinkedJiraKeys,
+  listLinkedLinearKeys,
+  listLinkedNotionPages,
+  getRequirementsSummary,
+  getKnowledgeFolderTree,
+  type LinkedIssueTaskStatus,
+  type RequirementsSummary,
+  type TicketSourceStats,
+} from "@/lib/api";
+import { Button, Input, PageLoader, StatusChip } from "@/components/ui";
+import { PageHeader, StandardPageLayout, Breadcrumbs } from "@/components/workflows";
+import { SyncStatusPanel, useSyncRun } from "@/components/integrations/SyncStatusPanel";
+import { normalizeTaskStatus, taskStatusLabel, taskStatusTone } from "@/components/agents/TaskQuickViewPanel";
+import { formatDate } from "@/lib/date";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { getPageCache, setPageCache } from "@/lib/pageDataCache";
+import { renderMarkdown } from "@/lib/markdown";
+
+const PAGE_SIZE = 25;
+
+type Source = "all" | "jira" | "linear" | "notion";
+type TicketSource = "jira" | "linear" | "notion";
+
+/** Normalized shape for a past (no-longer-current) Jira project / Linear team-or-project / Notion database this
+ * project has been mapped to — never deleted, just no longer the active mapping. */
+interface HistoricalSource {
+  remoteId: string;
+  remoteKey: string;
+  remoteName: string;
+}
+
+interface Requirement {
+  id: string;
+  source: TicketSource;
+  key: string;
+  /** What test cases and Zyra tasks link to: the issue key for Jira/Linear, the full page id for Notion (whose `key` is only a short label). */
+  externalId: string;
+  summary: string;
+  description: string;
+  issueType: string;
+  status: string;
+  priority: string;
+  assignee: string;
+  reporter: string;
+  labels: string;
+  url: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+interface ProviderMeta {
+  id: TicketSource;
+  label: string;
+  logoBg: string;
+  logoLetter: string;
+  /** Label for the provider's mapping screen — Jira maps projects, Linear maps teams. */
+  manageLabel: string;
+  getStatus: (projectId: string) => Promise<{ connected: boolean; connectedProjects?: unknown[] }>;
+}
+
+/**
+ * Every tracker this page knows how to render. Tabs are filtered down to the ones actually
+ * linked to *this* project, so registering a provider here is all a new integration needs — and
+ * one that is only connected at the workspace level, with no project-level link, never shows up.
+ */
+const PROVIDERS: ProviderMeta[] = [
+  {
+    id: "jira",
+    label: "Jira",
+    logoBg: "#0052CC",
+    logoLetter: "J",
+    manageLabel: "Jira Projects",
+    getStatus: getJiraStatus,
+  },
+  {
+    id: "linear",
+    label: "Linear",
+    logoBg: "#5E6AD2",
+    logoLetter: "L",
+    manageLabel: "Linear Teams",
+    getStatus: getLinearStatus,
+  },
+  {
+    id: "notion",
+    label: "Notion",
+    logoBg: "#191919",
+    logoLetter: "N",
+    manageLabel: "Notion Database",
+    getStatus: getNotionStatus,
+  },
+];
+
+const ALL_TAB = { id: "all" as const, label: "All Sources", logoBg: "#5A4F80", logoLetter: "Σ" };
+
+function providerFor(source: TicketSource): ProviderMeta | undefined {
+  return PROVIDERS.find((p) => p.id === source);
+}
+
+function providerLabel(source: TicketSource): string {
+  return providerFor(source)?.label ?? source;
+}
+
+function joinLabels(labels: string[]): string {
+  if (labels.length <= 1) return labels[0] ?? "";
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
+}
+
+const EMPTY_STATS: TicketSourceStats = { total: 0, covered: 0, uncovered: 0, types: [], statuses: [] };
+
+// The subset of state this page's single initial-load effect (below) populates — everything
+// downstream of a filter change, tab switch, or sync run is intentionally excluded, since this
+// cache exists only to make a bare revisit render the last-known initial view instantly.
+interface RequirementsPageData {
+  connectedSources: TicketSource[];
+  source: Source;
+  tickets: Requirement[];
+  total: number;
+  sourceHistory: HistoricalSource[];
+  linkedJiraKeys: Set<string>;
+  jiraKeyCounts: Record<string, number>;
+  jiraTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  linkedLinearKeys: Set<string>;
+  linearKeyCounts: Record<string, number>;
+  linearTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  // Keyed by full Notion page id, not by the short display key.
+  linkedNotionPages: Set<string>;
+  notionPageCounts: Record<string, number>;
+  notionTaskStatuses: Record<string, LinkedIssueTaskStatus>;
+  summary: RequirementsSummary | null;
+  providerFolderIds: Partial<Record<TicketSource, string>>;
+}
+
+function jiraStatusTone(status: string): "neutral" | "success" | "warning" | "info" {
+  const s = status.toLowerCase();
+  if (s === "done" || s === "closed" || s === "resolved") return "success";
+  if (s === "in progress" || s === "in review") return "info";
+  if (s === "to do" || s === "open" || s === "new" || s === "backlog") return "neutral";
+  return "warning";
+}
+
+function PriorityIcon({ priority }: { priority: string }) {
+  const p = priority?.toLowerCase() ?? "";
+  let color = "text-[var(--muted-soft)]";
+  if (p === "highest" || p === "critical") color = "text-red-500";
+  else if (p === "high") color = "text-orange-500";
+  else if (p === "medium") color = "text-yellow-500";
+  else if (p === "low") color = "text-[var(--accent-light)]";
+  else if (p === "lowest") color = "text-[var(--muted-soft)]";
+  return (
+    <span className={`text-xs font-medium ${color}`} title={priority}>
+      {priority || "—"}
+    </span>
+  );
+}
+
+function IssueTypeIcon({ type }: { type: string }) {
+  const t = type?.toLowerCase() ?? "";
+  let color = "bg-[var(--surface-tertiary)] text-[var(--muted)]";
+  if (t === "bug") color = "bg-[var(--error-soft)] text-[var(--error-foreground)]";
+  else if (t === "story" || t === "user story")
+    color = "bg-[var(--success-soft)] text-[var(--success-foreground)]";
+  else if (t === "epic")
+    color = "bg-[var(--ai-soft)] text-[var(--ai-primary)]";
+  else if (t === "task" || t === "sub-task")
+    color = "bg-[var(--brand-soft)] text-[var(--accent-light)]";
+  return (
+    <span className={`inline-block rounded px-1.5 py-0.5 text-xs font-medium ${color}`}>
+      {type || "—"}
+    </span>
+  );
+}
+
+function SourceBadge({ source }: { source: TicketSource }) {
+  const provider = providerFor(source);
+  if (!provider) return null;
+  return (
+    <span
+      className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold text-white"
+      style={{ background: provider.logoBg }}
+      title={provider.label}
+    >
+      {provider.logoLetter}
+    </span>
+  );
+}
+
+function SearchBar({
+  value,
+  onChange,
+  onSearch,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSearch: () => void;
+  placeholder?: string;
+}) {
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSearch();
+      }}
+      className="flex items-center gap-2"
+    >
+      <div className="relative flex-1 max-w-sm">
+        <svg
+          className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[var(--muted-soft)]"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-4.35-4.35M11 19a8 8 0 100-16 8 8 0 000 16z" />
+        </svg>
+        <Input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="pl-9"
+        />
+      </div>
+      <Button type="submit" variant="secondary" size="sm">Search</Button>
+    </form>
+  );
+}
+
+export default function RequirementsPage() {
+  const params = useParams();
+  const router = useRouter();
+  const projectId = params.id as string;
+  const { currentUser } = useAppData();
+  const { project } = useProjectData();
+  const projectName = String(project.name || "");
+
+  const cacheKey = `requirements:${projectId}`;
+  const cached = getPageCache<RequirementsPageData>(cacheKey);
+
+  // Only the true first visit to this project's requirements page has no cache to seed from —
+  // every later visit renders the last-known initial view immediately while the effect below
+  // revalidates it in the background, instead of blocking behind the spinner on every click.
+  const [loading, setLoading] = useState(!cached);
+  const [source, setSource] = useState<Source>(cached?.source ?? "all");
+  const [connectedSources, setConnectedSources] = useState<TicketSource[]>(cached?.connectedSources ?? []);
+  const [summary, setSummary] = useState<RequirementsSummary | null>(cached?.summary ?? null);
+  const [tickets, setTickets] = useState<Requirement[]>(cached?.tickets ?? []);
+  const [total, setTotal] = useState(cached?.total ?? 0);
+  const [page, setPage] = useState(0);
+  const [search, setSearch] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [coverageFilter, setCoverageFilter] = useState<"" | "covered" | "uncovered">("");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [linkedJiraKeys, setLinkedJiraKeys] = useState<Set<string>>(cached?.linkedJiraKeys ?? new Set());
+  const [jiraKeyCounts, setJiraKeyCounts] = useState<Record<string, number>>(cached?.jiraKeyCounts ?? {});
+  const [jiraTaskStatuses, setJiraTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.jiraTaskStatuses ?? {});
+  const [linkedLinearKeys, setLinkedLinearKeys] = useState<Set<string>>(cached?.linkedLinearKeys ?? new Set());
+  const [linearKeyCounts, setLinearKeyCounts] = useState<Record<string, number>>(cached?.linearKeyCounts ?? {});
+  const [linearTaskStatuses, setLinearTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.linearTaskStatuses ?? {});
+  const [linkedNotionPages, setLinkedNotionPages] = useState<Set<string>>(cached?.linkedNotionPages ?? new Set());
+  const [notionPageCounts, setNotionPageCounts] = useState<Record<string, number>>(cached?.notionPageCounts ?? {});
+  const [notionTaskStatuses, setNotionTaskStatuses] = useState<Record<string, LinkedIssueTaskStatus>>(cached?.notionTaskStatuses ?? {});
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [generatingKey, setGeneratingKey] = useState<string | null>(null);
+  // Past mappings for whichever single-provider tab is active — tickets from these are never
+  // deleted, just excluded from the default (current-mapping) view; this is how they stay reachable.
+  const [sourceHistory, setSourceHistory] = useState<HistoricalSource[]>(cached?.sourceHistory ?? []);
+  const [historicalRemoteId, setHistoricalRemoteId] = useState<string | null>(null);
+  // Knowledge Base folder id for each provider's mirrored tickets (e.g. the "Jira" folder under
+  // the KB root), so "View in Knowledge base" can deep-link into the tab that's actually active
+  // instead of always landing on the root listing. A provider's folder only exists once its first
+  // sync has created it, so an entry here can legitimately be absent.
+  const [providerFolderIds, setProviderFolderIds] = useState<Partial<Record<TicketSource, string>>>(cached?.providerFolderIds ?? {});
+
+  // One polled run per provider. Both hooks are called unconditionally (React rules) and gate
+  // their own fetching on whether that provider is connected.
+  const jiraSync = useSyncRun(projectId, "jira", connectedSources.includes("jira"));
+  const linearSync = useSyncRun(projectId, "linear", connectedSources.includes("linear"));
+  const notionSync = useSyncRun(projectId, "notion", connectedSources.includes("notion"));
+  const syncByProvider: Record<TicketSource, ReturnType<typeof useSyncRun>> = { jira: jiraSync, linear: linearSync, notion: notionSync };
+  const anySyncActive = jiraSync.isActive || linearSync.isActive || notionSync.isActive;
+  const syncStarting = jiraSync.starting || linearSync.starting || notionSync.starting;
+
+  // Only trackers actually linked to *this* project (not merely connected at the workspace
+  // level) are offered as tabs. "All Sources" is always shown alongside them — with zero linked
+  // trackers it's the only tab, since it's the default view the empty/connect states render under.
+  const connectedProviders = PROVIDERS.filter((p) => connectedSources.includes(p.id));
+  // With exactly one tracker linked an aggregate tab would only repeat that tracker's items, so it is
+  // dropped and the tracker's own tab (named for it) stands alone. Two or more get the aggregate tab,
+  // labelled "Sources"; with none it is the only tab and keeps "All Sources".
+  const singleProvider = connectedProviders.length === 1 ? connectedProviders[0] : null;
+  const allTab = connectedProviders.length >= 2 ? { ...ALL_TAB, label: "Sources" } : ALL_TAB;
+  const sourceTabs: Array<{ id: Source; label: string; logoBg: string; logoLetter: string }> =
+    singleProvider ? [singleProvider] : [allTab, ...connectedProviders];
+  const anyConnected = connectedProviders.length > 0;
+  const sourceConnected = source === "all" ? anyConnected : connectedSources.includes(source);
+  const stats = summary?.[source] ?? EMPTY_STATS;
+  const coveragePct = stats.total ? Math.round((stats.covered / stats.total) * 100) : 0;
+  const connectedPhrase = anyConnected
+    ? joinLabels(connectedProviders.map((p) => p.label))
+    : "your connected issue tracker";
+
+  // Test cases link to a requirement by `externalId` (the issue key, or a Notion page's full id).
+  function linkStateFor(req: Requirement) {
+    return req.source === "jira"
+      ? { linked: linkedJiraKeys, counts: jiraKeyCounts, tasks: jiraTaskStatuses }
+      : req.source === "linear"
+        ? { linked: linkedLinearKeys, counts: linearKeyCounts, tasks: linearTaskStatuses }
+        : { linked: linkedNotionPages, counts: notionPageCounts, tasks: notionTaskStatuses };
+  }
+
+  function tcCountFor(req: Requirement): number {
+    return linkStateFor(req).counts[req.externalId] || 0;
+  }
+
+  function isLinked(req: Requirement): boolean {
+    return linkStateFor(req).linked.has(req.externalId);
+  }
+
+  // The latest Zyra task assigned to this ticket, however far along it is — independent of whether
+  // it has saved any testcase yet. Once the task reaches "done" it stops being reported here (an
+  // ai_generation_requests row still exists, but "done" is the case isLinked/tcCountFor already
+  // covers via the saved testcase itself), so the two states never fight over the same row.
+  function activeTaskFor(req: Requirement): LinkedIssueTaskStatus | undefined {
+    const task = linkStateFor(req).tasks[req.externalId];
+    if (!task || normalizeTaskStatus(task.status) === "done") return undefined;
+    return task;
+  }
+
+  // Unlike activeTaskFor (which hides once a task is "done" so the Action column can hand off to
+  // "N saved"/"Regenerate"), this is the persistent, always-on label: every requirement is always
+  // somewhere in the Zyra pipeline, including before any task exists at all ("Not started").
+  function zyraStatusFor(req: Requirement): { label: string; tone: "neutral" | "info" | "success" | "warning" | "error" } {
+    const task = linkStateFor(req).tasks[req.externalId];
+    if (!task) return { label: "Not started", tone: "neutral" };
+    return { label: taskStatusLabel(task.status), tone: taskStatusTone(task.status) };
+  }
+
+  const loadTickets = useCallback(
+    async (
+      activeSource: Source,
+      pageNum: number,
+      query: string,
+      filters: { issueType?: string; status?: string; coverage?: "" | "covered" | "uncovered" },
+      remoteId?: string
+    ): Promise<{ tickets: Requirement[]; total: number } | undefined> => {
+      const listParams = {
+        limit: PAGE_SIZE,
+        offset: pageNum * PAGE_SIZE,
+        search: query || undefined,
+        issueType: filters.issueType || undefined,
+        status: filters.status || undefined,
+        coverage: filters.coverage || undefined,
+        // Omitted -> whatever's currently mapped (the default, bug-fixed view). Set only when the
+        // user picked a past source from the history dropdown below.
+        remoteId: remoteId || undefined,
+      };
+      try {
+        if (activeSource === "all") {
+          const data = await listAllTickets(projectId, listParams);
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: t.source, key: t.key, externalId: t.externalId || t.key, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.url, createdAt: t.createdAt, updatedAt: t.updatedAt,
+          }));
+          setTickets(mapped);
+          setTotal(data.total);
+          return { tickets: mapped, total: data.total };
+        } else if (activeSource === "jira") {
+          const data = await listJiraTickets(projectId, listParams);
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "jira" as const, key: t.jiraIssueKey, externalId: t.jiraIssueKey, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.jiraUrl, createdAt: t.jiraCreatedAt, updatedAt: t.jiraUpdatedAt,
+          }));
+          setTickets(mapped);
+          setTotal(data.total);
+          return { tickets: mapped, total: data.total };
+        } else if (activeSource === "linear") {
+          const data = await listLinearTickets(projectId, listParams);
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "linear" as const, key: t.linearIssueKey, externalId: t.linearIssueKey, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.linearUrl, createdAt: t.linearCreatedAt, updatedAt: t.linearUpdatedAt,
+          }));
+          setTickets(mapped);
+          setTotal(data.total);
+          return { tickets: mapped, total: data.total };
+        } else {
+          // Notion pages are shown under their short `notion:xxxxxxxx` key but link by full page id.
+          const data = await listNotionPages(projectId, listParams);
+          const mapped = data.list.map((t) => ({
+            id: t.id, source: "notion" as const, key: t.notionPageKey, externalId: t.notionPageId, summary: t.summary, description: t.description,
+            issueType: t.issueType, status: t.status, priority: t.priority, assignee: t.assignee,
+            reporter: t.reporter, labels: t.labels, url: t.notionUrl, createdAt: t.notionCreatedAt, updatedAt: t.notionUpdatedAt,
+          }));
+          setTickets(mapped);
+          setTotal(data.total);
+          return { tickets: mapped, total: data.total };
+        }
+      } catch {
+        /* ignore */
+        return undefined;
+      }
+    },
+    [projectId]
+  );
+
+  const refreshLinkedKeys = useCallback(async () => {
+    const [jiraKeysRes, linearKeysRes, notionPagesRes] = await Promise.all([
+      listLinkedJiraKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
+      listLinkedLinearKeys(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
+      listLinkedNotionPages(projectId).catch(() => ({ keys: [], counts: {}, tasks: {} })),
+    ]);
+    const linkedJira = new Set(jiraKeysRes.keys);
+    const jiraCounts = jiraKeysRes.counts ?? {};
+    const jiraTasks = jiraKeysRes.tasks ?? {};
+    const linkedLinear = new Set(linearKeysRes.keys);
+    const linearCounts = linearKeysRes.counts ?? {};
+    const linearTasks = linearKeysRes.tasks ?? {};
+    const linkedNotion = new Set(notionPagesRes.keys);
+    const notionCounts = notionPagesRes.counts ?? {};
+    const notionTasks = notionPagesRes.tasks ?? {};
+    setLinkedJiraKeys(linkedJira);
+    setJiraKeyCounts(jiraCounts);
+    setJiraTaskStatuses(jiraTasks);
+    setLinkedLinearKeys(linkedLinear);
+    setLinearKeyCounts(linearCounts);
+    setLinearTaskStatuses(linearTasks);
+    setLinkedNotionPages(linkedNotion);
+    setNotionPageCounts(notionCounts);
+    setNotionTaskStatuses(notionTasks);
+    return {
+      linkedJiraKeys: linkedJira,
+      jiraKeyCounts: jiraCounts,
+      jiraTaskStatuses: jiraTasks,
+      linkedLinearKeys: linkedLinear,
+      linearKeyCounts: linearCounts,
+      linearTaskStatuses: linearTasks,
+      linkedNotionPages: linkedNotion,
+      notionPageCounts: notionCounts,
+      notionTaskStatuses: notionTasks,
+    };
+  }, [projectId]);
+
+  const refreshSummary = useCallback(async () => {
+    const data = await getRequirementsSummary(projectId).catch(() => null);
+    setSummary(data);
+    return data;
+  }, [projectId]);
+
+  // Maps the KB root's direct children back to provider ids by name, matching how
+  // ensureProviderFolder names them on the backend ("Jira" / "Linear").
+  const refreshKbFolders = useCallback(async () => {
+    const root = await getKnowledgeFolderTree(projectId).catch(() => null);
+    const map: Partial<Record<TicketSource, string>> = {};
+    for (const child of root?.children ?? []) {
+      const provider = PROVIDERS.find((p) => p.label === child.name);
+      if (provider) map[provider.id] = child.id;
+    }
+    setProviderFolderIds(map);
+    return map;
+  }, [projectId]);
+
+  const refreshHistory = useCallback(async (activeSource: TicketSource) => {
+    let history: HistoricalSource[];
+    if (activeSource === "jira") {
+      const status = await getJiraStatus(projectId).catch(() => null);
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.jiraProjectId, remoteKey: h.jiraProjectKey, remoteName: h.jiraProjectName }));
+    } else if (activeSource === "linear") {
+      const status = await getLinearStatus(projectId).catch(() => null);
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.linearTeamId, remoteKey: h.linearTeamKey, remoteName: h.linearTeamName }));
+    } else {
+      // A Notion database has no short key; the title alone identifies it.
+      const status = await getNotionStatus(projectId).catch(() => null);
+      history = (status?.history ?? []).map((h) => ({ remoteId: h.notionDatabaseId, remoteKey: "", remoteName: h.notionDatabaseName }));
+    }
+    setSourceHistory(history);
+    // The initial-load effect fires this without awaiting it (so a slow history lookup never
+    // blocks the page's loading spinner), so if it resolves after that effect has already written
+    // the page cache, patch just this field in rather than leaving the cache's history stale until
+    // the next full reload. If no cache entry exists yet, there's nothing to patch — the initial
+    // load's own write (once it completes) is what seeds the entry.
+    const key = `requirements:${projectId}`;
+    const existing = getPageCache<RequirementsPageData>(key);
+    if (existing) {
+      setPageCache<RequirementsPageData>(key, { ...existing, sourceHistory: history });
+    }
+    return history;
+  }, [projectId]);
+
+  useEffect(() => {
+    (async () => {
+      if (!currentUser) {
+        router.replace("/login");
+        return;
+      }
+      const key = `requirements:${projectId}`;
+      const existing = getPageCache<RequirementsPageData>(key);
+      if (existing) {
+        setConnectedSources(existing.connectedSources);
+        setSource(existing.source);
+        setTickets(existing.tickets);
+        setTotal(existing.total);
+        setSourceHistory(existing.sourceHistory);
+        setLinkedJiraKeys(existing.linkedJiraKeys);
+        setJiraKeyCounts(existing.jiraKeyCounts);
+        setJiraTaskStatuses(existing.jiraTaskStatuses);
+        setLinkedLinearKeys(existing.linkedLinearKeys);
+        setLinearKeyCounts(existing.linearKeyCounts);
+        setLinearTaskStatuses(existing.linearTaskStatuses);
+        setLinkedNotionPages(existing.linkedNotionPages);
+        setNotionPageCounts(existing.notionPageCounts);
+        setNotionTaskStatuses(existing.notionTaskStatuses);
+        setSummary(existing.summary);
+        setProviderFolderIds(existing.providerFolderIds);
+        setLoading(false);
+      }
+      const statuses = await Promise.all(
+        PROVIDERS.map((p) => p.getStatus(projectId).catch(() => ({ connected: false, connectedProjects: [] })))
+      );
+      // A provider counts as "connected" here only once *this project* has an active link to it
+      // (a non-empty connectedProjects) — the workspace-level `connected` flag alone (set as soon
+      // as anyone in the workspace authorized the integration) says nothing about this project.
+      const connected = PROVIDERS.filter((_, i) => (statuses[i].connectedProjects?.length ?? 0) > 0).map((p) => p.id);
+      setConnectedSources(connected);
+      // With a single tracker connected there is no "All Sources" tab to sit under, so open
+      // straight onto that provider and keep the active tab in sync with what's rendered.
+      const initialSource: Source = connected.length === 1 ? connected[0] : "all";
+      setSource(initialSource);
+      const ticketsResult = await loadTickets(initialSource, 0, "", {});
+      if (initialSource !== "all") void refreshHistory(initialSource);
+      const [linkedResult, summaryResult, kbFoldersResult] = await Promise.all([
+        refreshLinkedKeys(),
+        refreshSummary(),
+        refreshKbFolders(),
+      ]);
+      setLoading(false);
+      // refreshHistory above is intentionally not awaited (see its own comment), so this write
+      // carries forward whatever history the cache already had rather than blocking on it; that
+      // function patches the history field in on its own once it resolves.
+      setPageCache<RequirementsPageData>(key, {
+        connectedSources: connected,
+        source: initialSource,
+        tickets: ticketsResult?.tickets ?? [],
+        total: ticketsResult?.total ?? 0,
+        sourceHistory: existing?.sourceHistory ?? [],
+        linkedJiraKeys: linkedResult.linkedJiraKeys,
+        jiraKeyCounts: linkedResult.jiraKeyCounts,
+        jiraTaskStatuses: linkedResult.jiraTaskStatuses,
+        linkedLinearKeys: linkedResult.linkedLinearKeys,
+        linearKeyCounts: linkedResult.linearKeyCounts,
+        linearTaskStatuses: linkedResult.linearTaskStatuses,
+        linkedNotionPages: linkedResult.linkedNotionPages,
+        notionPageCounts: linkedResult.notionPageCounts,
+        notionTaskStatuses: linkedResult.notionTaskStatuses,
+        summary: summaryResult,
+        providerFolderIds: kbFoldersResult,
+      });
+    })();
+  }, [projectId, loadTickets, refreshHistory, refreshLinkedKeys, refreshSummary, refreshKbFolders, router, currentUser]);
+
+  useEffect(() => {
+    if (!loading) loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
+  }, [source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, loading]);
+
+  // Pull the freshly synced tickets in on the active -> settled edge only. Reloading on every
+  // poll tick would refetch the whole list every two seconds for the length of the run.
+  const syncWasActiveRef = useRef(false);
+  useEffect(() => {
+    if (syncWasActiveRef.current && !anySyncActive) {
+      void loadTickets(source, page, search, { issueType: typeFilter, status: statusFilter, coverage: coverageFilter }, historicalRemoteId ?? undefined);
+      void refreshSummary();
+      void refreshLinkedKeys();
+      // A provider's KB folder is created lazily on its first sync, so a run settling is exactly
+      // when a previously-missing folder id can appear.
+      void refreshKbFolders();
+      if (source !== "all") void refreshHistory(source);
+    }
+    syncWasActiveRef.current = anySyncActive;
+  }, [anySyncActive, source, page, search, typeFilter, statusFilter, coverageFilter, historicalRemoteId, loadTickets, refreshSummary, refreshLinkedKeys, refreshKbFolders, refreshHistory]);
+
+  // A restored view can still be on the aggregate tab after a second tracker was unlinked; with only
+  // one left that tab is gone, so move to the remaining tracker's tab.
+  useEffect(() => {
+    if (singleProvider && source === "all") handleSourceChange(singleProvider.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [singleProvider?.id, source]);
+
+  function handleSourceChange(next: Source) {
+    setSource(next);
+    setPage(0);
+    setSearch("");
+    setSearchInput("");
+    setTypeFilter("");
+    setStatusFilter("");
+    setCoverageFilter("");
+    setExpandedId(null);
+    setHistoricalRemoteId(null);
+    setSourceHistory([]);
+    if (next !== "all") void refreshHistory(next);
+  }
+
+  // Fires the runs and returns; the ticket list is refreshed by the effect below when the last
+  // run settles, rather than by awaiting a sync that now takes minutes.
+  async function handleSync() {
+    setSyncError(null);
+    const targets = PROVIDERS.filter((p) => (source === "all" ? connectedSources.includes(p.id) : source === p.id));
+    await Promise.all(targets.map((p) => syncByProvider[p.id].start()));
+  }
+
+  async function handleGenerateFromTicket(ticket: Requirement, mode: "generate" | "regenerate") {
+    setGeneratingKey(ticket.key);
+    setSyncError(null);
+    try {
+      const existingCount = tcCountFor(ticket);
+      const provider = providerLabel(ticket.source);
+      const story = `${ticket.key}: ${ticket.summary}`;
+      const context = [
+        ticket.description,
+        ticket.status ? `Status: ${ticket.status}` : "",
+        ticket.priority ? `Priority: ${ticket.priority}` : "",
+        mode === "regenerate"
+          ? `Regenerate testcase coverage for ${ticket.key}. Update existing linked testcases where coverage overlaps, and add new testcases for new or changed ${provider} requirements. Mark regenerated cases clearly with Zyra/${provider} tags. Existing linked testcase count: ${existingCount}.`
+          : `Generate testcase coverage for ${ticket.key}. Mark generated cases clearly with Zyra/${provider} tags.`
+      ].filter(Boolean).join("\n\n");
+      await createZyraTask(projectId, {
+        story,
+        context,
+        jiraIssueKeys: ticket.source === "jira" ? [ticket.key] : undefined,
+        linearIssueKeys: ticket.source === "linear" ? [ticket.key] : undefined,
+        notionPageIds: ticket.source === "notion" ? [ticket.externalId] : undefined,
+      });
+      router.push(`/projects/${projectId}/agents/tasks`);
+    } catch (err) {
+      setSyncError(err instanceof Error ? err.message : "Failed to create Zyra task from ticket.");
+    } finally {
+      setGeneratingKey(null);
+    }
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  if (loading) {
+    return <PageLoader variant="content" />;
+  }
+
+  return (
+    <StandardPageLayout
+      header={
+        <PageHeader
+          title="Requirements"
+          subtitle={`Requirements to be developed, synced from ${connectedPhrase}, and turned into test coverage with Zyra. Full documents live in the Knowledge base's Requirements folder.`}
+          breadcrumb={
+            <Breadcrumbs
+              items={[
+                { label: "Projects", href: "/projects" },
+                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                { label: "Requirements" },
+              ]}
+            />
+          }
+          actions={
+            <Link
+              href={`/projects/${projectId}/settings?tab=integrations`}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+            >
+              <IconSettings size={15} stroke={1.75} />
+              Manage integrations
+            </Link>
+          }
+        />
+      }
+    >
+      {/* Source tabs + coverage stat strip */}
+      {(anyConnected || tickets.length > 0) && (
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          {sourceTabs.length > 0 && (
+            <div className="inline-flex items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-1">
+              {sourceTabs.map((tab) => {
+                const count = summary?.[tab.id]?.total ?? 0;
+                const active = source === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    data-testid={`requirements-source-tab-${tab.id}`}
+                    onClick={() => handleSourceChange(tab.id)}
+                    className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                      active
+                        ? "bg-[var(--brand-primary)] text-white"
+                        : "text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
+                    }`}
+                  >
+                    <span
+                      className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold text-white"
+                      style={{ background: tab.logoBg }}
+                    >
+                      {tab.logoLetter}
+                    </span>
+                    {tab.label}
+                    <span
+                      className={`rounded-full px-1.5 py-0.5 text-[11px] font-mono ${
+                        active ? "bg-white/20" : "bg-[var(--surface-tertiary)] text-[var(--muted)]"
+                      }`}
+                    >
+                      {count}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="flex items-center gap-2">
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-center min-w-[64px]">
+              <div className="text-base font-semibold text-[var(--foreground)]">{stats.total}</div>
+              <div className="text-[10px] uppercase tracking-wide text-[var(--muted-soft)]">Total</div>
+            </div>
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-center min-w-[64px]">
+              <div className="text-base font-semibold text-[var(--success-foreground)]">{stats.covered}</div>
+              <div className="text-[10px] uppercase tracking-wide text-[var(--muted-soft)]">Covered</div>
+            </div>
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-center min-w-[64px]">
+              <div className="text-base font-semibold text-[var(--warning-foreground)]">{stats.uncovered}</div>
+              <div className="text-[10px] uppercase tracking-wide text-[var(--muted-soft)]">Uncovered</div>
+            </div>
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 min-w-[120px]">
+              <div className="mb-1.5 flex items-baseline justify-between gap-2">
+                <span className="text-[10px] uppercase tracking-wide text-[var(--muted-soft)]">Coverage</span>
+                <span className="text-sm font-semibold text-[var(--foreground)]">{coveragePct}%</span>
+              </div>
+              <div className="h-1 rounded-full bg-[var(--surface-tertiary)] overflow-hidden">
+                <div className="h-full rounded-full bg-[var(--success)] transition-[width]" style={{ width: `${coveragePct}%` }} />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {sourceConnected && (
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleSync}
+              disabled={syncStarting || anySyncActive}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--surface-tertiary)] text-[var(--foreground)] px-3 py-1.5 text-sm font-medium hover:bg-[var(--surface-tertiary)] disabled:opacity-50 transition-colors"
+            >
+              <IconRefresh size={15} stroke={1.75} className={anySyncActive ? "animate-spin" : undefined} />
+              {syncStarting ? "Starting…" : anySyncActive ? "Syncing…" : `Sync ${source === "all" ? "all sources" : providerLabel(source)}`}
+            </button>
+            {source !== "all" && (
+              <Link
+                href={`/projects/${projectId}/settings/integrations/${source}`}
+                className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                Manage
+              </Link>
+            )}
+            {source !== "all" && sourceHistory.length > 0 && (
+              <select
+                value={historicalRemoteId ?? ""}
+                onChange={(e) => { setPage(0); setHistoricalRemoteId(e.target.value || null); }}
+                title="Tickets are never deleted when a mapping changes — switch here to browse a previously linked source."
+                className="h-9 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--foreground)] outline-none"
+              >
+                <option value="">Current source</option>
+                {sourceHistory.map((h) => (
+                  <option key={h.remoteId} value={h.remoteId}>
+                    Previously: {h.remoteKey ? `${h.remoteKey}: ` : ""}{h.remoteName}
+                  </option>
+                ))}
+              </select>
+            )}
+            <Link
+              href={
+                source !== "all" && providerFolderIds[source]
+                  ? `/projects/${projectId}/knowledge-base?folder=${providerFolderIds[source]}`
+                  : `/projects/${projectId}/knowledge-base`
+              }
+              data-testid="view-in-knowledge-base-link"
+              className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+            >
+              View in Knowledge base
+            </Link>
+          </div>
+          <span className="text-sm text-[var(--muted)]">
+            {total} requirement{total !== 1 ? "s" : ""}
+          </span>
+        </div>
+      )}
+
+      {/* Live per-provider run state. Kept visible after a run settles so the last sync's outcome
+          (and who ran it) explains what's in the Knowledge Base right now. */}
+      {sourceConnected &&
+        PROVIDERS.filter((p) => (source === "all" ? connectedSources.includes(p.id) : source === p.id)).map((p) => (
+          <SyncStatusPanel key={p.id} run={syncByProvider[p.id].run} label={p.label} />
+        ))}
+
+      {(syncError || jiraSync.error || linearSync.error || notionSync.error) && (
+        <div className="flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-4 py-2.5 text-sm text-[var(--error-foreground)]">
+          <span>{syncError || jiraSync.error || linearSync.error || notionSync.error}</span>
+          <button
+            type="button"
+            onClick={() => {
+              setSyncError(null);
+              jiraSync.clearError();
+              linearSync.clearError();
+              notionSync.clearError();
+            }}
+            className="ml-3 text-[var(--error-foreground)] hover:opacity-80"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {!sourceConnected && tickets.length === 0 && (
+        <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
+          <div className="mx-auto w-14 h-14 rounded-full bg-[var(--brand-soft)] flex items-center justify-center">
+            <IconPlug size={26} stroke={1.75} className="text-[var(--accent-light)]" />
+          </div>
+          <h2 className="mt-4 text-lg font-semibold text-[var(--foreground)]">
+            {source === "all"
+              ? "Connect an Issue Tracker to Get Started"
+              : `Connect ${providerLabel(source)} to Get Started`}
+          </h2>
+          <p className="mt-2 text-sm text-[var(--muted)] max-w-sm mx-auto">
+            Connect an issue tracker in project settings to automatically import tickets as
+            requirements and use them as context for generating test cases.
+          </p>
+          <Link
+            href={`/projects/${projectId}/settings?tab=integrations`}
+            style={{ color: "#fff" }}
+            className="mt-4 inline-flex items-center justify-center rounded-lg bg-[var(--brand-primary)] px-5 py-2 text-sm font-semibold !text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+          >
+            Go to Project Settings
+          </Link>
+        </div>
+      )}
+
+      {sourceConnected && tickets.length === 0 && !search && !typeFilter && !statusFilter && !coverageFilter && (
+        <div className="rounded-xl border border-dashed border-[var(--border)] p-12 text-center">
+          <h2 className="text-lg font-semibold text-[var(--foreground)]">No Requirements Synced Yet</h2>
+          <p className="mt-2 text-sm text-[var(--muted)] max-w-sm mx-auto">
+            Click &quot;Sync&quot; to pull tickets from your connected projects.
+          </p>
+          <div className="mt-4 flex items-center justify-center gap-3">
+            <button
+              onClick={handleSync}
+              disabled={syncStarting || anySyncActive}
+              className="rounded-lg bg-[var(--brand-primary)] text-white px-5 py-2 text-sm font-medium hover:bg-[var(--brand-hover)] disabled:opacity-50 transition-colors"
+            >
+              {syncStarting ? "Starting…" : anySyncActive ? "Syncing…" : "Sync Tickets"}
+            </button>
+            {source !== "all" && (
+              <Link
+                href={`/projects/${projectId}/settings/integrations/${source}`}
+                className="inline-flex items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-semibold text-[var(--foreground)] shadow-sm transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                Manage {providerFor(source)?.manageLabel ?? providerLabel(source)}
+              </Link>
+            )}
+          </div>
+        </div>
+      )}
+
+      {(tickets.length > 0 || search || typeFilter || statusFilter || coverageFilter) && (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            <SearchBar
+              value={searchInput}
+              onChange={setSearchInput}
+              onSearch={() => {
+                setPage(0);
+                setSearch(searchInput);
+              }}
+              placeholder="Search by key or summary…"
+            />
+            <select
+              value={typeFilter}
+              onChange={(e) => { setPage(0); setTypeFilter(e.target.value); }}
+              className="h-9 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--foreground)] outline-none"
+            >
+              <option value="">All types</option>
+              {stats.types.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+            <select
+              value={statusFilter}
+              onChange={(e) => { setPage(0); setStatusFilter(e.target.value); }}
+              className="h-9 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--foreground)] outline-none"
+            >
+              <option value="">All statuses</option>
+              {stats.statuses.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+            <select
+              value={coverageFilter}
+              onChange={(e) => { setPage(0); setCoverageFilter(e.target.value as "" | "covered" | "uncovered"); }}
+              className="h-9 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--foreground)] outline-none"
+            >
+              <option value="">Coverage: All</option>
+              <option value="covered">Covered</option>
+              <option value="uncovered">Uncovered</option>
+            </select>
+            {(search || typeFilter || statusFilter || coverageFilter) && (
+              <button
+                onClick={() => {
+                  setSearch("");
+                  setSearchInput("");
+                  setTypeFilter("");
+                  setStatusFilter("");
+                  setCoverageFilter("");
+                  setPage(0);
+                }}
+                className="text-sm text-[var(--accent-light)] hover:underline"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center justify-between text-sm text-[var(--muted)]">
+            <span>
+              {total} requirement{total !== 1 ? "s" : ""}
+              {search && <> matching &quot;{search}&quot;</>}
+            </span>
+            <span>
+              Page {page + 1} of {totalPages}
+            </span>
+          </div>
+
+          <div className="rounded-xl border border-[var(--border)] overflow-x-auto">
+            <table className="w-full text-sm" style={{ minWidth: 900 }}>
+              <thead>
+                <tr className="bg-[var(--surface-secondary)] border-b border-[var(--border)]">
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-28">Key</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)]">Summary</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-24">Type</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-36">Status</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-20">Priority</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-32">Assignee</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-24">Coverage</th>
+                  <th className="text-left px-4 py-2.5 font-medium text-[var(--muted-soft)] w-28">Zyra Status</th>
+                  <th className="text-right px-4 py-2.5 font-medium text-[var(--muted-soft)] w-64">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tickets.map((ticket) => {
+                  const linked = isLinked(ticket);
+                  const tcCount = tcCountFor(ticket);
+                  const activeTask = activeTaskFor(ticket);
+                  const zyraStatus = zyraStatusFor(ticket);
+                  return (
+                    <React.Fragment key={ticket.id}>
+                      <tr
+                        data-testid="requirement-row"
+                        data-source={ticket.source}
+                        onClick={() => setExpandedId(expandedId === ticket.id ? null : ticket.id)}
+                        className="border-b border-[var(--border-subtle)] hover:bg-[var(--surface-secondary)]/30 cursor-pointer transition-colors"
+                      >
+                        <td className="px-4 py-2.5">
+                          <div className="flex items-center gap-1.5">
+                            {source === "all" && <SourceBadge source={ticket.source} />}
+                            <a
+                              href={ticket.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              data-testid="requirement-key"
+                              className="font-mono text-xs text-[var(--accent-light)] hover:underline"
+                            >
+                              {ticket.key}
+                            </a>
+                          </div>
+                        </td>
+                        <td className="px-4 py-2.5 text-[var(--foreground)] truncate max-w-xs" title={ticket.summary}>
+                          {ticket.summary}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <IssueTypeIcon type={ticket.issueType} />
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <StatusChip tone={jiraStatusTone(ticket.status)}>{ticket.status}</StatusChip>
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <PriorityIcon priority={ticket.priority} />
+                        </td>
+                        <td className="px-4 py-2.5 text-[var(--muted-soft)] text-xs truncate">
+                          {ticket.assignee || "Unassigned"}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          {tcCount > 0 ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="w-8 h-1 rounded-full bg-[var(--surface-tertiary)] overflow-hidden">
+                                <div className="h-full w-full rounded-full bg-[var(--success)]" />
+                              </div>
+                              <span className="text-[11px] font-mono font-medium text-[var(--success-foreground)]">{tcCount} TC</span>
+                            </div>
+                          ) : (
+                            <span className="text-[11px] text-[var(--muted-soft)]">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <StatusChip tone={zyraStatus.tone} title="Zyra's test-generation status for this requirement">
+                            {zyraStatus.label}
+                          </StatusChip>
+                        </td>
+                        <td className="px-4 py-2.5 text-right">
+                          <div className="inline-flex items-center gap-2">
+                            {linked && (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-[var(--success-soft)] px-2 py-0.5 text-xs font-medium text-[var(--success-foreground)]">
+                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                {tcCount} saved
+                              </span>
+                            )}
+                            {linked && (
+                              <Link
+                                href={`/projects/${projectId}/testcases?${ticket.source === "jira" ? "jiraIssueKey" : ticket.source === "linear" ? "linearIssueKey" : "notionPageId"}=${encodeURIComponent(ticket.externalId)}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View testcases
+                              </Link>
+                            )}
+                            {activeTask ? (
+                              <Link
+                                href={`/projects/${projectId}/agents/tasks/${activeTask.taskId}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--foreground)] shadow-sm hover:bg-[var(--surface-secondary)]"
+                              >
+                                View task
+                              </Link>
+                            ) : linked ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleGenerateFromTicket(ticket, "regenerate");
+                                }}
+                                disabled={generatingKey === ticket.key}
+                                className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
+                              >
+                                {generatingKey === ticket.key ? "Assigning..." : "Regenerate with Zyra"}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  void handleGenerateFromTicket(ticket, "generate");
+                                }}
+                                disabled={generatingKey === ticket.key}
+                                className="rounded-lg bg-[var(--brand-primary)] px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-[var(--brand-hover)] disabled:opacity-50"
+                              >
+                                {generatingKey === ticket.key ? "Assigning..." : "Assign to Zyra"}
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                      {expandedId === ticket.id && (
+                        <tr key={`${ticket.id}-detail`} className="bg-[var(--surface-secondary)]/20">
+                          <td colSpan={9} className="px-4 py-4">
+                            <div className="space-y-3">
+                              {ticket.description && (
+                                <div>
+                                  <h4 className="text-xs font-semibold text-[var(--muted)] uppercase tracking-wide mb-1">
+                                    Description
+                                  </h4>
+                                  {/* Linear and Notion store descriptions as Markdown verbatim, so render them. Jira's
+                                      arrive already flattened to plain text (jiraDescriptionToText) —
+                                      running that through renderMarkdown would italicise snake_case. */}
+                                  {ticket.source === "linear" || ticket.source === "notion" ? (
+                                    <div
+                                      data-testid="ticket-description"
+                                      className="zyra-prose break-words text-sm text-[var(--muted)] max-h-48 overflow-y-auto"
+                                      dangerouslySetInnerHTML={{ __html: renderMarkdown(ticket.description) }}
+                                    />
+                                  ) : (
+                                    <p
+                                      data-testid="ticket-description"
+                                      className="text-sm text-[var(--muted)] whitespace-pre-wrap max-h-48 overflow-y-auto"
+                                    >
+                                      {ticket.description}
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                              <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs text-[var(--muted)]">
+                                {ticket.reporter && (
+                                  <span>Reporter: <span className="text-[var(--muted)]">{ticket.reporter}</span></span>
+                                )}
+                                {ticket.labels && (
+                                  <span>Labels: <span className="text-[var(--muted)]">{ticket.labels}</span></span>
+                                )}
+                                {ticket.createdAt && (
+                                  <span>Created: <span className="text-[var(--muted)]">{formatDate(ticket.createdAt)}</span></span>
+                                )}
+                                {ticket.updatedAt && (
+                                  <span>Updated: <span className="text-[var(--muted)]">{formatDate(ticket.updatedAt)}</span></span>
+                                )}
+                              </div>
+                              <a
+                                href={ticket.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-block text-xs text-[var(--accent-light)] hover:underline"
+                              >
+                                Open in {providerLabel(ticket.source)} →
+                              </a>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {totalPages > 1 && (
+            <div className="flex items-center justify-center gap-2">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)] disabled:opacity-40 transition-colors"
+              >
+                Previous
+              </button>
+              <span className="rounded-lg bg-[var(--brand-primary)] px-3 py-1.5 text-sm font-mono font-medium text-white">
+                {page + 1}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                disabled={page >= totalPages - 1}
+                className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)] disabled:opacity-40 transition-colors"
+              >
+                Next
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </StandardPageLayout>
+  );
+}
