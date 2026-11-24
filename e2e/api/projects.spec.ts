@@ -1,0 +1,1842 @@
+import { expect, test, type APIRequestContext } from "@playwright/test";
+import { env } from "../utils/env";
+import { dbControlAvailable } from "../utils/psql";
+import { anonymousContext } from "../utils/rbac-tenant";
+import {
+  backdate,
+  createBug,
+  createProject,
+  createSuite,
+  createTestCase,
+  deleteProjects,
+  getDashboard,
+  listRuns,
+  screensApi,
+  screensSuiteSkipReason,
+  screensTenant,
+  seedJiraRequirements,
+  seedRun,
+  softDeleteExecutions,
+  uniqueSuffix,
+  type ExecStatus,
+} from "../utils/screens-tenant";
+
+test.describe("project CRUD", () => {
+  test("creates a project from just a name and derives a key from it", { tag: '@tesbo.testId("TES-TC-405")' }, async ({ request }) => {
+    // projectKey() uppercases, strips non-alphanumerics, then keeps only the first 16 chars —
+    // so the name must stay short enough that the full (fast-changing) timestamp survives
+    // that truncation. A longer prefix like "E2E Project" would eat the budget and leave only
+    // the timestamp's slow-changing leading digits, colliding across reruns within the same
+    // ~2.8-hour window (organization_id, key) is uniquely constrained forever, even for
+    // archived projects.
+    const name = `E2E ${Date.now()}`;
+    const createRes = await request.post("/api/projects", { data: { name } });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    expect(created.id).toBeTruthy();
+    expect(created.name).toBe(name);
+    expect(created.key).toMatch(/^[A-Z0-9]{1,16}$/);
+    expect(created.projectType).toBe("tesbox");
+
+    await request.delete(`/api/projects/${created.id}`);
+  });
+
+  test("creates a project with an explicit key, description and projectType", { tag: '@tesbo.testId("TES-TC-406")' }, async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const name = `E2E Full Project ${suffix}`;
+    const createRes = await request.post("/api/projects", {
+      data: { name, key: `e2e${suffix}`, description: "Created by the e2e suite", projectType: "manual" },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    // projectKey() uppercases and strips non-alphanumerics before storing.
+    expect(created.key).toBe(`E2E${suffix}`);
+    expect(created.projectType).toBe("manual");
+
+    const getRes = await request.get(`/api/projects/${created.id}`);
+    expect((await getRes.json()).description).toBe("Created by the e2e suite");
+
+    await request.delete(`/api/projects/${created.id}`);
+  });
+
+  test("rejects creating a project without a name", { tag: '@tesbo.testId("TES-TC-407")' }, async ({ request }) => {
+    const res = await request.post("/api/projects", { data: {}, failOnStatusCode: false });
+    expect(res.status()).toBe(400);
+    expect((await res.json()).error).toMatch(/name/i);
+  });
+
+  test("rejects creating a project with a name over the 30 character max", { tag: '@tesbo.testId("TES-TC-1185")' }, async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: "x".repeat(31), key: `E2ELONG${suffix}` },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+    expect((await res.json()).error).toMatch(/30 characters/);
+  });
+
+  test("allows creating a project with a name at exactly the 30 character max", { tag: '@tesbo.testId("TES-TC-1186")' }, async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const name = "y".repeat(30);
+    const createRes = await request.post("/api/projects", { data: { name, key: `E2EMAX${suffix}` } });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    expect(created.name).toBe(name);
+
+    await request.delete(`/api/projects/${created.id}`);
+  });
+
+  test("rejects creating a project whose key collides with an existing one", { tag: '@tesbo.testId("TES-TC-408")' }, async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const key = `DUPE${suffix}`;
+
+    const firstRes = await request.post("/api/projects", { data: { name: `Dup A ${suffix}`, key } });
+    expect(firstRes.ok()).toBeTruthy();
+    const first = await firstRes.json();
+
+    // Known rough edge, pinned deliberately: (organization_id, key) is unique at the DB level
+    // but createProject() doesn't catch that constraint violation, so a collision falls through
+    // to the generic unhandled-exception handler as a 500 rather than a clean 4xx. If that's
+    // ever fixed, this assertion should be tightened to the new status rather than loosened.
+    const secondRes = await request.post("/api/projects", {
+      data: { name: `Dup B ${suffix}`, key },
+      failOnStatusCode: false,
+    });
+    expect(secondRes.ok()).toBeFalsy();
+
+    await request.delete(`/api/projects/${first.id}`);
+  });
+
+  test("a rename never changes the project key, even when the PATCH tries to send one", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const key = `E2EKEY${suffix}`;
+    const created = await (await request.post("/api/projects", { data: { name: `E2E Key Stays ${suffix}`, key } })).json();
+    try {
+      for (const body of [
+        { name: `E2E Renamed ${suffix}` },
+        // A key in the body is not an editable field: ignored, not applied and not an error.
+        { name: `E2E Renamed Again ${suffix}`, key: "HIJACK" },
+        // Surrounding whitespace is trimmed from the name; the key is still untouched.
+        { name: `  E2E Padded ${suffix}  ` },
+      ]) {
+        const res = await request.patch(`/api/projects/${created.id}`, { data: body, failOnStatusCode: false });
+        expect(res.ok(), await res.text()).toBeTruthy();
+        const after = await (await request.get(`/api/projects/${created.id}`)).json();
+        expect(after.key).toBe(key);
+        expect(after.name).toBe(body.name.trim());
+      }
+
+      // Every list that carries the label agrees with the single read.
+      const list = await (await request.get("/api/projects")).json();
+      const row = list.find((p: { id: string }) => p.id === created.id);
+      expect(row.key).toBe(key);
+      expect(row.name).toBe(`E2E Padded ${suffix}`);
+      // The project is still addressable by its original key.
+      const byKey = await request.get(`/api/projects/${key}`, { failOnStatusCode: false });
+      expect(byKey.status()).toBeLessThan(500);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("supports the read -> update -> delete lifecycle", { tag: '@tesbo.testId("TES-TC-409")' }, async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const name = `E2E Lifecycle Project ${suffix}`;
+    // Explicit key: the name alone is too long for projectKey()'s 16-char budget to retain any
+    // of the timestamp (see the "derives a key from it" test above for why that matters).
+    const createRes = await request.post("/api/projects", { data: { name, key: `E2ELIFE${suffix}` } });
+    const created = await createRes.json();
+
+    const getRes = await request.get(`/api/projects/${created.id}`);
+    expect(getRes.ok()).toBeTruthy();
+    expect((await getRes.json()).name).toBe(name);
+
+    const updatedName = `${name} (renamed)`;
+    const patchRes = await request.patch(`/api/projects/${created.id}`, {
+      data: { name: updatedName, description: "updated description", settings: { foo: "bar" } },
+    });
+    expect(patchRes.ok()).toBeTruthy();
+
+    const getAfterUpdateRes = await request.get(`/api/projects/${created.id}`);
+    const afterUpdate = await getAfterUpdateRes.json();
+    expect(afterUpdate.name).toBe(updatedName);
+    expect(afterUpdate.description).toBe("updated description");
+    expect(afterUpdate.settings).toMatchObject({ foo: "bar" });
+
+    const listRes = await request.get("/api/projects");
+    const list = await listRes.json();
+    expect(list.some((p: { id: string }) => p.id === created.id)).toBeTruthy();
+
+    const deleteRes = await request.delete(`/api/projects/${created.id}`);
+    expect(deleteRes.ok()).toBeTruthy();
+
+    const getAfterDeleteRes = await request.get(`/api/projects/${created.id}`, {
+      failOnStatusCode: false,
+    });
+    expect(getAfterDeleteRes.status()).toBe(404);
+
+    const listAfterDeleteRes = await request.get("/api/projects");
+    const listAfterDelete = await listAfterDeleteRes.json();
+    expect(listAfterDelete.some((p: { id: string }) => p.id === created.id)).toBeFalsy();
+  });
+
+  test("update validates name and description instead of blanking the name", { tag: '@tesbo.testId("TES-TC-950")' }, async ({ request }) => {
+    // This used to assert the opposite: updateProject() had no "name required" check, so
+    // PATCH {name: ""} blanked the name (COALESCE only skips null/undefined, and "" is neither),
+    // and the spec documented that gap. validateProjectFields() is now shared by
+    // createProject/updateProject, so the gap is closed and an empty name is a 400 that changes
+    // nothing. Boundaries are asserted here too, so a regression in either direction shows up.
+    const suffix = Date.now().toString().slice(-8);
+    const name = `E2E Validated Project ${suffix}`;
+    const createRes = await request.post("/api/projects", { data: { name, key: `E2EVAL${suffix}` } });
+    const created = await createRes.json();
+
+    try {
+      // Each rejected payload must leave the stored name untouched, not partially applied.
+      for (const badName of ["", "   ", "ab"]) {
+        const res = await request.patch(`/api/projects/${created.id}`, {
+          data: { name: badName },
+          failOnStatusCode: false,
+        });
+        expect(res.status()).toBe(400);
+        const getRes = await request.get(`/api/projects/${created.id}`);
+        expect((await getRes.json()).name).toBe(name);
+      }
+
+      const tooLongName = await request.patch(`/api/projects/${created.id}`, {
+        data: { name: "x".repeat(31) },
+        failOnStatusCode: false,
+      });
+      expect(tooLongName.status()).toBe(400);
+
+      const tooLongDescription = await request.patch(`/api/projects/${created.id}`, {
+        data: { description: "d".repeat(501) },
+        failOnStatusCode: false,
+      });
+      expect(tooLongDescription.status()).toBe(400);
+
+      // The max-length boundary itself is allowed — 30 passes, 31 (above) does not.
+      const atMaxName = `${"y".repeat(30)}`;
+      const okRes = await request.patch(`/api/projects/${created.id}`, { data: { name: atMaxName } });
+      expect(okRes.ok()).toBeTruthy();
+      const afterOk = await request.get(`/api/projects/${created.id}`);
+      expect((await afterOk.json()).name).toBe(atMaxName);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("updating or deleting a project that doesn't exist returns 404", { tag: '@tesbo.testId("TES-TC-411")' }, async ({ request }) => {
+    const missingId = "00000000-0000-0000-0000-000000000000";
+
+    const patchRes = await request.patch(`/api/projects/${missingId}`, {
+      data: { name: "nope" },
+      failOnStatusCode: false,
+    });
+    expect(patchRes.status()).toBe(404);
+
+    const deleteRes = await request.delete(`/api/projects/${missingId}`, { failOnStatusCode: false });
+    expect(deleteRes.status()).toBe(404);
+  });
+});
+
+/*
+ * A project card's badge: an optional color (restricted to the AVATAR_COLORS palette, so every
+ * choice keeps the WCAG AA contrast the generated placeholder already guarantees) plus an optional
+ * glyph (a letter or one emoji) that replaces the auto-derived initial. `null`/omitted on either
+ * field means "keep using the generated placeholder" — see legacy.service.ts's validateProjectIcon.
+ */
+test.describe("project icon", () => {
+  const PALETTE_COLOR = "#1F7A3D";
+
+  test("a valid color and glyph are persisted and surface on GET, list, and overview", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Icon ${suffix}`, key: `E2EICON${suffix}`, icon: { color: PALETTE_COLOR, glyph: "Z" } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+
+    try {
+      // GET /api/projects/:id (getProjectForUser) returns the raw settings blob, same as it does
+      // for testcaseIdPrefix — only the list/overview endpoints below flatten out a clean `icon`.
+      const fetched = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(fetched.settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+
+      const list = await (await request.get("/api/projects")).json();
+      expect(list.find((p: { id: string }) => p.id === created.id).icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+
+      const overview = await (await request.get("/api/projects/overview")).json();
+      expect(overview.find((p: { id: string }) => p.id === created.id).icon).toEqual({ color: PALETTE_COLOR, glyph: "Z" });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a project created without an icon reports null, not an empty override", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", { data: { name: `E2E No Icon ${suffix}`, key: `E2ENOICON${suffix}` } });
+    const created = await createRes.json();
+
+    try {
+      const fetched = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(fetched.settings.icon ?? null).toBeNull();
+      const list = await (await request.get("/api/projects")).json();
+      expect(list.find((p: { id: string }) => p.id === created.id).icon).toBeNull();
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a color outside the supported palette is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Bad Color ${suffix}`, key: `E2EBADCLR${suffix}`, icon: { color: "#123456" } },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+    expect((await res.json()).error).toMatch(/palette/i);
+  });
+
+  test("a palette color is matched case-insensitively", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Lowercase Color ${suffix}`, key: `E2ELOWCLR${suffix}`, icon: { color: PALETTE_COLOR.toLowerCase() } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      // Normalized to the canonical palette casing, not stored verbatim.
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.color).toBe(PALETTE_COLOR);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a glyph over 2 characters is rejected, and exactly 2 is accepted", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const tooLong = await request.post("/api/projects", {
+      data: { name: `E2E Long Glyph ${suffix}`, key: `E2ELONGGL${suffix}`, icon: { glyph: "ABC" } },
+      failOnStatusCode: false,
+    });
+    expect(tooLong.status()).toBe(400);
+
+    const atLimit = await request.post("/api/projects", {
+      data: { name: `E2E Max Glyph ${suffix}`, key: `E2EMAXGL${suffix}`, icon: { glyph: "AB" } },
+    });
+    expect(atLimit.ok()).toBeTruthy();
+    const created = await atLimit.json();
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.glyph).toBe("AB");
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a single emoji built from multiple code points counts as one glyph character", async ({ request }) => {
+    // U+2764 (heavy black heart) + U+FE0F (variation selector) — two UTF-16 code units, one
+    // grapheme. A length check instead of a grapheme count would reject this as "too long".
+    const emoji = "❤️";
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Emoji Glyph ${suffix}`, key: `E2EEMOJI${suffix}`, icon: { glyph: emoji } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon.glyph).toBe(emoji);
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a whitespace-only glyph is treated as no override, not an error", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const createRes = await request.post("/api/projects", {
+      data: { name: `E2E Whitespace Glyph ${suffix}`, key: `E2EWSGL${suffix}`, icon: { color: PALETTE_COLOR, glyph: "   " } },
+    });
+    expect(createRes.ok()).toBeTruthy();
+    const created = await createRes.json();
+    try {
+      const icon = (await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon;
+      expect(icon.color).toBe(PALETTE_COLOR);
+      expect(icon.glyph).toBeNull();
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a glyph containing control characters is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Control Glyph ${suffix}`, key: `E2ECTLGL${suffix}`, icon: { glyph: `A${String.fromCharCode(7)}` } },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("a non-object icon payload is rejected", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Bad Icon Shape ${suffix}`, key: `E2EBADSHP${suffix}`, icon: "purple" },
+      failOnStatusCode: false,
+    });
+    expect(res.status()).toBe(400);
+  });
+
+  test("update adds an icon to a project that had none, and can later clear it back to automatic", async ({ request }) => {
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await request.post("/api/projects", { data: { name: `E2E Icon Update ${suffix}`, key: `E2EICONUP${suffix}` } })
+    ).json();
+
+    try {
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon ?? null).toBeNull();
+
+      const addRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: { color: PALETTE_COLOR, glyph: "Q" } } });
+      expect(addRes.ok()).toBeTruthy();
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Q" });
+
+      const clearRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: null } });
+      expect(clearRes.ok()).toBeTruthy();
+      expect((await (await request.get(`/api/projects/${created.id}`)).json()).settings.icon).toEqual({ color: null, glyph: null });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("updating just the icon does not require resending, or erase, the rest of settings", async ({ request }) => {
+    // The icon is merged into `settings` with a targeted jsonb_set rather than folded into the
+    // generic `settings` field's whole-object replace, specifically so a caller updating one icon
+    // doesn't have to read-modify-write the whole blob (and risk losing a concurrent change to
+    // testcaseIdPrefix/testRunEnvironments) just to change a color.
+    const suffix = Date.now().toString().slice(-8);
+    const created = await (
+      await request.post("/api/projects", { data: { name: `E2E Icon Settings ${suffix}`, key: `E2EICONSET${suffix}` } })
+    ).json();
+
+    try {
+      const settingsRes = await request.patch(`/api/projects/${created.id}`, {
+        data: { settings: { testcaseIdPrefix: "ABC" } },
+      });
+      expect(settingsRes.ok()).toBeTruthy();
+
+      const iconRes = await request.patch(`/api/projects/${created.id}`, { data: { icon: { color: PALETTE_COLOR } } });
+      expect(iconRes.ok()).toBeTruthy();
+
+      const afterIcon = await (await request.get(`/api/projects/${created.id}`)).json();
+      expect(afterIcon.settings.testcaseIdPrefix, "the icon update erased an unrelated settings key").toBe("ABC");
+      expect(afterIcon.settings.icon).toEqual({ color: PALETTE_COLOR, glyph: null });
+    } finally {
+      await request.delete(`/api/projects/${created.id}`, { failOnStatusCode: false });
+    }
+  });
+});
+
+/*
+ * ── GET /api/projects/:projectId/dashboard ──
+ *
+ * Runs against the disposable screens tenant, not account A: every assertion here is arithmetic
+ * over a project's whole contents, which is only deterministic when the project was built by this
+ * test and nothing else is writing to it. See utils/screens-tenant.ts.
+ */
+test.describe("project dashboard summary", () => {
+  const tenant = screensTenant();
+  const skipReason = screensSuiteSkipReason(tenant);
+
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  test("DSH-A-01/02 a brand-new project reports the full contract, zeroed, with no invented rates", { tag: '@tesbo.testId("TES-TC-412")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const summary = await getDashboard(api, project.id);
+
+      expect(summary).toEqual({
+        testCases: { total: 0, addedThisWeek: 0 },
+        passRate: { value: null, deltaThisWeek: null },
+        executionProgress: { value: 0 },
+        openBugs: { total: 0, bySeverity: { Critical: 0, High: 0, Medium: 0, Low: 0 }, noSeverity: 0 },
+        coverage: { pct: null, totalRequirements: 0 },
+        plans: 0,
+        suites: 0,
+        activeRuns: 0,
+      });
+      // Nothing has been executed, so a rate would be a fabrication — null, never 0.
+      expect(summary.passRate.value).toBeNull();
+      expect(summary.coverage.pct).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-03 testCases.total matches the list endpoint and excludes soft-deleted cases", { tag: '@tesbo.testId("TES-TC-413")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const kept = await createTestCase(api, project.id);
+      const removed = await createTestCase(api, project.id);
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(2);
+
+      await api.delete(`/api/projects/${project.id}/testcases/${removed.id}`);
+
+      const summary = await getDashboard(api, project.id);
+      const listTotal = Number(
+        (await api.get(`/api/projects/${project.id}/testcases`)).headers()["x-total-count"],
+      );
+      expect(summary.testCases.total).toBe(1);
+      expect(summary.testCases.total).toBe(listTotal);
+      expect(kept.id).toBeTruthy();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-04 addedThisWeek counts the last 7 days only", { tag: '@tesbo.testId("TES-TC-414")' }, async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to backdate a test case past the 7-day window");
+    const project = await createProject(api);
+    try {
+      const recent = await createTestCase(api, project.id);
+      const old = await createTestCase(api, project.id);
+      backdate("testcases", "created_at", [old.id], "8 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(2);
+      expect(summary.testCases.addedThisWeek).toBe(1);
+      expect(recent.id).toBeTruthy();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-05 passRate divides by executed cases, leaving Untested out of the denominator", { tag: '@tesbo.testId("TES-TC-415")' }, async () => {
+    const project = await createProject(api);
+    try {
+      // 3 passed, 1 failed, 2 untested → 3/4 executed = 75%, not 3/6 = 50%.
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Untested", "Untested"],
+      });
+
+      expect((await getDashboard(api, project.id)).passRate.value).toBe(75);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06 a run with nothing executed reports no pass rate rather than 0%", { tag: '@tesbo.testId("TES-TC-416")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Untested", "Untested", "Untested"] });
+
+      expect((await getDashboard(api, project.id)).passRate.value).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06b Skipped is excluded from the pass rate denominator but counted in execution progress", { tag: '@tesbo.testId("TES-TC-416-1")' }, async () => {
+    /*
+     * The reported defect's own numbers: 3 Passed, 2 Failed, 2 Blocked, 1 Skipped, 2 Untested.
+     * Test Run Details used to read 3/10 = 30% (dividing by every case) while the Test Plan page
+     * read 3/7 = 43% (dividing by the settled cases). Pass Rate = Passed / (Passed+Failed+Blocked)
+     * = 3/7 = 43% is correct; Execution Progress counts the Skipped case as "done" even though it
+     * carries no verdict, so it is 8/10 = 80%, a different number answering a different question.
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBe(43);
+      expect(summary.executionProgress.value).toBe(80);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-06c a run that is entirely Skipped reports no pass rate but full execution progress", { tag: '@tesbo.testId("TES-TC-416-2")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBeNull();
+      expect(summary.executionProgress.value).toBe(100);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-07 deltaThisWeek stays null while either comparison window is empty", { tag: '@tesbo.testId("TES-TC-417")' }, async () => {
+    const project = await createProject(api);
+    try {
+      // Everything executed just now: the recent window has data, the prior one has none.
+      await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.value).toBe(50);
+      expect(summary.passRate.deltaThisWeek).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-08 deltaThisWeek compares the last 7 days against the 7 before them", { tag: '@tesbo.testId("TES-TC-418")' }, async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to place executions in the prior 7-day window");
+    const project = await createProject(api);
+    try {
+      // Prior window: 1 of 2 passed = 50%. Recent window: 2 of 2 passed = 100%. Delta = +50.
+      const prior = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      backdate("executions", "executed_at", prior.executionIds, "10 days");
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
+
+      expect((await getDashboard(api, project.id)).passRate.deltaThisWeek).toBe(50);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+
+  test("DSH-A-08b executions older than 14 days never move deltaThisWeek, but still count toward the all-time pass rate", async () => {
+    /*
+     * The delta is read from the last 14 days only, so the query is bounded to that window (and indexed on
+     * executed_at). That bound must not change the answer: older history is invisible to the delta, and
+     * the boundary sits at exactly 14 days.
+     */
+    test.skip(!dbControlAvailable(), "needs psql access to place executions in the comparison windows");
+    const project = await createProject(api);
+    try {
+      // Recent window: 2 of 2 passed = 100%.
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
+      // Just inside the prior window (13d 23h): 1 of 2 passed = 50%. Delta = +50.
+      const inside = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      backdate("executions", "executed_at", inside.executionIds, "13 days 23 hours");
+      expect((await getDashboard(api, project.id)).passRate.deltaThisWeek).toBe(50);
+
+      // Just outside it (14d 1h), a month back, and over a year back: all failures, none of them in either window.
+      const justOutside = await seedRun(api, project.id, { statuses: ["Failed", "Failed"] });
+      backdate("executions", "executed_at", justOutside.executionIds, "14 days 1 hour");
+      const monthOld = await seedRun(api, project.id, { statuses: ["Failed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", monthOld.executionIds, "30 days");
+      const yearOld = await seedRun(api, project.id, { statuses: ["Failed"] });
+      backdate("executions", "executed_at", yearOld.executionIds, "400 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek, "history older than 14 days leaked into a comparison window").toBe(50);
+      // All-time pass rate still sees every execution: 3 passed of 9 settled.
+      expect(Math.round(summary.passRate.value ?? -1)).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-08c a project whose executions are all older than 14 days has a null delta and a real pass rate", async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to place executions outside the comparison windows");
+    const project = await createProject(api);
+    try {
+      const old = await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed", "Failed"] });
+      backdate("executions", "executed_at", old.executionIds, "60 days");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.passRate.deltaThisWeek).toBeNull();
+      expect(summary.passRate.value).toBe(50);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-09 openBugs counts Open and Reopened, and nothing else", { tag: '@tesbo.testId("TES-TC-419")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await createBug(api, project.id, { severity: "Critical" });
+      await createBug(api, project.id, { severity: "High", status: "Reopened" });
+      await createBug(api, project.id, { severity: "Low", status: "Closed" });
+      await createBug(api, project.id, { severity: "Medium", status: "In Progress" });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.openBugs.total).toBe(2);
+      expect(summary.openBugs.bySeverity).toEqual({ Critical: 1, High: 1, Medium: 0, Low: 0 });
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Severity is optional since V130. The total used to be the sum of the four buckets, so an open bug
+   * with no severity would have silently vanished from "Open bugs". It counts in the total and in its
+   * own noSeverity figure, and never in a severity bucket it doesn't have.
+   */
+  test("DSH-A-09b an open bug with no severity counts toward the total, in noSeverity, not in a bucket", async () => {
+    const project = await createProject(api);
+    try {
+      await createBug(api, project.id, { severity: "High" });
+      await createBug(api, project.id, {});
+      await createBug(api, project.id, {});
+      await createBug(api, project.id, { status: "Closed" });
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.openBugs.total).toBe(3);
+      expect(summary.openBugs.noSeverity).toBe(2);
+      expect(summary.openBugs.bySeverity).toEqual({ Critical: 0, High: 1, Medium: 0, Low: 0 });
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-10 a severity outside the four buckets is refused with a validation error, not a 500", { tag: '@tesbo.testId("TES-TC-420")' }, async () => {
+    const project = await createProject(api);
+    try {
+      // The dashboard's bySeverity has exactly four buckets, so a fifth severity would be counted
+      // by the bugs list and dropped by the dashboard. It can't reach the database — V67 added
+      // bugs_severity_check — but the constraint violation surfaces raw: the API answers 500 with
+      // "Internal server error" instead of naming the offending field. An unknown enum value is
+      // caller error, so this should be a 400 the UI can render against the severity field.
+      const res = await api.post(`/api/projects/${project.id}/bugs`, {
+        data: { title: `E2E Screens Bad Severity ${uniqueSuffix()}`, severity: "Trivial" },
+        failOnStatusCode: false,
+      });
+
+      expect(res.status()).toBe(400);
+      expect((await getDashboard(api, project.id)).openBugs.total).toBe(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-11 activeRuns counts In Progress runs only", { tag: '@tesbo.testId("TES-TC-421")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed"], status: "In Progress" });
+      await seedRun(api, project.id, { statuses: ["Passed"], status: "Completed" });
+      await seedRun(api, project.id, { statuses: ["Passed"] }); // Planning, the create default
+
+      expect((await getDashboard(api, project.id)).activeRuns).toBe(1);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-12 coverage is null with no requirements, and a real percentage once they exist", { tag: '@tesbo.testId("TES-TC-422")' }, async () => {
+    test.skip(!dbControlAvailable(), "needs psql access to seed Jira requirements (no API route exists)");
+    const project = await createProject(api);
+    try {
+      const before = await getDashboard(api, project.id);
+      expect(before.coverage).toEqual({ pct: null, totalRequirements: 0 });
+
+      const keys = [`E2ESCR-${uniqueSuffix()}`, `E2ESCR-${uniqueSuffix()}`, `E2ESCR-${uniqueSuffix()}`];
+      seedJiraRequirements(tenant!.organizationId, project.id, keys);
+      // One of the three requirements gets a test case pointing at it.
+      await createTestCase(api, project.id, { jiraIssueKey: keys[0] } as never);
+
+      const after = await getDashboard(api, project.id);
+      expect(after.coverage.totalRequirements).toBe(3);
+      expect(after.coverage.pct).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-13 suites and plans match their own list endpoints", { tag: '@tesbo.testId("TES-TC-423")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await createSuite(api, project.id);
+      await createSuite(api, project.id);
+      await api.post(`/api/projects/${project.id}/plans`, { data: { name: `E2E Screens Plan ${Date.now()}` } });
+
+      const summary = await getDashboard(api, project.id);
+      const suites = await (await api.get(`/api/projects/${project.id}/suites`)).json();
+      const plans = await (await api.get(`/api/projects/${project.id}/plans`)).json();
+
+      expect(summary.suites).toBe(suites.length);
+      expect(summary.plans).toBe(plans.length);
+      expect(summary.plans).toBe(1);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-14 a caller with no session is refused and gets none of the summary", { tag: '@tesbo.testId("TES-TC-424")' }, async ({ playwright }) => {
+    // An explicitly empty storage state, not just an omitted one: playwright.config.ts sets a
+    // global `use.storageState`, and leaving it unset here yields account A's cookies rather than
+    // an anonymous caller — which would quietly turn this into a second copy of DSH-A-15.
+    const anonymous = await playwright.request.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: { cookies: [], origins: [] },
+    });
+    try {
+      const res = await anonymous.get(`/api/projects/${tenant!.projectId}/dashboard`, {
+        failOnStatusCode: false,
+      });
+
+      // The refusal is what matters, and it holds. The code does not: these legacy project routes
+      // answer a sessionless caller with 400 (requireUser rejecting a missing user id) where 401
+      // is the correct status — pinned here so changing it to 401 is a deliberate edit.
+      expect(res.status()).toBe(400);
+      expect(await res.text()).not.toContain("passRate");
+    } finally {
+      await anonymous.dispose();
+    }
+  });
+
+  test("DSH-A-15 another tenant cannot read this project's dashboard", { tag: '@tesbo.testId("TES-TC-425")' }, async ({ request }) => {
+    // `request` here is account A — a real, fully authenticated caller from a different workspace.
+    const res = await request.get(`/api/projects/${tenant!.projectId}/dashboard`, {
+      failOnStatusCode: false,
+    });
+    expect([403, 404]).toContain(res.status());
+  });
+
+  test("DSH-A-16 a missing or malformed project id fails cleanly, never with a 500", { tag: '@tesbo.testId("TES-TC-426")' }, async () => {
+    const missing = await api.get("/api/projects/00000000-0000-0000-0000-000000000000/dashboard", {
+      failOnStatusCode: false,
+    });
+    expect([403, 404]).toContain(missing.status());
+
+    const malformed = await api.get("/api/projects/not-a-uuid/dashboard", { failOnStatusCode: false });
+    expect(malformed.status()).toBeLessThan(500);
+  });
+
+  test("DSH-A-17 the dashboard disappears with the project", { tag: '@tesbo.testId("TES-TC-427")' }, async () => {
+    const project = await createProject(api);
+    await getDashboard(api, project.id); // readable while it exists
+    await api.delete(`/api/projects/${project.id}`);
+
+    const res = await api.get(`/api/projects/${project.id}/dashboard`, { failOnStatusCode: false });
+    expect([403, 404]).toContain(res.status());
+  });
+
+  test("DSH-A-19 the per-run status counters add up to totalCases", { tag: '@tesbo.testId("TES-TC-428")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, {
+        statuses: ["Passed", "Failed", "Blocked", "Skipped", "Untested", "Retest"],
+      });
+
+      const listed = (await listRuns(api, project.id)).find((r) => r.id === run.cycleId)!;
+      const bucketed =
+        listed.passed + listed.failed + listed.blocked + listed.skipped + listed.untested;
+
+      expect(listed.totalCases).toBe(6);
+      // Retest is a status the API accepts (see executions.spec.ts) but listCycles has no bucket
+      // for, so it lands in totalCases and in none of the counters the UI renders.
+      expect(bucketed).toBe(listed.totalCases);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-20 a Retest execution is treated the same way by the run list and the dashboard", { tag: '@tesbo.testId("TES-TC-429")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, { statuses: ["Passed", "Retest"] });
+
+      const listed = (await listRuns(api, project.id)).find((r) => r.id === run.cycleId)!;
+      const summary = await getDashboard(api, project.id);
+
+      /*
+       * Two readings of the same two executions, and they now agree: a case sent back for retest
+       * has no settled result, so it sits in the run list's untested bucket and stays out of the
+       * dashboard's executed denominator. One of the two cases has actually been executed, and it
+       * passed, so the headline reads 100%.
+       *
+       * This previously asserted the divergence instead — 0 in every bucket but passed, and a
+       * dashboard reading 1/2 = 50%. That was the defect DSH-A-19 reports from the other side: the
+       * counters summed to less than totalCases, and a Retest quietly dragged the pass rate down
+       * while changing nothing visible on the run. Fixing one required fixing both.
+       */
+      expect(listed.passed).toBe(1);
+      expect(listed.untested).toBe(1);
+      expect(listed.failed + listed.blocked + listed.skipped).toBe(0);
+      expect(summary.passRate.value).toBe(100);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-21 a soft-deleted execution disappears from both the dashboard and the run list", { tag: '@tesbo.testId("TES-TC-430")' }, async () => {
+    test.skip(!dbControlAvailable(), "needs psql access — executions have no DELETE route");
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      expect((await getDashboard(api, project.id)).passRate.value).toBe(50);
+
+      const failedExecution = run.executionIds[1];
+      softDeleteExecutions([failedExecution]);
+
+      const summary = await getDashboard(api, project.id);
+      const listed = (await listRuns(api, project.id)).find((r) => r.id === run.cycleId)!;
+
+      // The dashboard reads executions_active (the deleted_at IS NULL view from V64), so the row
+      // is gone and the rate climbs to 1 of 1 passed.
+      expect(summary.passRate.value).toBe(100);
+      // The run list agrees now. This used to assert the opposite — listCycles read the raw
+      // executions table, so the deleted row stayed in its counters and the two screens disagreed
+      // about the same run permanently. listCycles joins `AND e.deleted_at IS NULL` and counts off
+      // e.id, and every plan roll-up was moved onto that same rule (EXECUTION_BUCKET_COUNTS) when
+      // "Overall progress percentage not matching" was fixed, so a deleted result is now nowhere.
+      expect(listed.failed).toBe(0);
+      expect(listed.totalCases).toBe(1);
+      expect(listed.passed).toBe(1);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-22 a run with no test cases reports nothing to execute", { tag: '@tesbo.testId("TES-TC-431")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, { statuses: [] });
+
+      const listed = (await listRuns(api, project.id)).find((r) => r.id === run.cycleId)!;
+      expect(listed.totalCases).toBe(0);
+      // This used to be pinned at 1, recording the defect: the LEFT JOIN emits one all-NULL row for
+      // a cycle with no items, and an untested bucket counted with COUNT(*) FILTER (...) scored that
+      // row as a case that does not exist. The pin said fixing it had to be a deliberate change —
+      // this is that change, made everywhere at once. Counting the buckets off e.id (see
+      // EXECUTION_BUCKET_COUNTS) keeps the placeholder row out, so an empty run claims nothing on
+      // the run list, and a plan holding one no longer reports more untested cases than it has
+      // cases. That was the "Overall progress percentage not matching" report.
+      expect(listed.untested).toBe(0);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * testCases.total is the "Test cases" card, which links to the repository table — so it has to be
+   * the number that table reports. Archiving sets status = 'Archived' rather than soft-deleting, and
+   * listTestCases leaves those out by default (Basecamp 10212766570); the dashboard read the shared
+   * analytics() count, which does not, so any project with an archived case showed a higher total
+   * than its own list and its projects-list card. DSH-A-03 only ever soft-deleted, so it never saw it.
+   */
+  async function listTotal(projectId: string): Promise<number> {
+    const res = await api.get(`/api/projects/${projectId}/testcases`, { params: { limit: 1 } });
+    return Number(res.headers()["x-total-count"]);
+  }
+
+  async function setStatus(projectId: string, testcaseId: string, status: string): Promise<void> {
+    const res = await api.patch(`/api/projects/${projectId}/testcases/${testcaseId}`, {
+      data: { status },
+      failOnStatusCode: false,
+    });
+    expect(res.status(), `setting status ${status} — ${await res.text()}`).toBeLessThan(300);
+  }
+
+  test("DSH-A-23 an archived case leaves the total, matching the repository list", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id, { title: `E2E Dash Live ${uniqueSuffix()}` });
+      const archived = await createTestCase(api, project.id, { title: `E2E Dash Archived ${uniqueSuffix()}` });
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(2);
+
+      await setStatus(project.id, archived.id, "Archived");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total, "an archived case is still being counted").toBe(1);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+      // Created this week but archived: the badge must not claim an addition the card does not count.
+      expect(summary.testCases.addedThisWeek).toBe(1);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-24 restoring an archived case brings it back into the total", async () => {
+    const project = await createProject(api);
+    try {
+      const restored = await createTestCase(api, project.id);
+      await createTestCase(api, project.id);
+      await setStatus(project.id, restored.id, "Archived");
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(1);
+
+      // Restore resets an archived case to Draft — the repository's own restore does the same.
+      await setStatus(project.id, restored.id, "Draft");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(2);
+      expect(summary.testCases.addedThisWeek).toBe(2);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-25 archived and deleted cases are both excluded, each counted once", async () => {
+    const project = await createProject(api);
+    try {
+      const live = await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      const removed = await createTestCase(api, project.id);
+      await setStatus(project.id, archived.id, "Archived");
+      await api.delete(`/api/projects/${project.id}/testcases/${removed.id}`);
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(1);
+      expect(summary.testCases.addedThisWeek).toBe(1);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+      expect(live.id).toBeTruthy();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-26 cases across root, nested and no suite are each counted exactly once", async () => {
+    const project = await createProject(api);
+    try {
+      const root = await createSuite(api, project.id, `E2E Dash Root ${uniqueSuffix()}`);
+      const other = await createSuite(api, project.id, `E2E Dash Other ${uniqueSuffix()}`);
+      // Posted directly: createSuite takes a name only, and the nesting is what is under test.
+      const childRes = await api.post(`/api/projects/${project.id}/suites`, {
+        data: { name: `E2E Dash Child ${uniqueSuffix()}`, parentId: root.id },
+        failOnStatusCode: false,
+      });
+      expect(childRes.status(), `nesting a suite — ${await childRes.text()}`).toBeLessThan(300);
+      const child = await childRes.json();
+
+      await createTestCase(api, project.id, { suiteId: root.id });
+      await createTestCase(api, project.id, { suiteId: child.id });
+      await createTestCase(api, project.id, { suiteId: other.id });
+      await createTestCase(api, project.id);
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(4);
+      expect(summary.testCases.total).toBe(await listTotal(project.id));
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("DSH-A-27 another project's cases never reach this project's total", async () => {
+    const project = await createProject(api);
+    const neighbour = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      await createTestCase(api, neighbour.id);
+      await createTestCase(api, neighbour.id);
+      const neighbourArchived = await createTestCase(api, neighbour.id);
+      await setStatus(neighbour.id, neighbourArchived.id, "Archived");
+
+      expect((await getDashboard(api, project.id)).testCases.total).toBe(1);
+      expect((await getDashboard(api, neighbour.id)).testCases.total).toBe(2);
+    } finally {
+      await deleteProjects(api, [project.id, neighbour.id]);
+    }
+  });
+
+  test("DSH-A-28 the dashboard total equals the projects-list card's count", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id);
+      const archived = await createTestCase(api, project.id);
+      await setStatus(project.id, archived.id, "Archived");
+
+      const summary = await getDashboard(api, project.id);
+      expect(summary.testCases.total).toBe(1);
+      // Polled, not read once: the overview caches each project's counts for 10s
+      // (ProjectOverviewCacheService) with no invalidation on write, and another worker on this
+      // shared tenant can list projects between the seeding above and this read, caching a
+      // pre-archive count. 15s outlasts that TTL; the dashboard side is uncached and read once.
+      await expect
+        .poll(
+          async () => {
+            const list = await (await api.get("/api/projects/overview")).json();
+            return list.find((p: { id: string }) => p.id === project.id)?.testCaseCount;
+          },
+          { timeout: 15_000, message: "the projects-list card disagrees with the dashboard" },
+        )
+        .toBe(summary.testCases.total);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+});
+
+/*
+ * GET /api/projects/overview — the projects-list cards' stats, in one response.
+ *
+ * The screen used to build these client-side from five calls per project, and held its spinner
+ * until all of them returned; at fifteen projects that was seventy-eight requests gating first
+ * paint, and it is what made ui/projects-list time out wholesale. The endpoint that replaced the
+ * fan-out has to keep agreeing with the endpoints it displaced — a card that disagrees with the
+ * screen it links to is worse than a slow card — so each test here pins one field against the
+ * endpoint the card used to read it from, rather than against a hardcoded number.
+ */
+test.describe("projects overview", () => {
+  const tenant = screensTenant();
+  const skipReason = screensSuiteSkipReason(tenant);
+
+  test.skip(!!skipReason, skipReason ?? "");
+
+  let api: APIRequestContext;
+
+  test.beforeAll(async () => {
+    api = await screensApi();
+  });
+
+  test.afterAll(async () => {
+    await api?.dispose();
+  });
+
+  type Overview = {
+    id: string;
+    name: string;
+    testCaseCount: number;
+    suiteCount: number;
+    teamMembers: { userId: string; name: string }[];
+    lastActivityAt: string | null;
+    status: "setup_required" | "configured" | "active";
+    runCounts: { passed: number; failed: number; blocked: number; skipped: number; total: number } | null;
+    currentPassRate: number | null;
+  };
+
+  async function overviewFor(projectId: string): Promise<Overview> {
+    const res = await api.get("/api/projects/overview", { failOnStatusCode: false });
+    expect(res.status(), `overview — ${await res.text()}`).toBe(200);
+    const list: Overview[] = await res.json();
+    const entry = list.find((p) => p.id === projectId);
+    expect(entry, `the overview omitted project ${projectId}`).toBeTruthy();
+    return entry!;
+  }
+
+  test("PVW-A-01 the route is not swallowed as a project id", { tag: '@tesbo.testId("TES-TC-1187")' }, async () => {
+    // `/api/projects/:id` is declared right beside this route, and Nest matches in declaration
+    // order — get that ordering wrong and "overview" is read as a project id and 404s. This is the
+    // cheapest possible regression test for a mistake that is invisible in review.
+    const res = await api.get("/api/projects/overview", { failOnStatusCode: false });
+    expect(res.status()).toBe(200);
+    expect(Array.isArray(await res.json())).toBe(true);
+  });
+
+  test("PVW-A-02 an anonymous caller is refused", { tag: '@tesbo.testId("TES-TC-1188")' }, async () => {
+    const anon = await anonymousContext();
+    try {
+      const res = await anon.get("/api/projects/overview", { failOnStatusCode: false });
+      expect(res.status(), "the overview answered an unauthenticated caller").toBeGreaterThanOrEqual(401);
+      expect(res.status()).toBeLessThan(500);
+    } finally {
+      await anon.dispose();
+    }
+  });
+
+  test("PVW-A-03 a brand-new project needs setup and claims no run it has not had", { tag: '@tesbo.testId("TES-TC-1189")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const entry = await overviewFor(project.id);
+      expect(entry.testCaseCount).toBe(0);
+      expect(entry.suiteCount).toBe(0);
+      expect(entry.status, "an empty project is not 'setup required'").toBe("setup_required");
+      // The distinction the card exists to make: no run at all is not a 0% run. Reporting 0 here is
+      // what made a project with an unexecuted run read as a total failure on the list.
+      expect(entry.runCounts).toBeNull();
+      expect(entry.currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-04 the test case count matches the repository, and excludes archived and deleted cases", { tag: '@tesbo.testId("TES-TC-1190")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const live = await createTestCase(api, project.id, { title: `E2E Overview Live ${uniqueSuffix()}` });
+      const archived = await createTestCase(api, project.id, { title: `E2E Overview Archived ${uniqueSuffix()}` });
+      const removed = await createTestCase(api, project.id, { title: `E2E Overview Deleted ${uniqueSuffix()}` });
+      await api.patch(`/api/projects/${project.id}/testcases/${archived.id}`, { data: { status: "Archived" } });
+      await api.delete(`/api/projects/${project.id}/testcases/${removed.id}`);
+
+      // Pinned against listTestCases' own total rather than against "1": that endpoint backs the
+      // repository table, and the card's number has to be the same number the table reports.
+      const listed = await (
+        await api.get(`/api/projects/${project.id}/testcases`, { params: { limit: 1 } })
+      ).json();
+      const entry = await overviewFor(project.id);
+      expect(entry.testCaseCount).toBe(listed.total);
+      expect(entry.testCaseCount, "archived or deleted cases are being counted").toBe(1);
+      expect(live.id).toBeTruthy();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-05 the suite count includes nested suites, matching the suite tree", { tag: '@tesbo.testId("TES-TC-1191")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const parent = await createSuite(api, project.id, `E2E Overview Parent ${uniqueSuffix()}`);
+      // Posted directly rather than through the helper: createSuite takes a name only, and a nested
+      // suite is the whole point of this test.
+      const child = await api.post(`/api/projects/${project.id}/suites`, {
+        data: { name: `E2E Overview Child ${uniqueSuffix()}`, parentId: parent.id },
+        failOnStatusCode: false,
+      });
+      expect(child.status(), `nesting a suite — ${await child.text()}`).toBeLessThan(300);
+
+      // "Total Suites" on the card counts every suite, nested ones included — listSuites returns
+      // them as one flat list, so its length is the contract the card's number has to meet.
+      const suites = await (await api.get(`/api/projects/${project.id}/suites`)).json();
+      const entry = await overviewFor(project.id);
+      expect(entry.suiteCount).toBe(suites.length);
+      expect(entry.suiteCount, "a nested suite is not being counted").toBe(2);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-06 the members match the project's own member list", { tag: '@tesbo.testId("TES-TC-1192")' }, async () => {
+    const project = await createProject(api);
+    try {
+      const members = await (await api.get(`/api/projects/${project.id}/members`)).json();
+      const entry = await overviewFor(project.id);
+      expect(entry.teamMembers.map((m) => m.userId).sort()).toEqual(
+        members.map((m: { userId: string }) => m.userId).sort(),
+      );
+      // The card renders initials from this, so an empty name would draw a blank avatar.
+      for (const member of entry.teamMembers) expect(member.name.trim()).not.toBe("");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-07 the pass rate divides by executed cases, not by the run's total", { tag: '@tesbo.testId("TES-TC-1193")' }, async () => {
+    const project = await createProject(api);
+    try {
+      // Two passed, one failed, one never executed: 2/3 executed = 67%, not 2/4 = 50%.
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed", "Untested"] });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.total).toBe(4);
+      expect(entry.runCounts!.passed).toBe(2);
+      expect(entry.runCounts!.failed).toBe(1);
+      // Dividing by totalCases is what made a project read 100% on its dashboard and a lower number
+      // on the list card for the same run.
+      expect(entry.currentPassRate).toBe(67);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-08 a newer unexecuted run adds untested cases without dragging the pass rate down", { tag: '@tesbo.testId("TES-TC-1194")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed"] });
+      // Scheduling an empty run is routine, and it must not turn a project whose real results all
+      // passed into 0% or "—". Now that the card totals every run, the new run's cases are counted
+      // (total 4) but, being Untested, stay out of the pass-rate denominator.
+      await seedRun(api, project.id, { statuses: ["Untested", "Untested"] });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.currentPassRate, "an unexecuted run dragged the pass rate down").toBe(100);
+      expect(entry.runCounts!.passed).toBe(2);
+      expect(entry.runCounts!.total, "the unexecuted run's cases are part of every run's total").toBe(4);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * "[Projects Dashboard] Aggregate Execution Status Counts Across All Test Runs". The card showed
+   * one run's breakdown — the newest with results — beside dashboards that count every run. It now
+   * totals every live execution in every live run, exactly as analytics() does for the project
+   * dashboard, so the two are pinned against each other here rather than against a constant alone.
+   */
+  test("PVW-A-16 the breakdown totals every run, and matches the project dashboard's own counts", async () => {
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Passed", "Passed", "Failed"], status: "Completed" });
+      await seedRun(api, project.id, { statuses: ["Passed", "Blocked", "Skipped", "Untested"], status: "Completed" });
+      // Retest is folded into "untested" by the shared bucket counts, like everywhere else.
+      await seedRun(api, project.id, { statuses: ["Retest"] });
+
+      const entry = await overviewFor(project.id);
+      // No single run has these numbers — only the sum of all three does.
+      expect(entry.runCounts).toEqual({ passed: 3, failed: 1, blocked: 1, skipped: 1, total: 8 });
+      // Passed / (Passed + Failed + Blocked) over every run: 3 / 5.
+      expect(entry.currentPassRate).toBe(60);
+
+      // The project dashboard's analytics count the same executions the same way.
+      const analytics = await (await api.get(`/api/projects/${project.id}/analytics`)).json();
+      expect(entry.runCounts!.passed).toBe(analytics.executionStatus.Passed);
+      expect(entry.runCounts!.failed).toBe(analytics.executionStatus.Failed);
+      expect(entry.runCounts!.blocked).toBe(analytics.executionStatus.Blocked);
+      expect(entry.runCounts!.skipped).toBe(analytics.executionStatus.Skipped);
+      expect(entry.runCounts!.total).toBe(analytics.executionTotal);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-17 a deleted run and a case removed from a run are left out of the total, with nothing counted twice", async () => {
+    const project = await createProject(api);
+    try {
+      const kept = await seedRun(api, project.id, { statuses: ["Passed", "Failed"] });
+      const deleted = await seedRun(api, project.id, { statuses: ["Blocked", "Blocked"] });
+      await seedRun(api, project.id, { statuses: ["Passed"] });
+
+      // The Failed case leaves its run; the whole Blocked run goes.
+      const removed = await api.delete(`/api/cycles/${kept.cycleId}/testcases/${kept.testcaseIds[1]}`, { failOnStatusCode: false });
+      expect(removed.ok(), `removing a case from the run — ${await removed.text()}`).toBeTruthy();
+      const gone = await api.delete(`/api/cycles/${deleted.cycleId}`, { failOnStatusCode: false });
+      expect(gone.ok(), `deleting the run — ${await gone.text()}`).toBeTruthy();
+
+      // Read only after every write, so a cached earlier answer cannot stand in for this one.
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).toEqual({ passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 });
+      expect(entry.currentPassRate).toBe(100);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-18 another project's runs never reach this project's totals", async () => {
+    const mine = await createProject(api);
+    const other = await createProject(api);
+    try {
+      await seedRun(api, mine.id, { statuses: ["Passed"] });
+      await seedRun(api, other.id, { statuses: ["Failed", "Failed", "Blocked"] });
+
+      const list: Overview[] = await (await api.get("/api/projects/overview")).json();
+      expect(list.find((p) => p.id === mine.id)!.runCounts).toEqual({ passed: 1, failed: 0, blocked: 0, skipped: 0, total: 1 });
+      expect(list.find((p) => p.id === other.id)!.runCounts).toEqual({ passed: 0, failed: 2, blocked: 1, skipped: 0, total: 3 });
+    } finally {
+      await deleteProjects(api, [mine.id, other.id]);
+    }
+  });
+
+  test("PVW-A-12 the pass rate excludes Skipped from the denominator, matching Test Run Details and Test Plan", { tag: '@tesbo.testId("TES-TC-1198")' }, async () => {
+    /*
+     * The exact numbers from the reported defect: a run with 3 Passed, 2 Failed, 2 Blocked, 1
+     * Skipped and 2 Untested read 30% (3 of 10 total cases) on Test Run Details and 43% (3 of the
+     * 7 settled cases) on the Test Plan page. Passed / (Passed + Failed + Blocked) = 3/7 = 43% is
+     * the one correct answer, and this project-list card is a third surface that has to agree —
+     * runCounts.skipped is exposed precisely so a caller can tell the 1 Skipped case apart from
+     * the 2 still-Untested ones instead of both being silently folded into "not counted".
+     */
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, {
+        statuses: ["Passed", "Passed", "Passed", "Failed", "Failed", "Blocked", "Blocked", "Skipped", "Untested", "Untested"],
+      });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.total).toBe(10);
+      expect(entry.runCounts!.passed).toBe(3);
+      expect(entry.runCounts!.failed).toBe(2);
+      expect(entry.runCounts!.blocked).toBe(2);
+      expect(entry.runCounts!.skipped).toBe(1);
+      expect(entry.currentPassRate).toBe(43);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-13 a run that is entirely Skipped reports no pass rate rather than 0%", { tag: '@tesbo.testId("TES-TC-1199")' }, async () => {
+    // Skipped is neither a pass nor a fail — a run with nothing but Skipped cases has no settled
+    // verdict, so this must read "—" (null), the same as an all-Untested run, not 0%.
+    const project = await createProject(api);
+    try {
+      await seedRun(api, project.id, { statuses: ["Skipped", "Skipped"] });
+
+      const entry = await overviewFor(project.id);
+      expect(entry.runCounts).not.toBeNull();
+      expect(entry.runCounts!.skipped).toBe(2);
+      expect(entry.currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-09 a project with cases but no activity is configured, and activity makes it active", { tag: '@tesbo.testId("TES-TC-1195")' }, async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id, { title: `E2E Overview Status ${uniqueSuffix()}` });
+      const entry = await overviewFor(project.id);
+      // Creating a test case is itself logged, so this project has activity — the point of the
+      // assertion is that the three states are derived, not that they are constant.
+      expect(["configured", "active"]).toContain(entry.status);
+      expect(entry.status, "a project with cases still reads as needing setup").not.toBe("setup_required");
+
+      // Whatever lastActivityAt reports has to agree with the feed the Activity screen renders.
+      const feed = await (
+        await api.get(`/api/projects/${project.id}/activity`, { params: { limit: 1 } })
+      ).json();
+      if (feed.list.length === 0) {
+        expect(entry.lastActivityAt).toBeNull();
+      } else {
+        expect(entry.lastActivityAt, "the card claims no activity while the feed shows some").not.toBeNull();
+        // The feed's outer query drops a testcase_* row when a zyra_* sibling exists within five
+        // seconds, so the two timestamps can differ by less than that window but no more.
+        const drift = Math.abs(
+          new Date(entry.lastActivityAt!).getTime() - new Date(feed.list[0].createdAt).getTime(),
+        );
+        expect(drift, "last activity disagrees with the feed by more than the dedup window").toBeLessThan(5000);
+      }
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-10 an archived project drops out of the overview, as it does from the list", { tag: '@tesbo.testId("TES-TC-1196")' }, async () => {
+    const project = await createProject(api);
+    let archived = false;
+    try {
+      expect((await overviewFor(project.id)).id).toBe(project.id);
+
+      // Whatever the list hides, the overview must hide too — otherwise the page would carry stats
+      // for a card it never draws.
+      const res = await api.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+      expect(res.status(), `archiving the project — ${await res.text()}`).toBeLessThan(400);
+      archived = true;
+
+      const list: Overview[] = await (await api.get("/api/projects/overview")).json();
+      expect(list.some((p) => p.id === project.id), "an archived project is still in the overview").toBe(false);
+      const projects = await (await api.get("/api/projects")).json();
+      expect(projects.some((p: { id: string }) => p.id === project.id)).toBe(false);
+    } finally {
+      if (!archived) await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-11 one response covers every project the caller can see", { tag: '@tesbo.testId("TES-TC-1197")' }, async () => {
+    const first = await createProject(api);
+    const second = await createProject(api);
+    try {
+      await createTestCase(api, first.id, { title: `E2E Overview Multi ${uniqueSuffix()}` });
+
+      const list: Overview[] = await (await api.get("/api/projects/overview")).json();
+      const projects = await (await api.get("/api/projects")).json();
+      // The whole point of the endpoint: one call, every card. If it ever returned a subset the
+      // page would silently show stale zeros for the rest.
+      expect(list.length).toBe(projects.length);
+      expect(list.map((p) => p.id).sort()).toEqual(projects.map((p: { id: string }) => p.id).sort());
+      expect(list.find((p) => p.id === first.id)!.testCaseCount).toBe(1);
+      expect(list.find((p) => p.id === second.id)!.testCaseCount).toBe(0);
+    } finally {
+      await deleteProjects(api, [first.id, second.id]);
+    }
+  });
+
+  /*
+   * Hard-delete remediation Phase 2 (#1 in the progress log's 17-site gap sweep). The overview's
+   * runCounts/currentPassRate roll-up joins `cycles`/`cycle_items` with no `deleted_at IS NULL`
+   * filter, so a soft-deleted run (hard-delete remediation Phase 1) kept driving both numbers
+   * forever even though the run itself already 404s.
+   */
+  test("PVW-A-14 a soft-deleted run stops driving the run-count roll-up and pass rate", async () => {
+    const project = await createProject(api);
+    try {
+      const run = await seedRun(api, project.id, { statuses: ["Passed"] });
+
+      const before = await overviewFor(project.id);
+      expect(before.runCounts).toMatchObject({ passed: 1, total: 1 });
+      expect(before.currentPassRate).toBe(100);
+
+      const deleteRes = await api.delete(`/api/cycles/${run.cycleId}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      const after = await overviewFor(project.id);
+      expect(after.runCounts, "a soft-deleted run must no longer drive the run-count roll-up").toBeNull();
+      expect(after.currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Same site (#1), the other half of the same two statements: the lastActivityAt union selected
+   * `cycles.created_at`/`updated_at` with no deleted_at filter either, so a soft-deleted run's
+   * timestamps kept the project reading as "just active" forever. Proven as a differential against
+   * the activity feed on purpose: the feed deliberately keeps showing a deleted run's creation,
+   * marked "(deleted)" (site #17 — see activity.spec.ts's ACT-A-18), while this card's lastActivityAt
+   * must fall back to the next most recent event once the run no longer counts. The two endpoints are
+   * SUPPOSED to disagree about a deleted run, in this one specific way — an unfixed lastActivityAt
+   * would instead keep agreeing with the feed's (deleted) top entry forever.
+   *
+   * Deliberately does not execute the run's case: recording a result itself logs an
+   * "execution_updated" audit_logs row (legacy.service.ts's updateExecution), which would become the
+   * newest, unaffected-by-this-fix event and mask the very drop this test exists to prove. The run
+   * being merely created (and left Untested) is enough to make it the newest, audit-log-free event
+   * that fix #1 has to exclude.
+   */
+  test("PVW-A-15 a soft-deleted run's timestamp stops feeding lastActivityAt, though the audit feed still remembers it", async () => {
+    const project = await createProject(api);
+    try {
+      await createTestCase(api, project.id, { title: `E2E Overview Last-Activity Run ${uniqueSuffix()}` });
+      const cycle = await (
+        await api.post(`/api/projects/${project.id}/cycles`, { data: { name: `E2E Overview Last-Activity Run Cycle ${uniqueSuffix()}` } })
+      ).json();
+
+      // Before the delete: the run's own creation is the newest event, so the card and the feed agree.
+      const feedBefore = await (await api.get(`/api/projects/${project.id}/activity`, { params: { limit: 5 } })).json();
+      expect(feedBefore.list[0].entityType, "the run's own creation must be the newest event before anything is deleted").toBe("cycle");
+      const before = await overviewFor(project.id);
+      expect(
+        Math.abs(new Date(before.lastActivityAt!).getTime() - new Date(feedBefore.list[0].createdAt).getTime()),
+        "lastActivityAt must agree with the feed's own newest entry",
+      ).toBeLessThan(5000);
+
+      const deleteRes = await api.delete(`/api/cycles/${cycle.id}`);
+      expect(deleteRes.ok(), `deleting the run — ${await deleteRes.text()}`).toBeTruthy();
+
+      // After the delete: the feed still shows the run's creation, now marked "(deleted)" — the
+      // audit trail is supposed to remember it (site #17). But it is no longer the SOURCE of
+      // lastActivityAt on this card (site #1) — that must fall back to the next event, the test
+      // case's own creation.
+      const feedAfter = await (await api.get(`/api/projects/${project.id}/activity`, { params: { limit: 5 } })).json();
+      const cycleEntryAfter = feedAfter.list.find((i: { entityType: string; action: string }) => i.entityType === "cycle" && i.action === "created");
+      expect(cycleEntryAfter?.entityName, "the feed must still remember the run, marked deleted").toBe(`${cycle.name} (deleted)`);
+      const testcaseEntryAfter = feedAfter.list.find((i: { entityType: string }) => i.entityType === "testcase");
+      expect(testcaseEntryAfter, "the test case's own creation must still be in the feed").toBeTruthy();
+
+      const after = await overviewFor(project.id);
+      expect(
+        Math.abs(new Date(after.lastActivityAt!).getTime() - new Date(testcaseEntryAfter!.createdAt).getTime()),
+        "lastActivityAt must fall back to the test case's creation once the run is excluded",
+      ).toBeLessThan(5000);
+      expect(
+        new Date(after.lastActivityAt!).getTime(),
+        "lastActivityAt must move backward once the more recent (but now-deleted) run drops out",
+      ).toBeLessThan(new Date(before.lastActivityAt!).getTime());
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  /*
+   * Which run the card's passed/failed/blocked breakdown describes.
+   *
+   * The card reports ONE run: the newest (by creation) that has at least one settled result —
+   * Passed, Failed, Blocked or Skipped. PVW-A-08 pins the half of that rule that keeps an unstarted
+   * run from displacing a finished one; these pin the other half, which a report of the card
+   * "reflecting only the first run" said was broken: a newer run that HAS results must replace an
+   * older one. A test case is counted once per run it is in (one execution per run item), never
+   * once per execution attempt, and never pooled across runs.
+   */
+
+  type RunCounts = NonNullable<Overview["runCounts"]>;
+
+  /**
+   * A run over test cases that already exist, so the same case can be followed across runs —
+   * seedRun always creates fresh cases. statuses[i] is recorded against testcaseIds[i]; "Untested"
+   * is what adding a case already produces, so it is not patched.
+   */
+  async function runWith(projectId: string, testcaseIds: string[], statuses: ExecStatus[]): Promise<string> {
+    const cycleRes = await api.post(`/api/projects/${projectId}/cycles`, {
+      data: { name: `E2E Overview Rerun ${uniqueSuffix()}` },
+      failOnStatusCode: false,
+    });
+    expect(cycleRes.status(), `creating a run — ${await cycleRes.text()}`).toBeLessThan(300);
+    const cycle = await cycleRes.json();
+    const added = await api.post(`/api/cycles/${cycle.id}/testcases`, { data: { testcaseIds }, failOnStatusCode: false });
+    expect(added.status(), `adding cases to the run — ${await added.text()}`).toBeLessThan(300);
+    const executions: { id: string; testcaseId: string }[] = await (await api.get(`/api/cycles/${cycle.id}/executions`)).json();
+    for (let i = 0; i < testcaseIds.length; i++) {
+      if (statuses[i] === "Untested") continue;
+      const execution = executions.find((e) => e.testcaseId === testcaseIds[i]);
+      expect(execution, `the run has no execution for case ${i + 1}`).toBeTruthy();
+      const res = await api.patch(`/api/cycles/${cycle.id}/executions/${execution!.id}`, {
+        data: { status: statuses[i] },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), `recording ${statuses[i]} — ${await res.text()}`).toBeLessThan(300);
+    }
+    return cycle.id;
+  }
+
+  async function newCases(projectId: string, count: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let i = 0; i < count; i++) ids.push((await createTestCase(api, projectId, { status: "Approved" })).id);
+    return ids;
+  }
+
+  /**
+   * Polled rather than read once: the overview caches each project for 10s with no invalidation on
+   * write (ProjectOverviewCacheService), and another worker on this shared tenant can list projects
+   * mid-seed, caching a snapshot from before the last run was recorded. 15s outlasts that TTL.
+   */
+  async function expectRunCounts(projectId: string, expected: RunCounts | null, message: string): Promise<void> {
+    await expect
+      .poll(async () => (await overviewFor(projectId)).runCounts, { timeout: 15_000, message })
+      .toEqual(expected);
+  }
+
+  test("PVW-A-16 a newer run with results replaces the first run on the card", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 3);
+      await runWith(project.id, cases, ["Passed", "Passed", "Passed"]);
+      await expectRunCounts(project.id, { passed: 3, failed: 0, blocked: 0, skipped: 0, total: 3 }, "the first run");
+
+      await runWith(project.id, cases, ["Passed", "Failed", "Blocked"]);
+      await expectRunCounts(
+        project.id,
+        { passed: 1, failed: 1, blocked: 1, skipped: 0, total: 3 },
+        "the card is still reporting the first run after a newer run recorded results",
+      );
+      await expect.poll(async () => (await overviewFor(project.id)).currentPassRate, { timeout: 15_000 }).toBe(33);
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-17 a case that changes status between runs is counted once, under its status in the newer run", async () => {
+    const project = await createProject(api);
+    try {
+      const [flaky, steady] = await newCases(project.id, 2);
+      await runWith(project.id, [flaky, steady], ["Failed", "Passed"]);
+      await runWith(project.id, [flaky, steady], ["Passed", "Passed"]);
+      // 2, not 4: the earlier run's Failed is not pooled in alongside the newer Passed.
+      await expectRunCounts(project.id, { passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 }, "the earlier run leaked in");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-18 cases that only exist in a later run are counted", async () => {
+    const project = await createProject(api);
+    try {
+      const [first] = await newCases(project.id, 1);
+      await runWith(project.id, [first], ["Passed"]);
+      const later = await newCases(project.id, 2);
+      await runWith(project.id, [first, ...later], ["Passed", "Failed", "Blocked"]);
+      await expectRunCounts(
+        project.id,
+        { passed: 1, failed: 1, blocked: 1, skipped: 0, total: 3 },
+        "the cases added in the later run are missing",
+      );
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-19 a newer run that is only partly executed still replaces the older one", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 3);
+      await runWith(project.id, cases, ["Passed", "Passed", "Passed"]);
+      // One settled result is enough for the run to count as executed; the rest stay Untested.
+      await runWith(project.id, cases, ["Failed", "Untested", "Untested"]);
+      await expectRunCounts(project.id, { passed: 0, failed: 1, blocked: 0, skipped: 0, total: 3 }, "a partly executed run was skipped");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-20 a newer run marked entirely Retest does not displace the last settled run", async () => {
+    const project = await createProject(api);
+    try {
+      const cases = await newCases(project.id, 2);
+      await runWith(project.id, cases, ["Passed", "Failed"]);
+      // Retest is "needs running again", grouped with Untested in EXECUTION_BUCKET_COUNTS and left
+      // out of "executed" by computeExecutionMetrics — the same reason PVW-A-08's unstarted run is
+      // passed over.
+      await runWith(project.id, cases, ["Retest", "Retest"]);
+      await expectRunCounts(project.id, { passed: 1, failed: 1, blocked: 0, skipped: 0, total: 2 }, "an all-Retest run displaced the settled one");
+    } finally {
+      await deleteProjects(api, [project.id]);
+    }
+  });
+
+  test("PVW-A-21 a project with no runs, or runs with no results, reports no breakdown", async () => {
+    const empty = await createProject(api);
+    const unexecuted = await createProject(api);
+    try {
+      await newCases(empty.id, 1);
+      const cases = await newCases(unexecuted.id, 2);
+      await runWith(unexecuted.id, cases, ["Untested", "Untested"]);
+      await runWith(unexecuted.id, cases, ["Retest", "Untested"]);
+
+      await expectRunCounts(empty.id, null, "a project with no runs invented a breakdown");
+      await expectRunCounts(unexecuted.id, null, "a project with no settled result invented a breakdown");
+      expect((await overviewFor(unexecuted.id)).currentPassRate).toBeNull();
+    } finally {
+      await deleteProjects(api, [empty.id, unexecuted.id]);
+    }
+  });
+
+  test("PVW-A-22 another project's runs never reach this project's breakdown", async () => {
+    const project = await createProject(api);
+    const neighbour = await createProject(api);
+    try {
+      await runWith(project.id, await newCases(project.id, 2), ["Passed", "Passed"]);
+      // Newer than this project's run: if the per-project pick leaked across projects, this is the
+      // run it would take.
+      await runWith(neighbour.id, await newCases(neighbour.id, 3), ["Failed", "Blocked", "Failed"]);
+
+      await expectRunCounts(project.id, { passed: 2, failed: 0, blocked: 0, skipped: 0, total: 2 }, "the neighbour's run leaked in");
+      await expectRunCounts(neighbour.id, { passed: 0, failed: 2, blocked: 1, skipped: 0, total: 3 }, "the neighbour lost its own run");
+    } finally {
+      await deleteProjects(api, [project.id, neighbour.id]);
+    }
+  });
+});
+
+/*
+ * Project Settings -> Test Environments "Save always 500s".
+ *
+ * The settings screen sends `settings` as a pre-stringified JSON object. updateProject() stringified
+ * it a second time, so Postgres stored a jsonb *string*, and the icon write that follows
+ * (jsonb_set on '{icon}') then raised "cannot set path in scalar" -> 500. The first UPDATE had already
+ * committed, so the "failed" save still persisted the environments (and corrupted the column).
+ */
+test.describe("project settings save (test run environments)", () => {
+  // Must be one of the server's supported palette colours (same value the icon tests above use).
+  const PALETTE_COLOR = "#1F7A3D";
+
+  async function makeProject(request: APIRequestContext, label: string) {
+    const suffix = Date.now().toString().slice(-8);
+    const res = await request.post("/api/projects", {
+      data: { name: `E2E Env ${label} ${suffix}`.slice(0, 30), key: `E2EENV${suffix}` },
+    });
+    expect(res.ok()).toBeTruthy();
+    return (await res.json()) as { id: string };
+  }
+  const settingsOf = async (request: APIRequestContext, id: string) =>
+    (await (await request.get(`/api/projects/${id}`)).json()).settings;
+  const envs = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ name: `Env ${i}`, url: `https://env-${i}.example.com` }));
+
+  test("saves the stringified settings + icon the UI sends, stored as an object", { tag: '@tesbo.testId("TES-TC-3021")' }, async ({ request }) => {
+    const project = await makeProject(request, "ui");
+    try {
+      const environments = [
+        { name: "Prod", url: "https://app.tesbo.io" },
+        { name: "localhost", url: "http://localhost:1020" },
+      ];
+      const res = await request.patch(`/api/projects/${project.id}`, {
+        data: {
+          name: "E2E Env renamed",
+          description: "d",
+          settings: JSON.stringify({ testcaseIdPrefix: "TC", testRunEnvironments: environments }),
+          icon: { color: PALETTE_COLOR, glyph: "Q" },
+        },
+        failOnStatusCode: false,
+      });
+      expect(res.status(), await res.text()).toBeLessThan(300);
+
+      const settings = await settingsOf(request, project.id);
+      expect(typeof settings, "settings must be a jsonb object, not a double-encoded string").toBe("object");
+      expect(settings.testRunEnvironments).toEqual(environments);
+      expect(settings.icon).toEqual({ color: PALETTE_COLOR, glyph: "Q" });
+
+      // Second save in a row: the old failure corrupted the column, so every later save died too.
+      const again = await request.patch(`/api/projects/${project.id}`, {
+        data: { settings: JSON.stringify({ testRunEnvironments: [environments[0]] }), icon: { color: null, glyph: null } },
+        failOnStatusCode: false,
+      });
+      expect(again.status(), await again.text()).toBeLessThan(300);
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual([environments[0]]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an empty environment list clears the saved ones; 50 environments round-trip", { tag: '@tesbo.testId("TES-TC-3022")' }, async ({ request }) => {
+    const project = await makeProject(request, "many");
+    try {
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(50) } } });
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toHaveLength(50);
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: [] } } });
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("a payload without settings leaves saved environments untouched", { tag: '@tesbo.testId("TES-TC-3023")' }, async ({ request }) => {
+    const project = await makeProject(request, "keep");
+    try {
+      await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(2) } } });
+      const res = await request.patch(`/api/projects/${project.id}`, { data: { description: "only this" } });
+      expect(res.ok()).toBeTruthy();
+      expect((await settingsOf(request, project.id)).testRunEnvironments).toEqual(envs(2));
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  const invalid: Array<[string, unknown, RegExp]> = [
+    ["non-JSON string", "{not json", /settings must be a JSON object/],
+    ["array settings", [1, 2], /settings must be a JSON object/],
+    ["number settings", 7, /settings must be a JSON object/],
+    ["environments not an array", { testRunEnvironments: "nope" }, /must be an array/],
+    ["blank name", { testRunEnvironments: [{ name: "   ", url: "https://a.example.com" }] }, /name is required/i],
+    ["missing url", { testRunEnvironments: [{ name: "A" }] }, /URL is required/i],
+    ["name over 50 chars", { testRunEnvironments: [{ name: "n".repeat(51), url: "https://a.example.com" }] }, /at most 50/],
+    ["url over 500 chars", { testRunEnvironments: [{ name: "A", url: `https://${"a".repeat(500)}.com` }] }, /at most 500/],
+    ["url not parseable", { testRunEnvironments: [{ name: "A", url: "not a url" }] }, /valid URL/i],
+    ["non-http scheme", { testRunEnvironments: [{ name: "A", url: "ftp://a.example.com" }] }, /http:\/\/ or https:\/\//],
+    [
+      "duplicate name in another casing",
+      { testRunEnvironments: [{ name: "Stage", url: "https://a.example.com" }, { name: "STAGE", url: "https://b.example.com" }] },
+      /already exists/i,
+    ],
+    [
+      "duplicate url in another casing",
+      { testRunEnvironments: [{ name: "A", url: "https://a.example.com" }, { name: "B", url: "https://A.example.com" }] },
+      /already added/i,
+    ],
+  ];
+  for (const [label, settings, message] of invalid) {
+    test(`rejects ${label} with a 400 and saves nothing`, { tag: '@tesbo.testId("TES-TC-3024")' }, async ({ request }) => {
+      const project = await makeProject(request, "bad");
+      try {
+        await request.patch(`/api/projects/${project.id}`, { data: { settings: { testRunEnvironments: envs(1) } } });
+        const res = await request.patch(`/api/projects/${project.id}`, {
+          data: { name: "should not apply", settings },
+          failOnStatusCode: false,
+        });
+        expect(res.status(), await res.text()).toBe(400);
+        expect((await res.json()).error).toMatch(message);
+        // Nothing half-applied: neither the rename nor the settings.
+        const after = await (await request.get(`/api/projects/${project.id}`)).json();
+        expect(after.name).not.toBe("should not apply");
+        expect(after.settings.testRunEnvironments).toEqual(envs(1));
+      } finally {
+        await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+      }
+    });
+  }
+
+  test("a bad icon rejects the whole save, environments included", { tag: '@tesbo.testId("TES-TC-3025")' }, async ({ request }) => {
+    const project = await makeProject(request, "icon");
+    try {
+      const res = await request.patch(`/api/projects/${project.id}`, {
+        data: { settings: { testRunEnvironments: envs(2) }, icon: { color: "#123456" } },
+        failOnStatusCode: false,
+      });
+      expect(res.status()).toBe(400);
+      expect((await settingsOf(request, project.id))?.testRunEnvironments ?? []).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+
+  test("an unauthenticated caller cannot save settings", { tag: '@tesbo.testId("TES-TC-3026")' }, async ({ request }) => {
+    const project = await makeProject(request, "anon");
+    try {
+      const anon = await anonymousContext();
+      try {
+        const res = await anon.patch(`/api/projects/${project.id}`, {
+          data: { settings: { testRunEnvironments: envs(1) } },
+          failOnStatusCode: false,
+        });
+        expect([401, 403]).toContain(res.status());
+      } finally {
+        await anon.dispose();
+      }
+      expect((await settingsOf(request, project.id))?.testRunEnvironments ?? []).toEqual([]);
+    } finally {
+      await request.delete(`/api/projects/${project.id}`, { failOnStatusCode: false });
+    }
+  });
+});

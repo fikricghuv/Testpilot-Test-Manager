@@ -1,0 +1,687 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { IconArrowsSort, IconColumns, IconSortAscending, IconSortDescending } from "@tabler/icons-react";
+import { PriorityBadge, StatusChip, type Priority } from "@/components/ui";
+import type { TestCaseListItem } from "@/lib/api";
+import { readStoredValue, writeStoredValue } from "@/lib/storage";
+import { formatDate } from "@/lib/date";
+import { ZyraCitationsBadge } from "@/components/agents/ZyraCitationsBadge";
+import { buildContextEntries } from "@/lib/testcase-context";
+
+/** The columns the repository table's header offers a sort control for — mirrors the Test Runs table. */
+export type RepoTcSortColumn = "id" | "title" | "priority";
+export type RepoTcSort = { column: RepoTcSortColumn; direction: "asc" | "desc" } | null;
+const SORTABLE_COLUMNS = new Set<RepoTcSortColumn>(["id", "title", "priority"]);
+
+export type RepoTcColumnId =
+  | "select"
+  | "id"
+  | "title"
+  | "suite"
+  | "jira"
+  | "priority"
+  | "severity"
+  | "component"
+  | "status"
+  | "updated"
+  | "type"
+  | "automation"
+  | "context";
+
+type RepoDataColumnId = Exclude<RepoTcColumnId, "select">;
+
+const DATA_COLUMN_IDS: RepoDataColumnId[] = [
+  "id",
+  "title",
+  "suite",
+  "jira",
+  "component",
+  "priority",
+  "severity",
+  "type",
+  "automation",
+  "status",
+  "context",
+  "updated",
+];
+
+const COLUMN_LABELS: Record<RepoTcColumnId, string> = {
+  select: "Bulk select",
+  id: "ID",
+  title: "Test case title",
+  suite: "Suite",
+  jira: "Jira",
+  priority: "Priority",
+  severity: "Severity",
+  component: "Component",
+  status: "Status",
+  updated: "Updated",
+  type: "Type",
+  automation: "Automation Type",
+  context: "Context",
+};
+
+const FIELD_IDS: Record<RepoDataColumnId, string> = {
+  id: "id",
+  title: "title",
+  suite: "suite",
+  jira: "jira",
+  priority: "priority",
+  severity: "severity",
+  component: "component",
+  status: "status",
+  updated: "updated",
+  type: "type",
+  automation: "automationStatus",
+  context: "sourceRefs",
+};
+
+// Column order is fixed, not user-customizable — drag-to-reorder was removed (only the per-column
+// resize handle remains), so unlike `visible`/`widths` below this is never read from or written to
+// storage. It used to be, under the name DEFAULT_DATA_ORDER: a stored order from before a column
+// was added (or from before drag-reorder existed at all) would freeze that stale order forever,
+// since loadPrefs kept whatever was stored and only appended new columns at the end — reported as
+// Severity/Component always trailing after Updated regardless of where the code default put them.
+const DATA_ORDER: RepoDataColumnId[] = [
+  "id",
+  "title",
+  "suite",
+  "jira",
+  "component",
+  "priority",
+  "severity",
+  "type",
+  "automation",
+  "status",
+  "context",
+  "updated",
+];
+
+// Always shown, can't be hidden via the "Show fields" menu — a test case is illegible
+// without an ID, a title, and a priority to triage by.
+const LOCKED_COLUMN_IDS: RepoDataColumnId[] = ["id", "title", "priority"];
+const LOCKED_COLUMN_SET = new Set(LOCKED_COLUMN_IDS);
+
+const DEFAULT_VISIBLE: Record<RepoDataColumnId, boolean> = {
+  id: true,
+  title: true,
+  suite: false,
+  jira: false,
+  priority: true,
+  severity: false,
+  component: false,
+  status: true,
+  updated: true,
+  type: true,
+  automation: true,
+  context: false,
+};
+
+const DEFAULT_WIDTHS: Record<RepoTcColumnId, number> = {
+  select: 36,
+  id: 112,
+  title: 360,
+  suite: 160,
+  jira: 112,
+  priority: 88,
+  severity: 100,
+  component: 140,
+  status: 112,
+  updated: 136,
+  type: 120,
+  automation: 136,
+  context: 168,
+};
+
+const MIN_WIDTHS: Record<RepoTcColumnId, number> = {
+  select: 32,
+  id: 72,
+  title: 180,
+  suite: 96,
+  jira: 80,
+  priority: 72,
+  severity: 80,
+  component: 96,
+  status: 88,
+  updated: 124,
+  type: 88,
+  automation: 96,
+  context: 120,
+};
+
+const MAX_WIDTH = 560;
+
+function repoStatusTone(status: string) {
+  if (status === "Approved") return "success" as const;
+  if (status === "In Review") return "warning" as const;
+  if (status === "Deprecated") return "error" as const;
+  if (status === "Archived") return "neutral" as const;
+  return "brand" as const;
+}
+
+function repoAutomationTone(automationStatus: string) {
+  if (automationStatus === "Automated") return "success" as const;
+  if (automationStatus === "Can't Automate") return "error" as const;
+  return "neutral" as const;
+}
+
+type TablePrefs = {
+  visible: Record<RepoDataColumnId, boolean>;
+  widths: Partial<Record<RepoTcColumnId, number>>;
+};
+
+function storageKey(projectId: string) {
+  return `tesbo-repo-tc-table:v1:${projectId}`;
+}
+
+function normalizeVisible(raw: unknown): Record<RepoDataColumnId, boolean> {
+  const next = { ...DEFAULT_VISIBLE };
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const id of DATA_COLUMN_IDS) {
+      const v = (raw as Record<string, unknown>)[id];
+      if (typeof v === "boolean") next[id] = v;
+    }
+  }
+  // Force locked columns back on, in case a preference saved before they were locked had them hidden.
+  for (const id of LOCKED_COLUMN_IDS) next[id] = true;
+  return next;
+}
+
+function loadPrefs(projectId: string): Omit<TablePrefs, "widths"> & { widths: Record<RepoTcColumnId, number> } {
+  const widths: Record<RepoTcColumnId, number> = { ...DEFAULT_WIDTHS };
+  let visible = DEFAULT_VISIBLE;
+  try {
+    const raw = readStoredValue(storageKey(projectId));
+    if (!raw) return { visible, widths };
+    const parsed = JSON.parse(raw) as Partial<TablePrefs>;
+    visible = normalizeVisible(parsed.visible);
+    if (parsed.widths && typeof parsed.widths === "object") {
+      for (const id of Object.keys(DEFAULT_WIDTHS) as RepoTcColumnId[]) {
+        const w = (parsed.widths as Record<string, unknown>)[id];
+        if (typeof w === "number" && w >= MIN_WIDTHS[id] && w <= MAX_WIDTH) {
+          widths[id] = w;
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { visible, widths };
+}
+
+export type RepositoryTestCaseTableProps = {
+  projectId: string;
+  suiteNameMap: Map<string, string>;
+  cases: TestCaseListItem[];
+  rowHighlightId: string | null;
+  selectedCaseIdSet: Set<string>;
+  areAllCasesSelected: boolean;
+  onToggleSelectAll: () => void;
+  onToggleCase: (id: string) => void;
+  onOpenRow: (id: string) => void;
+  /** Suite column shows automatically when the suite panel is collapsed, matching the design spec. */
+  suitePanelOpen: boolean;
+  /**
+   * When provided, the "Columns" control is portaled into this element (e.g. the
+   * filter bar, beside the other dropdowns) instead of its own strip above the table.
+   */
+  columnsSlot?: HTMLElement | null;
+  /** Current ID/Test case title/Priority sort, or null for the server's default (creation) order. */
+  sort?: RepoTcSort;
+  /** Toggles the given column's sort: unsorted/other column -> ascending, same column again -> flips direction. */
+  onToggleSort?: (column: RepoTcSortColumn) => void;
+};
+
+export function RepositoryTestCaseTable({
+  projectId,
+  suiteNameMap,
+  cases,
+  rowHighlightId,
+  selectedCaseIdSet,
+  areAllCasesSelected,
+  onToggleSelectAll,
+  onToggleCase,
+  onOpenRow,
+  suitePanelOpen,
+  columnsSlot,
+  sort,
+  onToggleSort,
+}: RepositoryTestCaseTableProps) {
+  const [visible, setVisible] = useState<Record<RepoDataColumnId, boolean>>(DEFAULT_VISIBLE);
+  const [widths, setWidths] = useState<Record<RepoTcColumnId, number>>(DEFAULT_WIDTHS);
+  const [prefsReady, setPrefsReady] = useState(false);
+  const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
+  const columnsMenuRef = useRef<HTMLDivElement>(null);
+
+  const resizeRef = useRef<{ col: RepoTcColumnId; startX: number; startW: number } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const t = window.setTimeout(() => {
+      if (cancelled) return;
+      const p = loadPrefs(projectId);
+      setVisible(p.visible);
+      setWidths(p.widths);
+      setPrefsReady(true);
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t);
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!prefsReady) return;
+    try {
+      const payload: TablePrefs = { visible, widths };
+      writeStoredValue(storageKey(projectId), JSON.stringify(payload));
+    } catch {
+      /* ignore */
+    }
+  }, [prefsReady, projectId, visible, widths]);
+
+  useEffect(() => {
+    if (!columnsMenuOpen) return;
+    const close = (e: MouseEvent) => {
+      if (columnsMenuRef.current && !columnsMenuRef.current.contains(e.target as Node)) {
+        setColumnsMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [columnsMenuOpen]);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const r = resizeRef.current;
+      if (!r) return;
+      const delta = e.clientX - r.startX;
+      const next = Math.min(MAX_WIDTH, Math.max(MIN_WIDTHS[r.col], r.startW + delta));
+      setWidths((prev) => ({ ...prev, [r.col]: next }));
+    };
+    const onUp = () => {
+      resizeRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, []);
+
+  const startResize = useCallback((col: RepoTcColumnId, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizeRef.current = { col, startX: e.clientX, startW: widths[col] };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [widths]);
+
+  const visibleDataColumns = useMemo(
+    () => DATA_ORDER.filter((id) => (id === "suite" ? !suitePanelOpen || visible.suite : visible[id])),
+    [visible, suitePanelOpen],
+  );
+
+  const orderedColumns: RepoTcColumnId[] = useMemo(
+    () => ["select", ...visibleDataColumns],
+    [visibleDataColumns],
+  );
+
+  const totalWidth = useMemo(
+    () => orderedColumns.reduce((sum, id) => sum + widths[id], 0),
+    [orderedColumns, widths],
+  );
+
+  const toggleColumnVisible = useCallback((id: RepoDataColumnId) => {
+    if (LOCKED_COLUMN_SET.has(id)) return;
+    setVisible((prev) => ({ ...prev, [id]: !prev[id] }));
+  }, []);
+
+  function renderHeaderCell(col: RepoTcColumnId) {
+    const w = widths[col];
+    const label = COLUMN_LABELS[col];
+    const thSizing = { width: w, minWidth: w, maxWidth: w, position: "relative" as const };
+    const sortable = onToggleSort && SORTABLE_COLUMNS.has(col as RepoTcSortColumn);
+    const activeDirection = sortable && sort?.column === col ? sort.direction : null;
+
+    return (
+      <th
+        key={col}
+        style={thSizing}
+        className="align-middle"
+      >
+        <div className="flex items-center gap-1.5 pr-2">
+          {col === "select" ? (
+            <input
+              type="checkbox"
+              checked={areAllCasesSelected}
+              onChange={onToggleSelectAll}
+              aria-label="Select all test cases on this page"
+              className="mx-auto block"
+            />
+          ) : sortable ? (
+            <button
+              type="button"
+              onClick={() => onToggleSort!(col as RepoTcSortColumn)}
+              className={`inline-flex min-w-0 items-center gap-1 truncate ${
+                activeDirection ? "text-[var(--accent-light)]" : "hover:text-[var(--foreground)]"
+              }`}
+              title={`Sort by ${label}`}
+              aria-label={`Sort by ${label}${activeDirection ? `, currently ${activeDirection === "asc" ? "ascending" : "descending"}` : ""}`}
+            >
+              <span className="truncate">{label}</span>
+              {activeDirection === "asc" ? (
+                <IconSortAscending size={13} stroke={1.75} className="shrink-0" />
+              ) : activeDirection === "desc" ? (
+                <IconSortDescending size={13} stroke={1.75} className="shrink-0" />
+              ) : (
+                <IconArrowsSort size={13} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
+              )}
+            </button>
+          ) : (
+            <span className="truncate">{label}</span>
+          )}
+        </div>
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={`Resize ${label} column`}
+          className="absolute right-0 top-0 z-10 h-full w-2 cursor-col-resize hover:bg-[var(--brand-primary)]/15"
+          onMouseDown={(e) => startResize(col, e)}
+        />
+      </th>
+    );
+  }
+
+  function renderBodyCell(col: RepoTcColumnId, tc: TestCaseListItem) {
+    const w = widths[col];
+    const tdStyle = { width: w };
+    const cellClass = "min-w-0 align-middle";
+    const innerTruncate = "block max-w-full truncate whitespace-nowrap";
+
+    switch (col) {
+      case "select":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            <input
+              type="checkbox"
+              checked={selectedCaseIdSet.has(tc.id)}
+              onChange={() => onToggleCase(tc.id)}
+              onClick={(e) => e.stopPropagation()}
+              aria-label={`Select ${tc.title}`}
+            />
+          </td>
+        );
+      case "id":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            <button
+              type="button"
+              onClick={() => void onOpenRow(tc.id)}
+              className={`${innerTruncate} text-left font-mono text-[12px] font-medium text-[var(--accent-light)] hover:underline`}
+            >
+              {tc.externalId}
+            </button>
+          </td>
+        );
+      case "title": {
+        const tags = (tc.automationTags ?? "")
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean);
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            <button
+              type="button"
+              onClick={() => void onOpenRow(tc.id)}
+              title={tc.title}
+              className="block max-w-full overflow-hidden whitespace-normal break-words text-left leading-5 hover:underline"
+              style={{
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+              }}
+            >
+              {tc.title}
+            </button>
+            {/* Project custom tags (brand-tinted, what the toolbar's Tags filter matches on) ahead of the
+                free-text automation tags (mono, grey) — two different things, so they look different. */}
+            {(tc.customTags?.length ?? 0) > 0 && (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {tc.customTags!.map((tag) => (
+                  <span
+                    key={tag.id}
+                    title="Custom tag"
+                    className="rounded-full bg-[var(--brand-soft)] px-2 py-px text-[10.5px] font-medium text-[var(--accent-light)]"
+                  >
+                    {tag.name}
+                  </span>
+                ))}
+              </div>
+            )}
+            {tags.length > 0 && (
+              <div className="mt-1 flex flex-wrap gap-1">
+                {tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="rounded-[4px] bg-[var(--surface-secondary)] px-1.5 py-px font-mono text-[10px] text-[var(--muted-soft)]"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
+          </td>
+        );
+      }
+      case "suite":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.suiteId ? suiteNameMap.get(tc.suiteId) ?? "—" : "—"}</span>
+          </td>
+        );
+      case "jira":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            {tc.jiraIssueKey && tc.jiraUrl ? (
+              <a
+                href={tc.jiraUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className={`${innerTruncate} inline-flex items-center gap-1 font-mono text-xs text-[var(--accent-light)] hover:underline`}
+              >
+                <svg viewBox="0 0 24 24" className="h-3 w-3 shrink-0" fill="currentColor" aria-hidden="true">
+                  <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
+                </svg>
+                <span className="truncate">{tc.jiraIssueKey}</span>
+              </a>
+            ) : tc.jiraIssueKey ? (
+              <span className={`${innerTruncate} font-mono text-xs text-[var(--muted)]`}>{tc.jiraIssueKey}</span>
+            ) : (
+              <span className="text-[var(--muted-soft)]">—</span>
+            )}
+          </td>
+        );
+      case "priority":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            <PriorityBadge priority={tc.priority as Priority} />
+          </td>
+        );
+      case "status":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            <StatusChip
+              tone={repoStatusTone(tc.status)}
+              className="max-w-full !px-[9px] !py-[2px] !text-[11px] !font-medium"
+            >
+              <span className={innerTruncate}>{tc.status}</span>
+            </StatusChip>
+          </td>
+        );
+      case "updated":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] font-mono text-[var(--muted)]`}>
+            <span className={innerTruncate}>{formatDate(tc.updatedAt)}</span>
+          </td>
+        );
+      case "type":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.type?.trim() || "—"}</span>
+          </td>
+        );
+      case "severity":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.severity || "—"}</span>
+          </td>
+        );
+      case "component":
+        return (
+          <td key={col} style={tdStyle} className={`${cellClass} text-[11px] text-[var(--muted)]`}>
+            <span className={innerTruncate}>{tc.component || "—"}</span>
+          </td>
+        );
+      case "automation":
+        return (
+          <td key={col} style={tdStyle} className={cellClass}>
+            {tc.automationStatus?.trim() ? (
+              <StatusChip
+                tone={repoAutomationTone(tc.automationStatus)}
+                className="max-w-full !px-[9px] !py-[2px] !text-[11px] !font-medium"
+              >
+                <span className={innerTruncate}>{tc.automationStatus}</span>
+              </StatusChip>
+            ) : (
+              <span className="text-[11px] text-[var(--muted-soft)]">—</span>
+            )}
+          </td>
+        );
+      case "context":
+        return (
+          <td key={col} style={tdStyle} className={cellClass} onClick={(e) => e.stopPropagation()}>
+            <ZyraCitationsBadge refs={buildContextEntries(tc)} projectId={projectId} />
+          </td>
+        );
+      default:
+        return null;
+    }
+  }
+
+  const columnsControl = (
+    <div ref={columnsMenuRef} className="relative">
+      <button
+        type="button"
+        onClick={() => setColumnsMenuOpen((o) => !o)}
+        className="flex h-[30px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] font-medium text-[var(--ink-600)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
+      >
+        <IconColumns size={13} stroke={1.75} />
+        Columns
+      </button>
+      {columnsMenuOpen && (
+        <div className="absolute right-0 top-full z-30 mt-1 w-72 max-h-80 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] py-2 shadow-lg">
+          <p className="px-3 pb-2 text-xs font-medium uppercase tracking-wide text-[var(--muted-soft)]">
+            Show fields · {visibleDataColumns.length} of {DATA_COLUMN_IDS.length}
+          </p>
+          {DATA_COLUMN_IDS.map((id) => {
+            const locked = LOCKED_COLUMN_SET.has(id);
+            return (
+            <label
+              key={id}
+              title={locked ? "Always shown" : undefined}
+              className={`flex items-start gap-2 px-3 py-1.5 text-sm ${locked ? "cursor-not-allowed opacity-60" : "cursor-pointer hover:bg-[var(--surface-secondary)]"}`}
+            >
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={visible[id]}
+                disabled={locked}
+                onChange={() => toggleColumnVisible(id)}
+              />
+              <span className="min-w-0 flex-1">
+                <span className="text-[var(--foreground)]">
+                  {COLUMN_LABELS[id]}
+                  {locked && <span className="ml-1.5 text-[11px] font-normal text-[var(--muted-soft)]">(always shown)</span>}
+                </span>
+                <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted)]">{FIELD_IDS[id]}</span>
+              </span>
+            </label>
+            );
+          })}
+          <p className="mt-2 border-t border-[var(--border-subtle)] px-3 pt-2 text-[11px] text-[var(--muted)]">
+            {
+              "The selection column stays first. Drag header edges to resize columns."
+            }
+          </p>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      {/* Columns control lives beside the filter dropdowns via a portal; falls back to
+          a thin strip only if no slot was provided. */}
+      {columnsSlot
+        ? createPortal(columnsControl, columnsSlot)
+        : (
+          <div className="flex h-10 shrink-0 items-center justify-end border-b border-[var(--border)] bg-[var(--background)] px-4">
+            {columnsControl}
+          </div>
+        )}
+
+      <div className="min-h-0 w-full min-w-0 flex-1 overflow-auto bg-[var(--background)]">
+        <table
+          className="tesbo-table tc-repo-table max-w-full"
+          style={{
+            width: totalWidth,
+            minWidth: "100%",
+            tableLayout: "fixed",
+          }}
+        >
+          <colgroup>
+            {orderedColumns.map((col) => (
+              <col
+                key={col}
+                style={{ width: widths[col] }}
+              />
+            ))}
+          </colgroup>
+          <thead className="sticky top-0 z-[2]">
+            <tr>{orderedColumns.map((col) => renderHeaderCell(col))}</tr>
+          </thead>
+          <tbody>
+            {cases.map((tc) => (
+              <tr
+                key={tc.id}
+                onClick={() => void onOpenRow(tc.id)}
+                /*
+                 * An archived case reads differently from a live one.
+                 *
+                 * Basecamp 10212766570: archived cases were indistinguishable from working ones in the
+                 * table, so a user who had just archived three of them could not tell they had been
+                 * acted on. They are excluded from the list by default now, but they still appear when
+                 * the Archived status filter is on, and there they must not look like live rows.
+                 * Muted and struck through, not hidden — the row still opens.
+                 */
+                data-archived={tc.status === "Archived" ? "true" : undefined}
+                className={`cursor-pointer transition-colors hover:bg-[var(--surface-secondary)] ${
+                  rowHighlightId === tc.id ? "bg-[var(--brand-soft)]" : ""
+                } ${tc.status === "Archived" ? "opacity-55 [&_td]:line-through [&_td:has(input)]:no-underline" : ""}`}
+              >
+                {orderedColumns.map((col) => renderBodyCell(col, tc))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}

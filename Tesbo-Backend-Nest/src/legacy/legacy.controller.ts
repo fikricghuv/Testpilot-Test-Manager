@@ -1,0 +1,2390 @@
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  MessageEvent,
+  NotImplementedException,
+  Param,
+  Patch,
+  Post,
+  Put,
+  Query,
+  Req,
+  Res,
+  Sse,
+  UploadedFiles,
+  UseInterceptors
+} from "@nestjs/common";
+import { FilesInterceptor } from "@nestjs/platform-express";
+import type { Response } from "express";
+import ExcelJS from "exceljs";
+import { filter, interval, map, merge, Observable, of } from "rxjs";
+import { sendStoredFile } from "../common/file-delivery";
+import { cellValue, csvEscape, rowsToCsv } from "../common/spreadsheet-safe";
+import { AuthenticatedRequest } from "../common/request.types";
+import { LegacyService } from "./legacy.service";
+import { CustomFieldsService } from "../custom-fields/custom-fields.service";
+import { CustomFieldDefinitionDto, normalizeTestcaseHeader, RESERVED_TESTCASE_HEADERS } from "../custom-fields/custom-fields.types";
+import { ZyraProgressService } from "./zyra-progress.service";
+import { WelcomeEmailService } from "../welcome-email/welcome-email.service";
+import {
+  collidesWithLocalizedHeader,
+  ExportLocale,
+  exportReportMetric,
+  exportReportSection,
+  exportSheetName,
+  exportValue,
+  ExportValueField,
+  localizeRows,
+  resolveExportLocale,
+  UTF8_BOM
+} from "../common/export-i18n";
+
+const TESTCASE_EXPORT_BASE_HEADERS = [
+  "externalId",
+  "title",
+  "description",
+  "preconditions",
+  "steps",
+  "action",
+  "expectedResult",
+  "testData",
+  "priority",
+  "severity",
+  "type",
+  "status",
+  "suite",
+  "component"
+];
+
+/*
+ * Reports & Insights export.
+ *
+ * Basecamp 10218723531 ("Reports & Insights > Export buttons are not working"): the button carried
+ * no onClick at all — title="Coming soon", cursor-not-allowed, never wired to anything. It is a
+ * real export now, one per report view, because the screen already holds six different reports and
+ * exporting "the reports" without saying which one is meaningless.
+ *
+ * Every view reuses the same `*ForUser` service method the screen itself calls, so the numbers in
+ * the file are the numbers on the screen and authorization is the existing project-membership check
+ * rather than a second implementation of it.
+ *
+ * Two shapes come out of this. `execution` and `matrix` are already row-per-record tables and
+ * export as themselves. The other four are dashboards — a mix of scalars and several unrelated
+ * series — so they export in long form (section, label, metric, value), which stays one parseable
+ * table instead of stacked mini-tables with conflicting headers.
+ */
+const REPORT_EXPORT_VIEWS = ["overview", "execution", "matrix", "repository", "insights", "trends"] as const;
+type ReportExportView = (typeof REPORT_EXPORT_VIEWS)[number];
+
+const REPORT_LONG_HEADERS = ["section", "label", "metric", "value"];
+
+// Which columns of each generated file carry a fixed vocabulary that a non-English export translates
+// (see common/export-i18n.ts). Keyed by the internal column key; columns absent here pass through.
+const TESTCASE_EXPORT_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  priority: "priority",
+  status: "testcaseStatus",
+  type: "type",
+  severity: "severity",
+  automationStatus: "automationStatus"
+};
+
+const CYCLE_EXPORT_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  priority: "priority",
+  status: "executionStatus",
+  type: "type"
+};
+
+const REPORT_MATRIX_VALUE_FIELDS: Partial<Record<string, ExportValueField>> = {
+  testcaseStatus: "testcaseStatus",
+  runStatus: "runStatus",
+  executionStatus: "executionStatus",
+  bugStatus: "bugStatus"
+};
+
+const REPORT_EXECUTION_HEADERS = [
+  "groupName",
+  "Passed",
+  "Failed",
+  "Blocked",
+  "Skipped",
+  "Untested",
+  "Retest",
+  "total"
+];
+
+const REPORT_MATRIX_HEADERS = [
+  "externalId",
+  "testcaseTitle",
+  "priority",
+  "testcaseStatus",
+  "suiteName",
+  "runName",
+  "runStatus",
+  "executionStatus",
+  "executedAt",
+  "bugTitle",
+  "bugStatus",
+  "bugUrl"
+];
+
+const REPORT_VIEW_SHEET_NAMES: Record<ReportExportView, string> = {
+  overview: "Overview",
+  execution: "Execution Report",
+  matrix: "Traceability",
+  repository: "Repository",
+  insights: "AI Insights",
+  trends: "Trends"
+};
+
+@Controller()
+export class LegacyController {
+  constructor(
+    private readonly legacy: LegacyService,
+    private readonly customFields: CustomFieldsService,
+    private readonly zyraProgress: ZyraProgressService,
+    private readonly welcomeEmail: WelcomeEmailService
+  ) {}
+
+  // Kill switch for the whole SSE progress-narration side-channel (see zyra-progress.service.ts's
+  // file header) — flip ZYRA_PROGRESS_STREAMING_ENABLED=false to disable it without a revert, with
+  // the guarantee that a disabled feature never registers a turn, never opens a stream, and the
+  // POST route it rides alongside behaves exactly as it did before this feature existed.
+  private zyraProgressStreamingEnabled(): boolean {
+    return process.env.ZYRA_PROGRESS_STREAMING_ENABLED !== "false";
+  }
+
+  // A custom field's column, named for the file rather than the API: its display name, unless that
+  // name would collide with a fixed base column once normalized the same way the import modal's
+  // auto-mapper normalizes headers (lowercase, strip non-alphanumeric) — e.g. a field literally
+  // named "Title" or "externalId". Field creation now rejects new names like that (see
+  // CustomFieldsService), but this stays as a defensive fallback for any field named that way
+  // before the guard existed, so a generated file never has two columns that read as the same header.
+  // A Russian template's base columns are Russian words, which normalizeTestcaseHeader folds to ""
+  // — so a custom field named e.g. "Статус" is checked against the localized headers as well.
+  private sampleColumnName(definition: CustomFieldDefinitionDto, locale: ExportLocale = "en", baseKeys: string[] = []): string {
+    const name = definition.name;
+    if (RESERVED_TESTCASE_HEADERS.has(normalizeTestcaseHeader(name))) return `${name} (Custom Field)`;
+    if (collidesWithLocalizedHeader(locale, name, baseKeys)) return `${name} (Пользовательское поле)`;
+    return name;
+  }
+
+  // Builds a value that is valid for the definition's own config, so the template's worked example
+  // row can always be re-imported as-is instead of tripping the very validation it's meant to
+  // demonstrate (a maxLength, a min/max, a date-range restriction, or — for a select — simply having
+  // no active option to offer). Mirrors the parsing ImportTestCasesModal.tsx's
+  // coerceCustomFieldImportValue expects on the way back in.
+  private sampleCustomFieldValue(definition: CustomFieldDefinitionDto): string {
+    const config = definition.config || {};
+    switch (definition.fieldType) {
+      case "text":
+      case "long_text": {
+        const sample = "Sample value";
+        return config.maxLength != null && config.maxLength < sample.length ? sample.slice(0, config.maxLength) : sample;
+      }
+      case "boolean":
+        return config.displayFormat === "true_false" ? "True" : "Yes";
+      case "number": {
+        let sample = config.min ?? config.max ?? 1;
+        if (config.decimalsAllowed === false) sample = Math.round(sample);
+        return String(sample);
+      }
+      case "date":
+        // Today always satisfies any allowPastDates/allowFutureDates combination — see
+        // checkDateRange in custom-field-validation.ts, which only rejects date < today or date > today.
+        return new Date().toISOString().slice(0, 10);
+      case "single_select": {
+        const active = (config.options || []).find((o) => o.active);
+        return active ? active.label : "";
+      }
+      case "multi_select": {
+        const activeOptions = (config.options || []).filter((o) => o.active);
+        const count = Math.min(Math.max(1, config.minSelected ?? 1), config.maxSelected ?? (activeOptions.length || 1));
+        return activeOptions
+          .slice(0, count)
+          .map((o) => o.label)
+          .join(", ");
+      }
+      default:
+        return "";
+    }
+  }
+
+  private exportLocale(req: AuthenticatedRequest, query: Record<string, any> = {}): ExportLocale {
+    return resolveExportLocale(req.headers["accept-language"], query.lang);
+  }
+
+  // A non-English CSV is prefixed with a UTF-8 BOM: without it Excel on Windows decodes the file in
+  // the ANSI codepage and every Cyrillic header and value reads as mojibake, and SheetJS (which the
+  // import modal parses uploads with) does the same. English files stay byte-for-byte what they
+  // were, BOM-less, for any parser that already reads them by their first header.
+  private sendCsv(res: Response, locale: ExportLocale, fileName: string, headers: string[], rows: Record<string, unknown>[]) {
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send((locale === "en" ? "" : UTF8_BOM) + rowsToCsv(headers, rows));
+  }
+
+  private async sendWorkbook(
+    res: Response,
+    fileName: string,
+    sheetName: string,
+    rows: Record<string, unknown>[],
+    headers?: string[]
+  ) {
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet(sheetName);
+    // The header list is passed explicitly wherever the caller knows it: deriving the columns from
+    // the first row's keys means exporting a project with no test cases produces a workbook with no
+    // header row at all — a blank sheet with nothing to fill in, while the CSV export of the same
+    // project still emits its headers.
+    const columns = headers ?? Object.keys(rows[0] ?? {});
+    worksheet.addRow(columns);
+    for (const row of rows) {
+      worksheet.addRow(columns.map((column) => cellValue(row[column])));
+    }
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+    res.send(Buffer.from(buffer));
+  }
+
+  @Post("/api/onboarding/workspace")
+  createWorkspace(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createWorkspace(req.userId, body);
+  }
+
+  @Post("/api/onboarding/org-and-project")
+  createOrgAndProject(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createOrgAndProject(req.userId, body);
+  }
+
+  @Get("/api/workspace")
+  workspace(@Req() req: AuthenticatedRequest) {
+    return this.legacy.workspace(req.userId);
+  }
+
+  @Get("/api/workspaces")
+  listWorkspaces(@Req() req: AuthenticatedRequest) {
+    return this.legacy.listWorkspaces(req.userId);
+  }
+
+  @Post("/api/workspaces")
+  createAdditionalWorkspace(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createWorkspace(req.userId, body);
+  }
+
+  @Post("/api/workspaces/:id/switch")
+  switchWorkspace(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.switchWorkspace(req.userId, id);
+  }
+
+  @Patch("/api/workspace")
+  updateWorkspace(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.updateWorkspace(req.userId, body);
+  }
+
+  @Get("/api/workspace/analytics")
+  async workspaceAnalytics(@Req() req: AuthenticatedRequest) {
+    const workspace = await this.legacy.workspace(req.userId);
+    // The caller is passed through so the workspace dashboard can be narrowed to the projects they can
+    // actually reach — see analytics(). Basecamp 10199551447.
+    return this.legacy.analytics(undefined, workspace.id, req.userId);
+  }
+
+  @Get("/api/workspace/members")
+  workspaceMembers(@Req() req: AuthenticatedRequest) {
+    return this.legacy.workspaceMembers(req.userId);
+  }
+
+  @Post("/api/workspace/members")
+  addWorkspaceMember(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.addWorkspaceMember(req.userId, body);
+  }
+
+  @Delete("/api/workspace/members/:userId")
+  removeWorkspaceMember(@Req() req: AuthenticatedRequest, @Param("userId") userId: string) {
+    return this.legacy.removeWorkspaceMember(req.userId, userId);
+  }
+
+  @Get("/api/workspace/project-access")
+  projectAccess(@Req() req: AuthenticatedRequest) {
+    return this.legacy.workspaceProjectAccess(req.userId);
+  }
+
+  @Put("/api/workspace/project-access")
+  setProjectAccess(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.addProjectMember(req.userId, body.projectId, { userId: body.userId, role: body.role });
+  }
+
+  @Delete("/api/workspace/project-access")
+  removeProjectAccess(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.removeProjectMember(req.userId, body.projectId, body.userId);
+  }
+
+  @Get("/api/workspace/ai-keys")
+  aiKeys(@Req() req: AuthenticatedRequest) {
+    return this.legacy.aiKeys(req.userId);
+  }
+
+  @Post("/api/workspace/ai-keys")
+  createAiKey(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createAiKey(req.userId, body);
+  }
+
+  @Get("/api/workspace/ai-providers")
+  aiProviders() {
+    return this.legacy.listAiProviders();
+  }
+
+  // POST, not GET: the settings form calls this with an unsaved API key in the body,
+  // which must not end up in a URL, a proxy log, or the browser history.
+  @Post("/api/workspace/ai-keys/models")
+  listProviderModels(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.listProviderModels(req.userId, body);
+  }
+
+  @Delete("/api/workspace/ai-keys/:keyId")
+  deleteAiKey(@Req() req: AuthenticatedRequest, @Param("keyId") keyId: string) {
+    return this.legacy.deleteAiKey(req.userId, keyId);
+  }
+
+  @Post("/api/workspace/ai-keys/allocations")
+  allocateAiKey(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.allocateAiKey(req.userId, body);
+  }
+
+  @Post("/api/workspace/members/role")
+  changeWorkspaceMemberRole(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.changeWorkspaceMemberRole(req.userId, body.userId, body.role);
+  }
+
+  @Get("/api/workspace/invitations")
+  listInvitations(@Req() req: AuthenticatedRequest) {
+    return this.legacy.listInvitations(req.userId);
+  }
+
+  @Post("/api/workspace/invitations")
+  createInvitation(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createInvitation(req.userId, body);
+  }
+
+  @Delete("/api/workspace/invitations/:id")
+  cancelInvitation(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.cancelInvitation(req.userId, id);
+  }
+
+  @Post("/api/workspace/invitations/:id/resend")
+  resendInvitation(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.resendInvitation(req.userId, id);
+  }
+
+  @Get("/api/invitations/:token")
+  getInvitation(@Param("token") token: string) {
+    return this.legacy.getInvitationByToken(token);
+  }
+
+  @Post("/api/invitations/:token/accept")
+  acceptInvitation(@Req() req: AuthenticatedRequest, @Param("token") token: string) {
+    return this.legacy.acceptInvitation(req.userId, token);
+  }
+
+  @Post("/api/invitations/:token/decline")
+  declineInvitation(@Req() req: AuthenticatedRequest, @Param("token") token: string) {
+    return this.legacy.declineInvitation(req.userId, token);
+  }
+
+  @Post("/api/invitations/:token/register")
+  async registerFromInvitation(@Param("token") token: string, @Body() body: Record<string, any>) {
+    const result = await this.legacy.registerFromInvitation(token, body);
+    // Scheduled here rather than inside LegacyService, whose ~25 unit specs construct it positionally.
+    await this.welcomeEmail.schedule(result.userId);
+    return result;
+  }
+
+  @Get("/api/projects")
+  listProjects(@Req() req: AuthenticatedRequest) {
+    return this.legacy.listProjects(req.userId);
+  }
+
+  @Post("/api/projects")
+  createProject(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.createProject(req.userId, body);
+  }
+
+  // Declared above `/api/projects/:id` on purpose — Nest matches in declaration order, so the
+  // parameterised route would otherwise capture "overview" as a project id and 404.
+  @Get("/api/projects/overview")
+  projectsOverview(@Req() req: AuthenticatedRequest) {
+    return this.legacy.projectsOverview(req.userId);
+  }
+
+  // Readable app URL segments -> uuids (see LegacyService.resolveRoute).
+  @Get("/api/route-resolve")
+  resolveRoute(@Req() req: AuthenticatedRequest, @Query() query: Record<string, any>) {
+    return this.legacy.resolveRoute(req.userId, query);
+  }
+
+  @Get("/api/projects/:id")
+  getProject(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.getProjectForUser(req.userId, id);
+  }
+
+  @Patch("/api/projects/:id")
+  updateProject(@Req() req: AuthenticatedRequest, @Param("id") id: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateProjectForUser(req.userId, id, body);
+  }
+
+  @Delete("/api/projects/:id")
+  deleteProject(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.deleteProjectForUser(req.userId, id);
+  }
+
+  @Get("/api/projects/:id/members")
+  projectMembers(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.projectMembers(req.userId, id);
+  }
+
+  @Post("/api/projects/:id/members")
+  addProjectMember(@Req() req: AuthenticatedRequest, @Param("id") id: string, @Body() body: Record<string, any>) {
+    return this.legacy.addProjectMember(req.userId, id, body);
+  }
+
+  @Delete("/api/projects/:id/members/:userId")
+  removeProjectMember(@Req() req: AuthenticatedRequest, @Param("id") id: string, @Param("userId") userId: string) {
+    return this.legacy.removeProjectMember(req.userId, id, userId);
+  }
+
+  @Get("/api/projects/:id/apikeys")
+  apiKeys(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    return this.legacy.listApiKeys(req.userId, id);
+  }
+
+  @Post("/api/projects/:id/apikeys")
+  createApiKey(@Req() req: AuthenticatedRequest, @Param("id") id: string, @Body() body: Record<string, any>) {
+    return this.legacy.createApiKey(req.userId, id, body);
+  }
+
+  @Delete("/api/projects/:id/apikeys/:keyId")
+  revokeApiKey(@Req() req: AuthenticatedRequest, @Param("id") id: string, @Param("keyId") keyId: string) {
+    return this.legacy.revokeApiKey(req.userId, id, keyId);
+  }
+
+  @Get("/api/projects/:projectId/suites")
+  listSuites(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listSuitesForUser(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/suites")
+  createSuite(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createSuiteForUser(req.userId, projectId, body);
+  }
+
+  @Patch("/api/suites/:suiteId")
+  updateSuite(@Req() req: AuthenticatedRequest, @Param("suiteId") suiteId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateSuite(req.userId, suiteId, body);
+  }
+
+  @Delete("/api/suites/:suiteId")
+  deleteSuite(@Req() req: AuthenticatedRequest, @Param("suiteId") suiteId: string, @Query("mode") mode?: string) {
+    return this.legacy.deleteSuite(req.userId, suiteId, mode);
+  }
+
+  @Get("/api/projects/:projectId/testcases")
+  async listTestCases(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
+    const result = await this.legacy.listTestCasesForUser(req.userId, projectId, query);
+    res.setHeader("X-Total-Count", String(result.total));
+    res.json(result.rows);
+  }
+
+  @Post("/api/projects/:projectId/testcases")
+  createTestCase(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createTestCaseForUser(req.userId, projectId, body);
+  }
+
+  @Get("/api/projects/:projectId/testcases/linked-jira-keys")
+  linkedJiraKeys(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linkedJiraKeys(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/testcases/linked-linear-keys")
+  linkedLinearKeys(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linkedLinearKeys(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/testcases/linked-notion-pages")
+  linkedNotionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linkedNotionPages(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/testcases/:testcaseId")
+  getTestCase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string
+  ) {
+    return this.legacy.getTestCaseForUser(req.userId, projectId, testcaseId);
+  }
+
+  @Put("/api/projects/:projectId/testcases/:testcaseId")
+  updateTestCase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateTestCaseForUser(req.userId, projectId, testcaseId, body);
+  }
+
+  @Delete("/api/projects/:projectId/testcases/:testcaseId")
+  deleteTestCase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string
+  ) {
+    return this.legacy.deleteTestCaseForUser(req.userId, projectId, testcaseId);
+  }
+
+  @Post("/api/projects/:projectId/testcases/:testcaseId/duplicate")
+  duplicateTestCase(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string
+  ) {
+    return this.legacy.duplicateTestCaseForUser(req.userId, projectId, testcaseId);
+  }
+
+  @Post("/api/projects/:projectId/testcases/bulk-create")
+  bulkCreate(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.bulkCreateTestCases(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/testcases/bulk-update")
+  bulkUpdate(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.bulkUpdateTestCases(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/testcases/bulk-delete")
+  bulkDelete(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.bulkDeleteTestCases(projectId, req.userId, body.testcaseIds || []);
+  }
+
+  @Post("/api/projects/:projectId/testcases/import")
+  importTestCases(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.importTestCases(req.userId, projectId, body);
+  }
+
+  @Get("/api/projects/:projectId/plans")
+  listPlans(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.listPlansForUser(req.userId, projectId);
+  }
+
+  @Post("/api/projects/:projectId/plans")
+  createPlan(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createPlan(req.userId, projectId, body);
+  }
+
+  @Get("/api/plans/:planId")
+  getPlan(@Req() req: AuthenticatedRequest, @Param("planId") planId: string) {
+    return this.legacy.getPlan(req.userId, planId);
+  }
+
+  @Patch("/api/plans/:planId")
+  updatePlan(@Req() req: AuthenticatedRequest, @Param("planId") planId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updatePlan(req.userId, planId, body);
+  }
+
+  @Delete("/api/plans/:planId")
+  deletePlan(@Req() req: AuthenticatedRequest, @Param("planId") planId: string) {
+    return this.legacy.deletePlan(req.userId, planId);
+  }
+
+  @Get("/api/plans/:planId/items")
+  planItems(@Req() req: AuthenticatedRequest, @Param("planId") planId: string) {
+    return this.legacy.planItems(req.userId, planId);
+  }
+
+  @Post("/api/plans/:planId/items")
+  addPlanItem(@Req() req: AuthenticatedRequest, @Param("planId") planId: string, @Body() body: Record<string, any>) {
+    return this.legacy.addPlanItem(req.userId, planId, body);
+  }
+
+  @Delete("/api/plans/:planId/items/:itemId")
+  removePlanItem(
+    @Req() req: AuthenticatedRequest,
+    @Param("planId") planId: string,
+    @Param("itemId") itemId: string
+  ) {
+    return this.legacy.deletePlanItem(req.userId, planId, itemId);
+  }
+
+  @Get("/api/plans/:planId/runs")
+  planRuns(@Req() req: AuthenticatedRequest, @Param("planId") planId: string) {
+    return this.legacy.planRuns(req.userId, planId);
+  }
+
+  @Get("/api/plans/:planId/progress")
+  planProgress(@Req() req: AuthenticatedRequest, @Param("planId") planId: string) {
+    return this.legacy.planProgress(req.userId, planId);
+  }
+
+  @Get("/api/projects/:projectId/cycles")
+  listCycles(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    // `?limit=N` returns only the newest N runs (the project home asks for four); without it, every run.
+    return this.legacy.listCyclesForUser(req.userId, projectId, { limit: query.limit !== undefined ? Number(query.limit) : undefined });
+  }
+
+  @Post("/api/projects/:projectId/cycles")
+  createCycle(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createCycleForUser(req.userId, projectId, body);
+  }
+
+  @Post("/api/projects/:projectId/cycles/from-plan")
+  createCycleFromPlan(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createCycleForUser(req.userId, projectId, body);
+  }
+
+  @Post("/api/projects/:projectId/cycles/from-cases")
+  createCycleFromCases(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createCycleForUser(req.userId, projectId, body);
+  }
+
+  @Get("/api/cycles/:cycleId")
+  getCycle(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string) {
+    return this.legacy.getCycle(cycleId, req.userId);
+  }
+
+  @Patch("/api/cycles/:cycleId")
+  updateCycle(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateCycle(cycleId, req.userId, body);
+  }
+
+  @Delete("/api/cycles/:cycleId")
+  deleteCycle(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string) {
+    return this.legacy.deleteCycle(cycleId, req.userId);
+  }
+
+  @Post("/api/cycles/:cycleId/testcases")
+  addCycleCases(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.addCycleTestCases(cycleId, req.userId, body);
+  }
+
+  // Mirrors /api/projects/:projectId/testcases/bulk-delete: POST (not DELETE) so the id list
+  // travels in a body, which no proxy strips the way it can from a DELETE.
+  @Post("/api/cycles/:cycleId/testcases/bulk-delete")
+  removeCycleCases(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.removeCycleTestCases(cycleId, req.userId, body);
+  }
+
+  @Delete("/api/cycles/:cycleId/testcases/:testcaseId")
+  removeCycleCase(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Param("testcaseId") testcaseId: string) {
+    return this.legacy.removeCycleTestCase(cycleId, req.userId, testcaseId);
+  }
+
+  @Get("/api/cycles/:cycleId/executions")
+  executions(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string) {
+    return this.legacy.executionsForUser(cycleId, req.userId);
+  }
+
+  @Patch("/api/cycles/:cycleId/executions/:executionId")
+  updateExecution(@Req() req: AuthenticatedRequest, @Param("executionId") executionId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateExecution(executionId, req.userId, body);
+  }
+
+  @Post("/api/cycles/:cycleId/executions/:executionId/attachments")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  uploadExecutionAttachments(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.uploadExecutionAttachments(cycleId, req.userId, executionId, files);
+  }
+
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments")
+  listExecutionAttachments(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string
+  ) {
+    return this.legacy.listExecutionAttachments(cycleId, req.userId, executionId);
+  }
+
+  /**
+   * Download (or, for an image/video, render) one evidence file from a run's result.
+   *
+   * The list endpoint above has existed without this one, so evidence has been storable and
+   * listable but not retrievable — see getExecutionAttachmentAccess. `?inline=1` is a request, not
+   * a guarantee: the service refuses inline for anything that is not an image or a video, so a
+   * trace .zip or a log is always a download.
+   */
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/download")
+  async downloadExecutionAttachment(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string,
+    @Query("inline") inline?: string
+  ) {
+    const access = await this.legacy.getExecutionAttachmentAccess(
+      cycleId,
+      req.userId,
+      executionId,
+      attachmentId,
+      inline === "1" || inline === "true"
+    );
+    return sendStoredFile(res, access);
+  }
+
+  /** The parsed JSON of one `api` evidence file, for the in-place request/response viewer. */
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/api-content")
+  getExecutionApiEvidence(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.getExecutionApiEvidence(cycleId, req.userId, executionId, attachmentId);
+  }
+
+  /**
+   * Mints a short-lived link the embedded Playwright trace viewer can read.
+   *
+   * The viewer is trace.playwright.dev running inside an iframe: it fetches the .zip itself, from
+   * the browser, cross-origin and without credentials, so it cannot use the download route above.
+   * This hands back a signed token instead; /api/public/trace/:token below is what redeems it.
+   */
+  @Delete("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId")
+  deleteExecutionAttachment(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.deleteExecutionAttachment(cycleId, req.userId, executionId, attachmentId);
+  }
+
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/trace-link")
+  createExecutionTraceLink(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.createExecutionTraceLink(cycleId, req.userId, executionId, attachmentId);
+  }
+
+  /**
+   * Serves one trace archive to a holder of a valid link. Unauthenticated by design — see
+   * createExecutionTraceLink in the service for why, and for what keeps the grant narrow.
+   *
+   * The bytes are streamed from storage rather than redirected to a presigned URL: the fetch comes
+   * from a third-party origin, so the response needs CORS headers we control, and a private bucket
+   * has none. Evidence is capped at MAX_EVIDENCE_FILE_SIZE (25 MB by default), so buffering one
+   * trace is bounded.
+   */
+  @Get("/api/public/trace/:token")
+  async publicTrace(@Res() res: Response, @Param("token") token: string) {
+    const trace = await this.legacy.getPublicTraceContent(token);
+    // The viewer is a fixed, known origin, so it is named rather than wildcarded. No credentials
+    // are involved either way — the token is the authorization.
+    res.setHeader("Access-Control-Allow-Origin", "https://trace.playwright.dev");
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Content-Type", "application/zip");
+    // attachment, never inline: nothing served from this route may be rendered by a browser.
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(trace.fileName)}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(trace.buffer);
+  }
+
+  @Post("/api/cycles/:cycleId/executions/bulk-assign")
+  bulkAssign(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.bulkAssignExecutions(cycleId, req.userId, body);
+  }
+
+  @Post("/api/cycles/:cycleId/executions/bulk-status")
+  bulkStatus(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.bulkUpdateExecutionStatus(cycleId, req.userId, body);
+  }
+
+  /** Owner-or-manager: applies a run's and its results' past state from another tool onto this run. See importRunHistory. */
+  @Post("/api/cycles/:cycleId/history-import")
+  importRunHistory(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.importRunHistory(req.userId, cycleId, body);
+  }
+
+  @Post("/api/cycles/:cycleId/share")
+  shareCycle(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string, @Body() body: Record<string, any>) {
+    return this.legacy.shareCycle(cycleId, req.userId, body);
+  }
+
+  /*
+   * Scheduled runs are NOT IMPLEMENTED. There is no schedules table and no runner; these four routes
+   * were stubs that answered 2xx — createSchedule handed back `{ id: "local-schedule", ...body }`
+   * without storing anything, and the list, update and delete routes did nothing at all. A schedule
+   * the user created, was told about, and can never see again is worse than a feature that says it
+   * isn't there.
+   *
+   * Implementing it is a feature (a cron parser, a scheduler, a runner), not a bug fix, so it is left
+   * out and recorded in docs/e2e-coverage-waves.md — see the red EXO-A-07/08/10 in
+   * e2e/api/execution-ops.spec.ts. What is fixed here is the part that is unambiguous: they no longer
+   * answer a caller with no session or no access to the project, and creating one no longer claims
+   * success. 501 is the honest status for "the route exists, the feature does not".
+   */
+  @Get("/api/projects/:projectId/cycles/schedules")
+  async schedules(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return [];
+  }
+
+  // Nothing is persisted yet (see the comment above), but a one-time schedule's runAt is still
+  // validated up front: a caller bypassing the UI's own datetime-local `min` and submit-time check
+  // must not be able to submit a past or malformed instant just because the route 501s regardless —
+  // the rule has to hold at the API, not only in the form that happens to enforce it today.
+  private validateScheduleRunAt(body: Record<string, any>): void {
+    if (body?.scheduleType !== "one_time") return;
+    const raw = body?.runAt;
+    if (typeof raw !== "string" || !raw || Number.isNaN(Date.parse(raw))) {
+      throw new BadRequestException({ error: "Run At must be a valid date and time" });
+    }
+    if (Date.parse(raw) <= Date.now()) {
+      throw new BadRequestException({ error: "Date and time must be in future" });
+    }
+  }
+
+  @Post("/api/projects/:projectId/cycles/schedules")
+  async createSchedule(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Body() body: Record<string, any>
+  ) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    this.validateScheduleRunAt(body);
+    throw new NotImplementedException({ error: "Scheduled runs are not available yet" });
+  }
+
+  @Patch("/api/cycles/schedules/:scheduleId")
+  async updateSchedule(@Req() req: AuthenticatedRequest, @Param("scheduleId") scheduleId: string) {
+    await this.legacy.requireSession(req.userId);
+    throw new NotImplementedException({ error: "Scheduled runs are not available yet" });
+  }
+
+  @Delete("/api/cycles/schedules/:scheduleId")
+  async deleteSchedule(@Req() req: AuthenticatedRequest, @Param("scheduleId") scheduleId: string) {
+    await this.legacy.requireSession(req.userId);
+    throw new NotImplementedException({ error: "Scheduled runs are not available yet" });
+  }
+
+  @Get("/api/public/shared-runs/:token")
+  publicRun(@Param("token") token: string) {
+    return this.legacy.publicCycle(token);
+  }
+
+  @Get("/api/public/shared-runs/:token/executions")
+  publicExecutions(@Param("token") token: string) {
+    return this.legacy.publicCycleExecutions(token);
+  }
+
+  @Get("/api/projects/:projectId/bugs")
+  listBugs(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.listBugsForUser(req.userId, projectId, query);
+  }
+
+  @Post("/api/projects/:projectId/bugs")
+  createBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createBug(projectId, req.userId, body);
+  }
+
+  @Get("/api/bugs/:bugId")
+  getBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string) {
+    return this.legacy.getBugForUser(req.userId, bugId);
+  }
+
+  // Project-scoped (unlike /api/bugs/:bugId above) so the Bug Details page's shareable URL can
+  // carry the bug's external id (e.g. "PRO-BUG-12"), not just its uuid — the external id is only
+  // unique per project, so resolving it needs the project id from the URL. Read-only; existing
+  // mutation routes above are unaffected.
+  @Get("/api/projects/:projectId/bugs/:bugId")
+  getProjectBug(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.getBugForUserByIdentifier(req.userId, projectId, bugId);
+  }
+
+  @Patch("/api/bugs/:bugId")
+  updateBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateBug(req.userId, bugId, body);
+  }
+
+  @Delete("/api/bugs/:bugId")
+  deleteBug(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string) {
+    return this.legacy.deleteBug(req.userId, bugId);
+  }
+
+  @Post("/api/bugs/:bugId/links")
+  addBugLink(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Body() body: Record<string, any>) {
+    return this.legacy.addBugLink(req.userId, bugId, body);
+  }
+
+  @Delete("/api/bugs/:bugId/links/:linkId")
+  removeBugLink(@Req() req: AuthenticatedRequest, @Param("bugId") bugId: string, @Param("linkId") linkId: string) {
+    return this.legacy.removeBugLink(req.userId, bugId, linkId);
+  }
+
+  // Project-scoped (unlike the /api/bugs/:bugId routes above) so ProjectWriteLockGuard refuses a
+  // new comment on a read-only locked project while still letting it be read.
+  @Get("/api/projects/:projectId/bugs/:bugId/comments")
+  listBugComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("bugId") bugId: string) {
+    return this.legacy.listBugComments(projectId, req.userId, bugId);
+  }
+
+  // JSON, or multipart with `body` + `files` when the comment carries attachments. Multer passes a
+  // non-multipart request straight through, so the JSON contract is unchanged.
+  @Post("/api/projects/:projectId/bugs/:bugId/comments")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  createBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.createBugComment(projectId, req.userId, bugId, body, files);
+  }
+
+  @Patch("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  updateBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.updateBugComment(projectId, req.userId, bugId, commentId, body, files);
+  }
+
+  @Delete("/api/projects/:projectId/bugs/:bugId/comments/:commentId")
+  deleteBugComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.deleteBugComment(projectId, req.userId, bugId, commentId);
+  }
+
+  @Post("/api/projects/:projectId/bugs/:bugId/attachments")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  uploadBugAttachments(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("bugId") bugId: string,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.uploadBugAttachments(projectId, req.userId, bugId, files);
+  }
+
+  @Get("/api/projects/:projectId/bugs/attachments/:attachmentId/download")
+  async downloadBugAttachment(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    const access = await this.legacy.getBugAttachmentAccess(projectId, req.userId, attachmentId, false);
+    return sendStoredFile(res, access);
+  }
+
+  @Delete("/api/bugs/attachments/:attachmentId")
+  deleteBugAttachment(@Req() req: AuthenticatedRequest, @Param("attachmentId") attachmentId: string) {
+    return this.legacy.deleteBugAttachment(attachmentId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/testcases/export/csv")
+  async exportCsv(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
+    const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
+    const keys = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(TESTCASE_EXPORT_BASE_HEADERS.length));
+    this.sendCsv(res, locale, "testcases.csv", localized.headers, localized.rows);
+  }
+
+  @Get("/api/projects/:projectId/testcases/export/xlsx")
+  async exportXlsx(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
+    const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
+    const rows = await this.legacy.exportTestCases(projectId, definitions, query);
+    const keys = [...TESTCASE_EXPORT_BASE_HEADERS, ...definitions.map((d) => `cf_${d.key}`)];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(TESTCASE_EXPORT_BASE_HEADERS.length));
+    await this.sendWorkbook(res, "testcases.xlsx", exportSheetName(locale, "Test Cases"), localized.rows, localized.headers);
+  }
+
+  @Get("/api/projects/:projectId/testcases/import/template")
+  async template(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query("format") format: string | undefined,
+    @Query("lang") lang: string | undefined,
+    @Res() res: Response
+  ) {
+    // The payload is a constant, but the route is project-scoped and only ever linked to from a
+    // signed-in screen. Authorizing it keeps it consistent with every other route under
+    // /api/projects/:id — it was the one that answered with no session, and that served the same
+    // 200 for a project id that doesn't exist.
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    // Every mandatory (and every other active) custom field must show up here: skipping one gives
+    // the user nothing to fill in for it, so the importer's own required-field check then rejects
+    // every row — see LegacyController.template()'s history for the incident this fixes.
+    const definitions = await this.customFields.listActiveDefinitionsForColumns(req.userId, projectId);
+    const row: Record<string, string> = {
+      title: "Example login test",
+      description: "Verify a valid user can sign in.",
+      preconditions: "User account exists.",
+      postconditions: "User lands on the dashboard with an active session.",
+      // "action => expected result" per step, separated by " | " — the expected result after
+      // "=>" is optional but importing it this way carries it into each step's Expected Result.
+      steps: "Open login page => Login form is displayed | Enter valid credentials => Fields accept the input | Submit the form => User is redirected to the dashboard",
+      // The Map Columns screen also offers a plain Action/Expected Result pair for a file with one
+      // step per row instead of the "=>"/"|" DSL above (see ImportTestCasesModal.tsx's handleImport).
+      // Populated here so those two fields auto-map instead of showing "-- Skip --" out of the box;
+      // mirrors the DSL's first step so both examples agree. Steps stays mapped in this same file, so
+      // on import it still wins over these two exactly as it always has — this pair only matters once
+      // Steps itself is left unmapped.
+      action: "Open login page",
+      expectedResult: "Login form is displayed",
+      testData: "user@example.com",
+      priority: "P2",
+      severity: "Medium",
+      type: "Functional",
+      status: "Draft",
+      suite: "Authentication",
+      component: "Login",
+      // Same shape the field itself validates: plain minutes or an "Xh Ym" form — see
+      // normalizeEstimatedDuration in legacy.service.ts.
+      estimatedDuration: "10m",
+      automationStatus: "Not Automated",
+      attachments: "Screenshot attached: successful-login.png"
+    };
+    const locale = this.exportLocale(req, { lang });
+    // The worked example is our own copy, not user data, so a Russian template gets a Russian one.
+    // The step DSL's "=>" and " | " separators and the "10m" duration are syntax, not prose.
+    if (locale === "ru") {
+      Object.assign(row, {
+        title: "Пример теста входа",
+        description: "Проверить, что пользователь с верными данными может войти.",
+        preconditions: "Учётная запись пользователя существует.",
+        postconditions: "Пользователь попадает на панель управления с активной сессией.",
+        steps:
+          "Открыть страницу входа => Отображается форма входа | Ввести верные учётные данные => Поля принимают ввод | Отправить форму => Пользователь перенаправлен на панель управления",
+        action: "Открыть страницу входа",
+        expectedResult: "Отображается форма входа",
+        suite: "Аутентификация",
+        component: "Вход",
+        attachments: "Приложен снимок экрана: successful-login.png"
+      });
+    }
+    const baseKeys = Object.keys(row);
+    const keys = [...baseKeys];
+    for (const definition of definitions) {
+      const column = this.sampleColumnName(definition, locale, baseKeys);
+      row[column] = this.sampleCustomFieldValue(definition);
+      keys.push(column);
+    }
+    const localized = localizeRows(locale, keys, [row], TESTCASE_EXPORT_VALUE_FIELDS, keys.slice(baseKeys.length));
+    if (format === "xlsx") {
+      await this.sendWorkbook(res, "testcase-import-template.xlsx", exportSheetName(locale, "Test Cases"), localized.rows, localized.headers);
+      return;
+    }
+    this.sendCsv(res, locale, "testcase-import-template.csv", localized.headers, localized.rows);
+  }
+
+  /*
+   * The import itself is POST .../testcases/import, declared next to the other bulk test case routes
+   * above. It reads its body: an earlier pair of stubs here ignored theirs and hard-returned
+   * {imported: 0} to any caller, signed in or not, so anything trusting them imported nothing and was
+   * told it worked.
+   *
+   * The browser still parses the workbook and maps the columns
+   * (Tesbo-Frontend/components/ImportTestCasesModal.tsx) — only the commit is server-side. It used to
+   * POST one createTestCase per row, which is what made a large file take minutes.
+   *
+   * There is still no .../import/preview: the preview is built from the parsed workbook in the
+   * browser and never needed a round trip.
+   */
+
+  @Get("/api/cycles/:cycleId/export/csv")
+  async exportCycle(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
+    const rows = await this.legacy.exportCycleExecutions(req.userId, cycleId);
+    const keys = ["externalId", "title", "status", "priority", "type", "actualResult", "executedAt", "defectKey", "defectUrl"];
+    const locale = this.exportLocale(req, query);
+    const localized = localizeRows(locale, keys, rows, CYCLE_EXPORT_VALUE_FIELDS);
+    this.sendCsv(res, locale, "test-run.csv", localized.headers, localized.rows);
+  }
+
+  @Get("/api/projects/:projectId/analytics")
+  projectAnalytics(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.projectAnalyticsForUser(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/dashboard")
+  projectDashboard(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.projectDashboardSummary(req.userId, projectId);
+  }
+
+  // Still a stub returning zeros, but no longer one that answers a caller who has no business
+  // knowing whether this run exists — an unauthorized caller now gets the same 404 as for a run
+  // that isn't there. (That it fabricates a zeroed summary at all is a separate, open problem.)
+  @Get("/api/cycles/:cycleId/report/summary")
+  async cycleSummary(@Req() req: AuthenticatedRequest, @Param("cycleId") cycleId: string) {
+    await this.legacy.requireCycleAccessForUser(req.userId, cycleId);
+    return { total: 0, passed: 0, failed: 0, blocked: 0, skipped: 0, untested: 0 };
+  }
+
+  @Get("/api/projects/:projectId/reports/execution")
+  executionReport(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>
+  ) {
+    return this.legacy.executionReportForUser(req.userId, projectId, query);
+  }
+
+  @Get("/api/projects/:projectId/reports/requirement-matrix")
+  matrix(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Query() query: Record<string, any>
+  ) {
+    // No `limit` = the full matrix (API consumers); the Reports tab always sends one and pages.
+    const limit = query.limit !== undefined ? Number(query.limit) : undefined;
+    return this.legacy.requirementMatrixForUser(req.userId, projectId, {
+      limit: Number.isFinite(limit) ? limit : undefined,
+      offset: Number(query.offset) || 0,
+      search: typeof query.search === "string" ? query.search : undefined
+    });
+  }
+
+  @Get("/api/projects/:projectId/reports/repository-summary")
+  repositorySummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.repositorySummaryForUser(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/reports/overview")
+  reportsOverview(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.reportsOverviewForUser(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/reports/insights")
+  reportsInsights(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.reportsInsightsForUser(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/reports/trends")
+  reportsTrends(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.reportsTrendsForUser(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/reports/export/:format")
+  async exportReport(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("format") format: string,
+    @Query() query: Record<string, any>,
+    @Res() res: Response
+  ) {
+    if (format !== "csv" && format !== "xlsx") {
+      throw new BadRequestException({ error: `Unsupported export format "${format}". Use csv or xlsx.` });
+    }
+    const view = String(query.view ?? "overview");
+    if (!REPORT_EXPORT_VIEWS.includes(view as ReportExportView)) {
+      throw new BadRequestException({
+        error: `Unknown report view "${view}". Expected one of: ${REPORT_EXPORT_VIEWS.join(", ")}.`
+      });
+    }
+    const typedView = view as ReportExportView;
+    const locale = this.exportLocale(req, query);
+    // One row per test case per run — ~700k on a large project — so it is written to the response page
+    // by page instead of being built in memory first. Every other view is a handful of rows.
+    if (typedView === "matrix") {
+      await this.streamMatrixExport(req, projectId, format, locale, res);
+      return;
+    }
+    const { headers: keys, rows: rawRows } = await this.reportExportRows(req, projectId, typedView, query);
+    const { headers, rows } = this.localizeReportRows(locale, typedView, keys, rawRows);
+    const fileName = `report-${typedView}`;
+    if (format === "csv") {
+      this.sendCsv(res, locale, `${fileName}.csv`, headers, rows);
+      return;
+    }
+    await this.sendWorkbook(res, `${fileName}.xlsx`, exportSheetName(locale, REPORT_VIEW_SHEET_NAMES[typedView]), rows, headers);
+  }
+
+  /**
+   * The traceability matrix as csv/xlsx, streamed: 200 test cases at a time are read, localized and
+   * written, so memory stays flat however large the project is. The first page goes through the
+   * access check BEFORE any byte is sent, so a 403/404 is still a normal error response; a failure
+   * after that point can only abort the connection (the status line is already out).
+   * Pages are read one after another, not in a snapshot, so a case created mid-export may be missed.
+   */
+  private async streamMatrixExport(
+    req: AuthenticatedRequest,
+    projectId: string,
+    format: "csv" | "xlsx",
+    locale: ExportLocale,
+    res: Response
+  ) {
+    const PAGE = 200;
+    const readPage = async (offset: number) => {
+      const matrix =
+        offset === 0
+          ? await this.legacy.requirementMatrixForUser(req.userId, projectId, { limit: PAGE, offset })
+          : await this.legacy.requirementMatrix(projectId, { limit: PAGE, offset });
+      const shaped = (matrix.rows ?? []).map((row: Record<string, unknown>) =>
+        Object.fromEntries(REPORT_MATRIX_HEADERS.map((header) => [header, row[header] ?? ""]))
+      );
+      const { headers, rows } = this.localizeReportRows(locale, "matrix", REPORT_MATRIX_HEADERS, shaped);
+      return { headers, rows, total: (matrix as { total?: number }).total ?? 0 };
+    };
+    const first = await readPage(0);
+    const { headers } = first;
+    // Respect backpressure: a slow client must slow the reads down, not pile the pages up in memory.
+    const write = async (chunk: string) => {
+      if (!res.write(chunk)) await new Promise<void>((resolve) => res.once("drain", resolve));
+    };
+
+    try {
+      if (format === "csv") {
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="report-matrix.csv"`);
+        await write((locale === "en" ? "" : UTF8_BOM) + headers.map((h) => csvEscape(h)).join(","));
+        for (let offset = 0, page = first; ; ) {
+          const lines = page.rows.map((row) => "\n" + headers.map((h) => csvEscape(row[h])).join(","));
+          if (lines.length) await write(lines.join(""));
+          offset += PAGE;
+          if (offset >= first.total || res.destroyed) break;
+          page = await readPage(offset);
+        }
+        res.end();
+        return;
+      }
+
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="report-matrix.xlsx"`);
+      const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: res, useSharedStrings: false });
+      const sheet = workbook.addWorksheet(exportSheetName(locale, REPORT_VIEW_SHEET_NAMES.matrix));
+      sheet.addRow(headers).commit();
+      for (let offset = 0, page = first; ; ) {
+        for (const row of page.rows) sheet.addRow(headers.map((h) => cellValue(row[h]))).commit();
+        offset += PAGE;
+        if (offset >= first.total || res.destroyed) break;
+        page = await readPage(offset);
+      }
+      await sheet.commit();
+      await workbook.commit();
+    } catch (err) {
+      if (!res.headersSent) throw err;
+      res.destroy(err as Error);
+    }
+  }
+
+  // Applied after reportExportRows so the English file is built exactly as before and the
+  // translation is one pass over it. In the long-form views the section and metric columns are our
+  // own keys and are translated; the label column is user data (suite and run names) except where
+  // a section's labels are themselves a product vocabulary (byStatus), and the value column is data
+  // except for the two health labels the service computes.
+  private localizeReportRows(
+    locale: ExportLocale,
+    view: ReportExportView,
+    keys: string[],
+    rows: Record<string, unknown>[]
+  ): { headers: string[]; rows: Record<string, unknown>[] } {
+    if (locale === "en") return { headers: keys, rows };
+    if (view === "execution") return localizeRows(locale, keys, rows);
+    if (view === "matrix") return localizeRows(locale, keys, rows, REPORT_MATRIX_VALUE_FIELDS);
+    const translated = rows.map((row) => {
+      const section = String(row.section ?? "");
+      const metric = String(row.metric ?? "");
+      return {
+        section: exportReportSection(locale, section),
+        label: section === "byStatus" ? exportValue(locale, "testcaseStatus", row.label) : row.label,
+        metric: exportReportMetric(locale, metric),
+        value:
+          metric === "healthLabel" || metric === "flakinessLabel"
+            ? exportValue(locale, metric, row.value)
+            : row.value
+      };
+    });
+    return localizeRows(locale, keys, translated);
+  }
+
+  private longRow(section: string, label: string, metric: string, value: unknown): Record<string, unknown> {
+    // `?? ""` rather than String(value): a real 0 has to survive as 0, and a null pass rate (a run
+    // with nothing executed yet) has to read as blank rather than the word "null".
+    return { section, label, metric, value: value ?? "" };
+  }
+
+  private async reportExportRows(
+    req: AuthenticatedRequest,
+    projectId: string,
+    view: ReportExportView,
+    query: Record<string, any>
+  ): Promise<{ headers: string[]; rows: Record<string, unknown>[] }> {
+    if (view === "execution") {
+      // The screen's filter travels with the export: exporting "the execution report" while looking
+      // at one plan should not hand back every plan. filterBy/filterValue are the same query params
+      // the tab itself sends, and executionReport applies them.
+      const report = await this.legacy.executionReportForUser(req.userId, projectId, query);
+      const rows = (report.rows ?? []).map((row: Record<string, unknown>) => ({
+        groupName: row.groupName,
+        Passed: row.Passed,
+        Failed: row.Failed,
+        Blocked: row.Blocked,
+        Skipped: row.Skipped,
+        Untested: row.Untested,
+        Retest: row.Retest,
+        total: row.total
+      }));
+      return { headers: REPORT_EXECUTION_HEADERS, rows };
+    }
+
+    if (view === "matrix") {
+      const matrix = await this.legacy.requirementMatrixForUser(req.userId, projectId);
+      const rows = (matrix.rows ?? []).map((row: Record<string, unknown>) =>
+        Object.fromEntries(REPORT_MATRIX_HEADERS.map((header) => [header, row[header] ?? ""]))
+      );
+      return { headers: REPORT_MATRIX_HEADERS, rows };
+    }
+
+    if (view === "overview") {
+      const overview = await this.legacy.reportsOverviewForUser(req.userId, projectId);
+      const rows: Record<string, unknown>[] = [
+        this.longRow("summary", "", "trendDelta", overview.trendDelta),
+        this.longRow("summary", "", "flakyCount", overview.flakyCount),
+        this.longRow("summary", "", "coverageGapCount", overview.coverageGapCount),
+        this.longRow("summary", "", "untestedP1Count", overview.untestedP1Count),
+        this.longRow("summary", "", "aiSummary", overview.aiSummary)
+      ];
+      for (const point of overview.passRateTrend ?? []) {
+        rows.push(this.longRow("passRateTrend", point.name, "total", point.total));
+        rows.push(this.longRow("passRateTrend", point.name, "executed", point.executed));
+        rows.push(this.longRow("passRateTrend", point.name, "passRate", point.passRate));
+        rows.push(this.longRow("passRateTrend", point.name, "createdAt", point.createdAt));
+      }
+      for (const suite of overview.suiteHealth ?? []) {
+        rows.push(this.longRow("suiteHealth", suite.suiteName, "executed", suite.executed));
+        rows.push(this.longRow("suiteHealth", suite.suiteName, "passedPct", suite.passedPct));
+        rows.push(this.longRow("suiteHealth", suite.suiteName, "failedPct", suite.failedPct));
+        rows.push(this.longRow("suiteHealth", suite.suiteName, "blockedPct", suite.blockedPct));
+      }
+      return { headers: REPORT_LONG_HEADERS, rows };
+    }
+
+    if (view === "repository") {
+      const summary = await this.legacy.repositorySummaryForUser(req.userId, projectId);
+      const rows: Record<string, unknown>[] = [
+        this.longRow("summary", "", "totalTestCases", summary.totalTestCases),
+        this.longRow("summary", "", "updatedToday", summary.updatedToday),
+        this.longRow("summary", "", "updatedThisWeek", summary.updatedThisWeek),
+        this.longRow("summary", "", "updatedThisMonth", summary.updatedThisMonth)
+      ];
+      for (const bucket of summary.bySuite ?? []) rows.push(this.longRow("bySuite", String(bucket.name), "count", bucket.count));
+      for (const bucket of summary.byStatus ?? []) rows.push(this.longRow("byStatus", String(bucket.name), "count", bucket.count));
+      for (const bucket of summary.byPriority ?? []) rows.push(this.longRow("byPriority", String(bucket.name), "count", bucket.count));
+      for (const bucket of summary.addedByDate ?? []) rows.push(this.longRow("addedByDate", String(bucket.date), "count", bucket.count));
+      return { headers: REPORT_LONG_HEADERS, rows };
+    }
+
+    if (view === "insights") {
+      const insights = await this.legacy.reportsInsightsForUser(req.userId, projectId);
+      const rows: Record<string, unknown>[] = [
+        this.longRow("summary", "", "healthScore", insights.healthScore),
+        this.longRow("summary", "", "healthLabel", insights.healthLabel),
+        this.longRow("summary", "", "untestedP1Count", insights.untestedP1Count)
+      ];
+      for (const test of insights.flakyTests ?? []) {
+        const label = String(test.externalId || test.title || "");
+        rows.push(this.longRow("flakyTests", label, "title", test.title));
+        rows.push(this.longRow("flakyTests", label, "suiteName", test.suiteName));
+        rows.push(this.longRow("flakyTests", label, "flipCount", test.flipCount));
+        rows.push(this.longRow("flakyTests", label, "flakinessLabel", test.flakinessLabel));
+      }
+      for (const gap of insights.coverageGaps ?? []) {
+        rows.push(this.longRow("coverageGaps", gap.suiteName, "total", gap.total));
+        rows.push(this.longRow("coverageGaps", gap.suiteName, "covered", gap.covered));
+        rows.push(this.longRow("coverageGaps", gap.suiteName, "pct", gap.pct));
+      }
+      for (const suite of insights.coverageBySuite ?? []) {
+        rows.push(this.longRow("coverageBySuite", suite.suiteName, "total", suite.total));
+        rows.push(this.longRow("coverageBySuite", suite.suiteName, "covered", suite.covered));
+        rows.push(this.longRow("coverageBySuite", suite.suiteName, "pct", suite.pct));
+      }
+      return { headers: REPORT_LONG_HEADERS, rows };
+    }
+
+    const trends = await this.legacy.reportsTrendsForUser(req.userId, projectId);
+    const rows: Record<string, unknown>[] = [this.longRow("summary", "", "trendDelta", trends.trendDelta)];
+    for (const point of trends.passRateTrend ?? []) {
+      rows.push(this.longRow("passRateTrend", point.name, "total", point.total));
+      rows.push(this.longRow("passRateTrend", point.name, "executed", point.executed));
+      rows.push(this.longRow("passRateTrend", point.name, "passRate", point.passRate));
+      rows.push(this.longRow("passRateTrend", point.name, "createdAt", point.createdAt));
+    }
+    for (const bucket of trends.executionVelocity ?? []) {
+      rows.push(this.longRow("executionVelocity", String(bucket.name), "count", bucket.count));
+    }
+    for (const bucket of trends.bugDiscoveryRate ?? []) {
+      rows.push(this.longRow("bugDiscoveryRate", String(bucket.week), "count", bucket.count));
+    }
+    return { headers: REPORT_LONG_HEADERS, rows };
+  }
+
+  @Post("/api/projects/:projectId/ai/generate-testcases")
+  generateAi(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.aiGenerate(projectId, req.userId, body);
+  }
+
+  // REMOVED: POST /api/projects/:projectId/ai/review-script
+  //
+  // It was a stub that took no caller, resolved no project, called no model, and answered every
+  // request — including an unauthenticated one, and one carrying a script that cannot parse — with
+  // { status: "passed", categories: [], validatedSteps: [] }. An "AI review" that always reports a
+  // pass is worse than none: it is a green tick with nothing behind it.
+  //
+  // Deleted rather than implemented, for the same reason the import stubs were (§3 bug 15): nothing
+  // in Tesbo-Frontend calls it, so there is no feature to keep working — only a route that lied.
+  // Reinstate it alongside a real implementation, not before.
+
+  @Get("/api/projects/:projectId/ai/generation-history")
+  aiHistory(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.aiHistory(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/ai/generation-history/:requestId/save")
+  aiSave(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("requestId") requestId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.aiSave(projectId, req.userId, requestId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra")
+  zyraAgent(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.zyraAgent(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/test")
+  testZyraConnection(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.testZyraAiConnection(projectId, req.userId);
+  }
+
+  @Patch("/api/projects/:projectId/agents/zyra/settings")
+  updateZyraSettings(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.updateZyraSettings(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/chat/sessions")
+  zyraChatSessions(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.zyraChatSessions(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions")
+  createZyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createZyraChatSession(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  zyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("sessionId") sessionId: string) {
+    return this.legacy.zyraChatSession(projectId, req.userId, sessionId);
+  }
+
+  @Patch("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  renameZyraChatSession(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.renameZyraChatSession(projectId, req.userId, sessionId, body);
+  }
+
+  @Delete("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId")
+  deleteZyraChatSession(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("sessionId") sessionId: string) {
+    return this.legacy.deleteZyraChatSession(projectId, req.userId, sessionId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages")
+  async sendZyraChatMessage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Body() body: Record<string, any>
+  ) {
+    // turnId is a caller-supplied, purely optional, opaque correlation id — it exists only to let
+    // an ALREADY-open GET .../turns/:turnId/events stream narrate this same request while it runs.
+    // It changes nothing about what this route does or returns: a caller that omits it (every
+    // existing caller, every API-token/MCP integration) gets exactly today's behavior, byte for
+    // byte, because `onStage` below is then simply undefined and sendZyraChatMessage never calls it.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    // `background: true` (sent by the Zyra chat page) returns as soon as the user's message is
+    // recorded and runs the turn detached — see LegacyService.startZyraChatMessage for why a request
+    // held open for minutes fails behind Cloudflare. Opt-in, so every other caller is unchanged.
+    // Wired exactly like the continue route below: completion reaches SSE through onSettled.
+    if (body?.background === true) {
+      const onStage = turnId ? this.zyraProgress.stageEmitter(turnId, { projectId, sessionId, userId: req.userId || "" }) : undefined;
+      const onSettled = turnId
+        ? (result: { ok: true; payload: unknown } | { ok: false; message: string }) =>
+            result.ok ? this.zyraProgress.complete(turnId, result.payload) : this.zyraProgress.completeWithError(turnId, result.message)
+        : undefined;
+      try {
+        return await this.legacy.startZyraChatMessage(projectId, req.userId, sessionId, body, onStage, onSettled);
+      } catch (err) {
+        // A synchronous rejection (validation, 409, 404) never reaches onSettled — close the stream here.
+        if (turnId) this.zyraProgress.completeWithError(turnId, "This turn did not complete.");
+        throw err;
+      }
+    }
+    if (!turnId) {
+      return this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body);
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const onStage = this.zyraProgress.stageEmitter(turnId, owner);
+    try {
+      const result = await this.legacy.sendZyraChatMessage(projectId, req.userId, sessionId, body, onStage);
+      this.zyraProgress.complete(turnId, result);
+      return result;
+    } catch (err) {
+      // Deliberately generic — the real error detail still reaches the client via this same
+      // request's own (unmodified) HTTP error response; the progress channel only needs to tell an
+      // open SSE stream to stop waiting, never to explain why.
+      this.zyraProgress.completeWithError(turnId, "This turn did not complete.");
+      throw err;
+    }
+  }
+
+  // Read-only, best-effort progress narration for one turn of the route above — see
+  // zyra-progress.service.ts's file header for the full design and the guarantees this route
+  // cannot violate (it can only ever narrate the POST above, never affect it). Same
+  // project/session ownership check as every other Zyra route (zyraChatSession already does both
+  // requireProjectAccess and "this session belongs to this project" in one call) — a turnId is an
+  // unguessable v4 UUID, but that is not the same as authorized, so this still runs before ever
+  // touching the in-memory turn registry.
+  @Sse("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/turns/:turnId/events")
+  async zyraTurnEvents(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Param("turnId") turnId: string
+  ): Promise<Observable<MessageEvent>> {
+    await this.legacy.zyraChatSession(projectId, req.userId, sessionId);
+    if (!this.zyraProgressStreamingEnabled()) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    const owner = { projectId, sessionId, userId: req.userId || "" };
+    const subject = this.zyraProgress.subscribe(turnId, owner);
+    if (!subject) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    return subject.pipe(map((event) => ({ data: event })));
+  }
+
+  /*
+   * Live events of this session's background plan batches: each test case as the model finishes it
+   * ({kind: "draft", piece, row}), each part as it is posted for review ({kind: "posted", piece}), and
+   * the end of each batch ({kind: "batch"}). Best-effort and in-process, like the turn stream above —
+   * the page keeps polling the session, which stays the source of truth (an instance that is not the
+   * one running the plan simply has nothing to say). Same access check and kill switch as above.
+   */
+  @Sse("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/plan/events")
+  async zyraPlanEvents(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string
+  ): Promise<Observable<MessageEvent>> {
+    await this.legacy.zyraChatSession(projectId, req.userId, sessionId);
+    if (!this.zyraProgressStreamingEnabled()) {
+      return of<MessageEvent>({ data: { kind: "unknown" } });
+    }
+    const events = this.legacy.zyraPlanEvents.pipe(
+      filter((entry) => entry.projectId === projectId && entry.sessionId === sessionId),
+      map((entry) => ({ data: entry.event }) as MessageEvent)
+    );
+    // A batch can go a minute or two between events; a heartbeat keeps proxies (Cloudflare drops an
+    // idle connection after 100 s) from closing the stream in between.
+    const heartbeat = interval(25_000).pipe(map(() => ({ data: { kind: "ping" } }) as MessageEvent));
+    return merge(events, heartbeat);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/messages/:messageId/continue")
+  async continueZyraChatMessage(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string,
+    @Param("messageId") messageId: string,
+    @Body() body: Record<string, any>
+  ) {
+    // Same optional, purely-additive turnId contract as sendZyraChatMessage above — a caller that
+    // omits it gets exactly today's fire-and-forget behavior with no progress narration. The one
+    // difference from sendZyraChatMessage: this route no longer awaits the underlying work before
+    // responding (see continueZyraChatMessage's own doc comment for why), so complete()/
+    // completeWithError() can't be called here after an await — they're wired in as onSettled and
+    // fired from inside the background resume itself once it actually finishes.
+    const rawTurnId = body?.turnId;
+    const turnId = this.zyraProgressStreamingEnabled() && typeof rawTurnId === "string" && rawTurnId.length > 0 && rawTurnId.length <= 100
+      ? rawTurnId
+      : undefined;
+    const onStage = turnId ? this.zyraProgress.stageEmitter(turnId, { projectId, sessionId, userId: req.userId || "" }) : undefined;
+    const onSettled = turnId
+      ? (result: { ok: true; payload: unknown } | { ok: false; message: string }) =>
+          result.ok ? this.zyraProgress.complete(turnId, result.payload) : this.zyraProgress.completeWithError(turnId, result.message)
+      : undefined;
+    return this.legacy.continueZyraChatMessage(projectId, req.userId, sessionId, messageId, onStage, onSettled, Boolean(body?.narrow));
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/stop-plan")
+  stopZyraChatPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string
+  ) {
+    return this.legacy.stopZyraChatPlan(projectId, req.userId, sessionId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/chat/sessions/:sessionId/resume-plan")
+  resumeZyraChatPlan(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("sessionId") sessionId: string
+  ) {
+    return this.legacy.resumeZyraChatPlan(projectId, req.userId, sessionId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks")
+  createZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.aiGenerate(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/tasks/:taskId")
+  getZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
+    return this.legacy.zyraTask(projectId, req.userId, taskId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/feedback")
+  feedbackZyraTask(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.zyraFeedback(projectId, req.userId, taskId, body);
+  }
+
+  @Delete("/api/projects/:projectId/agents/zyra/tasks/:taskId/drafts/:draftIndex")
+  deleteZyraDraft(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("draftIndex") draftIndex: string
+  ) {
+    return this.legacy.zyraDeleteDraft(projectId, req.userId, taskId, Number(draftIndex));
+  }
+
+  @Patch("/api/projects/:projectId/agents/zyra/tasks/:taskId/drafts/:draftIndex")
+  editZyraDraft(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("draftIndex") draftIndex: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.zyraEditDraft(projectId, req.userId, taskId, Number(draftIndex), body);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/close")
+  closeZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
+    return this.legacy.zyraCloseTask(projectId, req.userId, taskId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/save")
+  saveZyraTask(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string, @Body() body: Record<string, any>) {
+    return this.legacy.zyraSave(projectId, req.userId, taskId, body);
+  }
+
+  @Get("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments")
+  zyraTaskTicketComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("taskId") taskId: string) {
+    return this.legacy.zyraTaskTicketComments(projectId, req.userId, taskId);
+  }
+
+  @Post("/api/projects/:projectId/agents/zyra/tasks/:taskId/ticket-comments/:commentId/retry")
+  retryZyraTicketComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("taskId") taskId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.zyraRetryTicketComment(projectId, req.userId, taskId, commentId);
+  }
+
+  // ─── Knowledge Base v2 (folders / documents / files) ────────────────────────
+  // NOTE: these routes must stay ABOVE the legacy /knowledge-base/:itemId routes
+  // below, since literal segments like "folders"/"search" would otherwise be
+  // captured by that older single-param route.
+
+  @Post("/api/projects/:projectId/knowledge-base/folders")
+  createKnowledgeFolder(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createKnowledgeFolder(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/folders/tree")
+  getKnowledgeFolderTree(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.getKnowledgeFolderTree(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/summary")
+  getKnowledgeBaseSummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.knowledgeBaseSummary(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/folders/:folderId/export")
+  async exportKnowledgeFolder(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("folderId") folderId: string
+  ) {
+    const { buffer, filename } = await this.legacy.exportKnowledgeFolder(projectId, req.userId, folderId);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.send(buffer);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/folders/:folderId")
+  getKnowledgeFolder(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("folderId") folderId: string) {
+    return this.legacy.getKnowledgeFolder(projectId, req.userId, folderId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/folders/:folderId/items")
+  listKnowledgeFolderItems(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("folderId") folderId: string,
+    @Query() query: Record<string, any>
+  ) {
+    return this.legacy.listKnowledgeFolderItems(projectId, req.userId, folderId, query);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/folders/:folderId/move")
+  moveKnowledgeFolder(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("folderId") folderId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.moveKnowledgeFolder(projectId, req.userId, folderId, body);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/folders/:folderId/restore")
+  restoreKnowledgeFolder(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("folderId") folderId: string) {
+    return this.legacy.restoreKnowledgeFolder(projectId, req.userId, folderId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/folders/:folderId")
+  updateKnowledgeFolder(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("folderId") folderId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateKnowledgeFolder(projectId, req.userId, folderId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/folders/:folderId")
+  deleteKnowledgeFolder(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("folderId") folderId: string) {
+    return this.legacy.deleteKnowledgeFolder(projectId, req.userId, folderId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/search")
+  searchKnowledgeBase(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.searchKnowledgeBase(projectId, req.userId, query);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/documents")
+  listKnowledgeDocuments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.listKnowledgeDocuments(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/documents")
+  createKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createKnowledgeDocument(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId/versions")
+  listKnowledgeDocumentVersions(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.listKnowledgeDocumentVersions(projectId, req.userId, documentId);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/documents/:documentId/restore-version")
+  restoreKnowledgeDocumentVersion(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.restoreKnowledgeDocumentVersion(projectId, req.userId, documentId, body);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/approve-ai-memory")
+  approveAiMemory(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.approveAiMemory(projectId, req.userId, documentId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/reject-ai-memory")
+  rejectAiMemory(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.rejectAiMemory(projectId, req.userId, documentId);
+  }
+
+  // ── Document comments ──
+  // Must stay above the bare /documents/:documentId route below, same ordering constraint noted
+  // at the top of this Knowledge Base block.
+
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId/comments")
+  listKnowledgeDocumentComments(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.listKnowledgeDocumentComments(projectId, req.userId, documentId);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/documents/:documentId/comments")
+  createKnowledgeDocumentComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.createKnowledgeDocumentComment(projectId, req.userId, documentId, body);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/comments/:commentId")
+  updateKnowledgeDocumentComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("commentId") commentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateKnowledgeDocumentComment(projectId, req.userId, commentId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/comments/:commentId")
+  deleteKnowledgeDocumentComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("commentId") commentId: string) {
+    return this.legacy.deleteKnowledgeDocumentComment(projectId, req.userId, commentId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId")
+  getKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.getKnowledgeDocument(projectId, req.userId, documentId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/documents/:documentId/history")
+  getKnowledgeDocumentHistory(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Query() query: Record<string, any>
+  ) {
+    return this.legacy.getKnowledgeDocumentHistory(projectId, req.userId, documentId, query);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/move")
+  moveKnowledgeDocument(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.moveKnowledgeDocument(projectId, req.userId, documentId, body);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/restore")
+  restoreKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.restoreKnowledgeDocument(projectId, req.userId, documentId);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/documents/:documentId/duplicate")
+  duplicateKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.duplicateKnowledgeDocument(projectId, req.userId, documentId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId")
+  updateKnowledgeDocument(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateKnowledgeDocument(projectId, req.userId, documentId, body);
+  }
+
+  // Zyra AI Memory's only write path for people: correct or remove one entry (owner/manager only).
+  @Patch("/api/projects/:projectId/knowledge-base/documents/:documentId/memory-entries/:entryId")
+  updateZyraMemoryEntry(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Param("entryId") entryId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateZyraMemoryEntry(projectId, req.userId, documentId, entryId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/documents/:documentId/memory-entries/:entryId")
+  deleteZyraMemoryEntry(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("documentId") documentId: string,
+    @Param("entryId") entryId: string
+  ) {
+    return this.legacy.deleteZyraMemoryEntry(projectId, req.userId, documentId, entryId);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/documents/:documentId")
+  deleteKnowledgeDocument(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("documentId") documentId: string) {
+    return this.legacy.deleteKnowledgeDocument(projectId, req.userId, documentId);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/files/upload")
+  @UseInterceptors(FilesInterceptor("files", 10, { limits: { fileSize: LegacyService.KB_MAX_UPLOAD_SIZE } }))
+  uploadKnowledgeFiles(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Body() body: Record<string, any>,
+    @UploadedFiles() files: Array<{ buffer: Buffer; originalname: string; mimetype: string; size: number }>
+  ) {
+    return this.legacy.uploadKnowledgeFiles(projectId, req.userId, body.folderId, files);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/files/:fileId/download")
+  async downloadKnowledgeFile(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("fileId") fileId: string
+  ) {
+    const access = await this.legacy.getKnowledgeFileAccess(projectId, req.userId, fileId, false);
+    return sendStoredFile(res, access);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/files/:fileId/preview")
+  async previewKnowledgeFile(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("fileId") fileId: string
+  ) {
+    const access = await this.legacy.getKnowledgeFileAccess(projectId, req.userId, fileId, true);
+    return sendStoredFile(res, access);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/files/:fileId")
+  getKnowledgeFile(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("fileId") fileId: string) {
+    return this.legacy.getKnowledgeFile(projectId, req.userId, fileId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/files/:fileId/move")
+  moveKnowledgeFile(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("fileId") fileId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.moveKnowledgeFile(projectId, req.userId, fileId, body);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/files/:fileId/restore")
+  restoreKnowledgeFile(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("fileId") fileId: string) {
+    return this.legacy.restoreKnowledgeFile(projectId, req.userId, fileId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/files/:fileId")
+  updateKnowledgeFile(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("fileId") fileId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateKnowledgeFile(projectId, req.userId, fileId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/files/:fileId")
+  deleteKnowledgeFile(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("fileId") fileId: string) {
+    return this.legacy.deleteKnowledgeFile(projectId, req.userId, fileId);
+  }
+
+  // ─── Knowledge Base v1 (legacy flat notes/files — superseded by v2 above) ────
+
+  @Get("/api/projects/:projectId/knowledge-base")
+  knowledge(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.listKnowledge(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base")
+  createKnowledge(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.createKnowledge(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/knowledge-base/upload")
+  async uploadKnowledge(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return { error: "File uploads are not enabled in this endpoint yet" };
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/:itemId")
+  getKnowledge(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("itemId") itemId: string) {
+    return this.legacy.getKnowledge(projectId, req.userId, itemId);
+  }
+
+  @Patch("/api/projects/:projectId/knowledge-base/:itemId")
+  updateKnowledge(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("itemId") itemId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateKnowledge(projectId, req.userId, itemId, body);
+  }
+
+  @Delete("/api/projects/:projectId/knowledge-base/:itemId")
+  deleteKnowledge(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("itemId") itemId: string) {
+    return this.legacy.deleteKnowledge(projectId, req.userId, itemId);
+  }
+
+  @Get("/api/projects/:projectId/knowledge-base/:itemId/file")
+  knowledgeFile(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("itemId") itemId: string) {
+    return this.legacy.knowledgeItemFile(projectId, req.userId, itemId);
+  }
+
+  // ── Workspace-scoped app integrations (Jira, Linear, Notion) ──
+  // Connecting/configuring an app is workspace-wide; see the project-scoped mapping/sync/ticket
+  // routes further below for picking which remote project/team feeds a given Tesbo project.
+
+  @Get("/api/workspace/integrations/:provider/auth-url")
+  integrationAuthUrl(@Req() req: AuthenticatedRequest, @Param("provider") provider: string) {
+    return this.legacy.integrationAuthUrl(req.userId, provider);
+  }
+
+  @Get("/api/workspace/integrations/:provider/config")
+  integrationConfig(@Req() req: AuthenticatedRequest, @Param("provider") provider: string) {
+    return this.legacy.integrationConfigStatus(req.userId, provider);
+  }
+
+  @Post("/api/workspace/integrations/:provider/callback")
+  integrationCallback(@Req() req: AuthenticatedRequest, @Param("provider") provider: string, @Body() body: Record<string, any>) {
+    return this.legacy.integrationCallback(req.userId, provider, body);
+  }
+
+  @Delete("/api/workspace/integrations/:provider/disconnect")
+  integrationDisconnect(@Req() req: AuthenticatedRequest, @Param("provider") provider: string) {
+    return this.legacy.integrationDisconnect(req.userId, provider);
+  }
+
+  @Get("/api/workspace/integrations/:provider/status")
+  integrationStatus(@Req() req: AuthenticatedRequest, @Param("provider") provider: string) {
+    return this.legacy.integrationStatus(req.userId, provider);
+  }
+
+  // ── Project-scoped Jira mapping/sync/tickets ──
+
+  @Get("/api/projects/:projectId/jira/status")
+  jiraStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.jiraStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/jira/projects")
+  jiraProjects(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.jiraProjects(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/jira/projects")
+  connectJiraProjects(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectJiraProjects(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/jira/sync")
+  syncJira(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncJira(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/jira/tickets")
+  jiraTickets(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.jiraTickets(projectId, req.userId, query);
+  }
+
+  @Get("/api/projects/:projectId/jira/tickets/:issueKey")
+  jiraTicketByKey(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("issueKey") issueKey: string) {
+    return this.legacy.jiraTicketByKey(projectId, req.userId, issueKey);
+  }
+
+  @Post("/api/projects/:projectId/jira/comment")
+  jiraComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.jiraComment(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/jira/search-issues")
+  jiraSearchIssues(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.jiraSearchIssues(projectId, req.userId, query);
+  }
+
+  // ── Project-scoped Linear mapping/sync/tickets ──
+
+  @Get("/api/projects/:projectId/linear/status")
+  linearStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linearStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/linear/teams")
+  linearTeams(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.linearTeams(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/linear/teams")
+  connectLinearTeams(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectLinearTeams(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/linear/sync")
+  syncLinear(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncLinear(req.userId, projectId);
+  }
+
+  // ── Sync run status (polled by the Requirements page while a sync is in flight) ──
+
+  @Get("/api/projects/:projectId/integrations/:provider/sync-status")
+  integrationSyncStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Param("provider") provider: string) {
+    return this.legacy.integrationSyncStatus(req.userId, projectId, provider);
+  }
+
+  @Get("/api/projects/:projectId/integrations/sync-history")
+  integrationSyncHistory(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.integrationSyncHistory(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/linear/tickets")
+  linearTickets(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.linearTickets(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/linear/comment")
+  linearComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.linearComment(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/linear/search-issues")
+  linearSearchIssues(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.linearSearchIssues(projectId, req.userId, query);
+  }
+
+  // ── Project-scoped Notion mapping/sync/pages ──
+  // One Notion database per Tesbo project; its pages are the tickets. Same shape as the Linear routes.
+
+  @Get("/api/projects/:projectId/notion/status")
+  notionStatus(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionStatus(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/notion/databases")
+  notionDatabases(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.notionDatabases(projectId, req.userId);
+  }
+
+  @Post("/api/projects/:projectId/notion/databases")
+  connectNotionDatabase(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.connectNotionDatabase(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/notion/sync")
+  syncNotion(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.syncNotion(req.userId, projectId);
+  }
+
+  @Get("/api/projects/:projectId/notion/pages")
+  notionPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionPages(projectId, req.userId, query);
+  }
+
+  @Post("/api/projects/:projectId/notion/comment")
+  notionComment(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.notionComment(projectId, req.userId, body);
+  }
+
+  @Get("/api/projects/:projectId/notion/search-pages")
+  notionSearchPages(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.notionSearchPages(projectId, req.userId, query);
+  }
+
+  // ── Requirements page: cross-source (Jira + Linear + Notion) aggregates ──
+
+  @Get("/api/projects/:projectId/tickets/summary")
+  requirementsSummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.requirementsSummary(projectId, req.userId);
+  }
+
+  @Get("/api/projects/:projectId/tickets")
+  allTickets(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.allTickets(projectId, req.userId, query);
+  }
+
+  @Get("/api/projects/:projectId/activity")
+  activity(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Query() query: Record<string, any>) {
+    return this.legacy.listActivityForUser(req.userId, projectId, query);
+  }
+
+  @Get("/api/projects/:projectId/activity/summary")
+  activitySummary(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.activitySummaryForUser(req.userId, projectId);
+  }
+
+  @Get("/api/workspace/activity")
+  workspaceActivity(@Req() req: AuthenticatedRequest, @Query() query: Record<string, any>) {
+    return this.legacy.workspaceActivity(req.userId, query);
+  }
+
+  @Get("/api/workspace/activity/summary")
+  workspaceActivitySummary(@Req() req: AuthenticatedRequest) {
+    return this.legacy.workspaceActivitySummaryForUser(req.userId);
+  }
+
+  // Real as of the archive sweep's notification work: `notifications` (V6) previously had no writer
+  // anywhere in this codebase, so both routes were honest stubs (empty list, always-404 read) rather
+  // than faking success — see LegacyService.notifyProjectMembers' own comment for the full history.
+  @Get("/api/notifications")
+  async notifications(@Req() req: AuthenticatedRequest) {
+    return this.legacy.notificationsForUser(req.userId);
+  }
+
+  // Declared before the `:id/read` route below; the two never overlap (this one is a single fixed
+  // segment, that one needs an id in the middle) but keeping the literal first reads unambiguously.
+  @Post("/api/notifications/read-all")
+  async readAllNotifications(@Req() req: AuthenticatedRequest) {
+    return this.legacy.markAllNotificationsRead(req.userId);
+  }
+
+  @Post("/api/notifications/:id/read")
+  async readNotification(@Req() req: AuthenticatedRequest, @Param("id") id: string) {
+    await this.legacy.markNotificationRead(req.userId, id);
+    return { ok: true };
+  }
+
+  @Get("/api/admin/customers")
+  customers(@Req() req: AuthenticatedRequest) {
+    return this.legacy.adminCustomers(req.userId);
+  }
+
+  @Get("/api/admin/admins")
+  admins(@Req() req: AuthenticatedRequest) {
+    return this.legacy.adminList(req.userId);
+  }
+
+  @Get("/api/branding")
+  branding() {
+    return this.legacy.publicBranding();
+  }
+
+  @Get("/api/admin/branding")
+  adminBranding(@Req() req: AuthenticatedRequest) {
+    return this.legacy.adminBranding(req.userId);
+  }
+
+  @Patch("/api/admin/branding")
+  updateAdminBranding(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.updateAdminBranding(req.userId, body);
+  }
+
+  @Post("/api/admin/admins")
+  addAdmin(@Req() req: AuthenticatedRequest, @Body() body: Record<string, any>) {
+    return this.legacy.addAdmin(req.userId, body);
+  }
+
+  @Delete("/api/admin/admins/:adminId")
+  removeAdmin(@Req() req: AuthenticatedRequest, @Param("adminId") adminId: string) {
+    return this.legacy.deleteAdmin(req.userId, adminId);
+  }
+
+  /*
+   * The external Tesbo Reports ingest is not implemented — these six routes return empty lists and
+   * zeroed analytics. What they no longer do is answer without a caller: they took no @Req() and
+   * ignored the project in their own URL, so any request at all was served, and `settings` is shaped
+   * to carry an ingestion credential. The placeholder payloads are a missing feature, recorded in
+   * docs/e2e-coverage-waves.md; being readable by anyone was a defect regardless of what fills them.
+   *
+   * SUPERSEDED, and will not be filled in as designed. Basecamp 10189985971 chose the opposite
+   * linking mechanism: automation reports results against a test case's `external_id`, onto
+   * ordinary `cycles`/`executions` rows, via /api/projects/:projectId/automation/* (src/automation).
+   * These six were shaped around spec-name/test-name matching in a store of their own, and the
+   * frontend client that called them (`listTesboRuns`, `ingestTesboPlaywright`,
+   * `getTesboTestHistory(projectId, specName, testName)`, ...) has been deleted for that reason.
+   * They are left standing only because removing a route is a separate, riskier change than
+   * deleting an uncalled client. Nothing should be built on them --
+   * see docs/automation-integration-plan.md §2, trap 2.
+   */
+  @Get("/api/projects/:projectId/tesbo-reports/runs")
+  async tesboRuns(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return [];
+  }
+
+  @Get("/api/projects/:projectId/tesbo-reports/specs")
+  async tesboSpecs(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return [];
+  }
+
+  @Get("/api/projects/:projectId/tesbo-reports/tests")
+  async tesboTests(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return [];
+  }
+
+  @Get("/api/projects/:projectId/tesbo-reports/analytics")
+  async tesboAnalytics(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return { totalRuns: 0, totalTests: 0, passRate: 0, byStatus: {}, runsByDay: [] };
+  }
+
+  @Get("/api/projects/:projectId/tesbo-reports/alerts")
+  async tesboAlerts(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return [];
+  }
+
+  @Get("/api/projects/:projectId/tesbo-reports/settings")
+  async tesboSettings(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    await this.legacy.requireProjectAccess(req.userId, projectId);
+    return { keepTrace: true, traceRetentionDays: 14, ingestionApiKey: "", alertsEnabled: false, shareByDefault: false };
+  }
+}

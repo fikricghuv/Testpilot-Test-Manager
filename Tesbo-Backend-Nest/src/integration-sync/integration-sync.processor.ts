@@ -1,0 +1,677 @@
+import { OnWorkerEvent, Processor, WorkerHost } from "@nestjs/bullmq";
+import { Logger } from "@nestjs/common";
+import { createHash } from "crypto";
+import type { Job } from "bullmq";
+import { DatabaseService } from "../database/database.service";
+import { truncateForColumn } from "../common/integration-text.util";
+import { notificationLinks, notificationMessages } from "../legacy/notification-events";
+import { writeNotifications } from "../legacy/notification-writer";
+import { summarizeTextChange } from "../common/text-diff.util";
+import { PlanLimitsService } from "../plan-limits/plan-limits.service";
+import { RagIngestionService } from "../rag/rag-ingestion.service";
+import {
+  IntegrationConnectionInvalidError,
+  IntegrationSyncClient,
+  LinearEntityNotFoundError,
+  NotionNotSharedError,
+  NotionPermissionError
+} from "./integration-sync.client";
+import { notionPageKey } from "./notion-api";
+import { IntegrationSyncDecisions } from "./integration-sync-decisions";
+import { IntegrationSyncDocumentBuilder } from "./integration-sync-document.builder";
+import { IntegrationSyncService } from "./integration-sync.service";
+import {
+  INTEGRATION_SYNC_CONCURRENCY,
+  INTEGRATION_SYNC_NIGHTLY_JIRA_JOB,
+  INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB,
+  INTEGRATION_SYNC_NIGHTLY_NOTION_JOB,
+  INTEGRATION_SYNC_QUEUE,
+  INTEGRATION_SYNC_RUN_JOB,
+  INTEGRATION_SYNC_TICKET_JOB,
+  INTEGRATION_SYNC_WATCHDOG_JOB,
+  MAX_TICKETS_PER_RUN,
+  NIGHTLY_SYNC_SINCE_BUFFER_MINUTES,
+  PROVIDER_FOLDER_NAMES
+} from "./integration-sync.constants";
+import { RemoteComment, RemoteTicket, SyncProvider, SyncRunJobPayload, SyncTicketJobPayload } from "./integration-sync.types";
+
+type Row = Record<string, any>;
+
+/**
+ * Per-provider column names. Jira, Linear and Notion keep separate ticket tables (their APIs and units of
+ * work differ enough that forcing one shape on both was rejected in V47), so the shared pipeline
+ * parameterises the column names instead. Every value here is a compile-time constant — never
+ * user input — so interpolating them into SQL is safe.
+ */
+const TICKET_TABLES: Record<SyncProvider, {
+  table: string;
+  connectionCol: string;
+  issueIdCol: string;
+  issueKeyCol: string;
+  createdCol: string;
+  updatedCol: string;
+  urlCol: string;
+  conflict: string;
+  mappingSql: string;
+}> = {
+  jira: {
+    table: "jira_tickets",
+    connectionCol: "jira_connection_id",
+    issueIdCol: "jira_issue_id",
+    issueKeyCol: "jira_issue_key",
+    createdCol: "jira_created_at",
+    updatedCol: "jira_updated_at",
+    urlCol: "jira_url",
+    conflict: "(jira_connection_id, jira_issue_id, project_id)",
+    mappingSql: `SELECT jira_project_id AS remote_id, jira_project_key AS remote_key, jira_project_name AS remote_name
+                 FROM jira_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
+  },
+  linear: {
+    table: "linear_tickets",
+    connectionCol: "integration_connection_id",
+    issueIdCol: "linear_issue_id",
+    issueKeyCol: "linear_issue_key",
+    createdCol: "linear_created_at",
+    updatedCol: "linear_updated_at",
+    urlCol: "linear_url",
+    conflict: "(integration_connection_id, linear_issue_id, project_id)",
+    // entity_type (V95) disambiguates whether remote_id/remote_key/remote_name hold a Linear Team
+    // or a Linear Project — jira's mappingSql has no equivalent column since Jira only ever maps
+    // by Project.
+    mappingSql: `SELECT linear_team_id AS remote_id, linear_team_key AS remote_key, linear_team_name AS remote_name, entity_type
+                 FROM linear_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
+  },
+  notion: {
+    table: "notion_pages",
+    connectionCol: "integration_connection_id",
+    issueIdCol: "notion_page_id",
+    issueKeyCol: "notion_page_key",
+    createdCol: "notion_created_at",
+    updatedCol: "notion_updated_at",
+    urlCol: "notion_url",
+    conflict: "(integration_connection_id, notion_page_id, project_id)",
+    // A Notion database has no short key, so its id doubles as remote_key (the run row's
+    // remote_project_key); remote_name is what the UI shows.
+    mappingSql: `SELECT notion_database_id AS remote_id, notion_database_id AS remote_key, notion_database_name AS remote_name
+                 FROM notion_project_mappings WHERE project_id = $1 AND enabled = true LIMIT 1`
+  }
+};
+
+@Processor(INTEGRATION_SYNC_QUEUE, { concurrency: INTEGRATION_SYNC_CONCURRENCY })
+export class IntegrationSyncProcessor extends WorkerHost {
+  private readonly logger = new Logger(IntegrationSyncProcessor.name);
+
+  constructor(
+    private readonly db: DatabaseService,
+    private readonly runs: IntegrationSyncService,
+    private readonly client: IntegrationSyncClient,
+    private readonly builder: IntegrationSyncDocumentBuilder,
+    private readonly decisions: IntegrationSyncDecisions,
+    private readonly ragIngestion: RagIngestionService,
+    private readonly planLimits: PlanLimitsService
+  ) {
+    super();
+  }
+
+  async process(job: Job): Promise<void> {
+    if (job.name === INTEGRATION_SYNC_RUN_JOB) return this.processRun(job.data as SyncRunJobPayload);
+    if (job.name === INTEGRATION_SYNC_TICKET_JOB) return this.processTicket(job.data as SyncTicketJobPayload);
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_JIRA_JOB) return this.processNightlyOrchestrator("jira");
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_LINEAR_JOB) return this.processNightlyOrchestrator("linear");
+    if (job.name === INTEGRATION_SYNC_NIGHTLY_NOTION_JOB) return this.processNightlyOrchestrator("notion");
+    if (job.name === INTEGRATION_SYNC_WATCHDOG_JOB) return this.runs.failStaleRuns();
+    this.logger.warn(`Unknown integration-sync job name: ${job.name}`);
+  }
+
+  // ── Nightly orchestrator: one per provider, fans out into the same sync-run job every other
+  // trigger uses, so logging, dedup, and error handling are all shared rather than reimplemented. ──
+
+  private async processNightlyOrchestrator(provider: SyncProvider): Promise<void> {
+    const targets = await this.runs.listNightlySyncTargets(provider);
+    this.logger.log(`Nightly ${provider} sync starting for ${targets.length} target${targets.length === 1 ? "" : "s"}.`);
+    let started = 0;
+    let deduped = 0;
+    let failedToStart = 0;
+    for (const target of targets) {
+      try {
+        const lastStart = await this.runs.getLastSuccessfulRunStart(target.projectId, provider);
+        const since = lastStart ? new Date(lastStart.getTime() - NIGHTLY_SYNC_SINCE_BUFFER_MINUTES * 60_000).toISOString() : null;
+        const { alreadyRunning } = await this.runs.startRun(target.organizationId, target.projectId, provider, null, target.remoteKey, {
+          triggerSource: "nightly",
+          since
+        });
+        if (alreadyRunning) deduped++;
+        else started++;
+      } catch (err) {
+        // One tenant's failure (revoked token, transient DB error) must never abort the rest of
+        // the night's run for everyone else.
+        failedToStart++;
+        this.logger.warn(
+          `Nightly ${provider} sync failed to start for project ${target.projectId}: ${err instanceof Error ? err.message : err}`
+        );
+      }
+    }
+    // The direct answer to "is the nightly cron healthy" without resorting to manual DB forensics.
+    // A nonzero `deduped` count on a night with no known double-fire is itself a signal that the
+    // BullMQ Job Scheduler misfired again (see idx_integration_sync_runs_nightly_cycle, V90) and is
+    // worth investigating on its own.
+    this.logger.log(`Nightly ${provider} sync complete: ${started} started, ${deduped} already ran this cycle, ${failedToStart} failed to start.`);
+  }
+
+  // ── Coordinator: page the provider, upsert tickets, fan out document jobs ──
+
+  private async processRun(payload: SyncRunJobPayload): Promise<void> {
+    const { runId, organizationId, projectId, provider, triggeredBy, since } = payload;
+    const config = TICKET_TABLES[provider];
+
+    try {
+      await this.runs.markRunning(runId, "connecting");
+
+      const connection = await this.client.loadConnection(organizationId, provider);
+      if (!connection) {
+        await this.runs.failRun(runId, `${PROVIDER_FOLDER_NAMES[provider]} is no longer connected to this workspace.`);
+        return;
+      }
+
+      const mapping = await this.db.query<{ remote_id: string; remote_key: string; remote_name: string; entity_type?: string }>(config.mappingSql, [projectId]);
+      const remote = mapping.rows[0];
+      if (!remote) {
+        await this.runs.failRun(runId, `No ${PROVIDER_FOLDER_NAMES[provider]} ${provider === "notion" ? "database" : "project"} is mapped to this project yet.`);
+        return;
+      }
+      // Runs record and show the mapped project name (V126), not the key — a Jira key ("KAN") is
+      // terse and a Linear Project's is an opaque slugId (V95). The key stays as the fallback.
+      const remoteName = remote.remote_name || null;
+      const remoteLabel = remoteName || remote.remote_key;
+      await this.db.query(
+        "UPDATE integration_sync_runs SET remote_project_key = $2, remote_project_name = $3, updated_at = now() WHERE id = $1",
+        [runId, remote.remote_key, remoteName]
+      );
+
+      // Created before any ticket lands, so the folder exists by the time the first document
+      // needs a home — and only ever for projects that actually ran a sync.
+      const folderId = await this.runs.ensureProviderFolder(organizationId, projectId, provider, triggeredBy);
+
+      await this.runs.setStage(runId, "fetching_tickets");
+      const queued: SyncTicketJobPayload[] = [];
+      let skipped = 0;
+      let alreadySynced = 0;
+      let capped = false;
+      const onPage = async (tickets: RemoteTicket[]): Promise<boolean> => {
+        // A run continuing a pass the cap cut off (V134) skips what the earlier runs already synced, so
+        // the cap below is spent on the tickets that are left rather than on the same newest tickets again.
+        const done = await this.syncedInPass(runId, projectId, String(connection.id), provider, tickets);
+        for (const ticket of tickets) {
+          if (done.has(ticket.issueId)) {
+            alreadySynced++;
+            continue;
+          }
+          // Checked only when another ticket still needs syncing, so a backlog of exactly the cap
+          // finishes the pass instead of reporting a limit that was never exceeded.
+          if (queued.length + skipped >= MAX_TICKETS_PER_RUN) {
+            capped = true;
+            break;
+          }
+          try {
+            const ticketId = await this.upsertTicket(projectId, String(connection.id), provider, ticket, remote.remote_id);
+            queued.push({ runId, organizationId, projectId, provider, ticketId, issueId: ticket.issueId, issueKey: ticket.issueKey, folderId, triggeredBy });
+          } catch (err) {
+            // One ticket's data (an oversized field, or anything else unexpected) must never abort
+            // the rest of the page or the run — an incremental run cursors off the last
+            // *successful* run's start, so an uncaught failure here would keep hitting this same
+            // ticket on every future attempt, permanently blocking the whole project's sync.
+            skipped++;
+            this.logger.warn(
+              `Skipping ${provider} ticket ${ticket.issueKey} in run ${runId} — could not upsert: ${err instanceof Error ? err.message : err}`
+            );
+          }
+        }
+        // Published per page so the UI's "found N tickets" climbs while a large backlog is still
+        // being pulled, instead of sitting at zero for a minute.
+        await this.runs.setTotals(runId, queued.length);
+        return capped;
+      };
+
+      const { truncated } =
+        provider === "jira"
+          ? await this.client.fetchJiraTickets(connection, remote.remote_key, onPage, since)
+          : provider === "notion"
+            ? await this.client.fetchNotionPages(connection, remote.remote_id, onPage, since)
+            : await this.client.fetchLinearTickets(connection, remote.remote_id, onPage, since, remote.entity_type === "project" ? "project" : "team");
+
+      await this.runs.setTotals(runId, queued.length);
+      // Marks the pass unfinished so the next Sync for this project continues it (see startRun).
+      if (truncated) await this.db.query("UPDATE integration_sync_runs SET truncated = true, updated_at = now() WHERE id = $1", [runId]);
+
+      if (!queued.length) {
+        // An incremental (nightly) run finding nothing means "nothing changed since last time",
+        // not "this project is empty" — a full run reports the latter as before. A run where
+        // every ticket was skipped (all had bad data) is neither — say so instead of implying an
+        // empty/unchanged project.
+        let emptyNote: string;
+        if (skipped) {
+          emptyNote = `All ${skipped} updated ticket${skipped === 1 ? "" : "s"} in ${remoteLabel} had invalid data and were skipped — see server logs.`;
+        } else if (alreadySynced) {
+          emptyNote = `Every ticket in ${remoteLabel} is already synced.`;
+        } else if (since) {
+          emptyNote = `No changes in ${remoteLabel} since the last sync.`;
+        } else {
+          emptyNote = `No tickets found in ${remoteLabel}.`;
+        }
+        await this.runs.finishRun(runId, emptyNote);
+        return;
+      }
+
+      await this.runs.setStage(runId, "building_documents");
+      await this.runs.enqueueTicketJobs(queued);
+
+      // Both conditions are independent and rare enough that combining them into one message,
+      // rather than writing one then leaving the other to COALESCE itself away, keeps neither one
+      // silently lost. Recorded now (not at finish) so it's visible while the run is still
+      // building documents — finishRun's own COALESCE keeps whatever is written here.
+      const notes: string[] = [];
+      if (truncated) {
+        const syncedSoFar = await this.countSyncedInPass(runId, projectId, provider);
+        notes.push(
+          `Stopped at the ${MAX_TICKETS_PER_RUN}-ticket limit for one sync. ${syncedSoFar} tickets are synced so far; run Sync again to continue with the rest.`
+        );
+      }
+      if (skipped) {
+        notes.push(`${skipped} ticket${skipped === 1 ? "" : "s"} had invalid data and were skipped — see server logs.`);
+      }
+      if (notes.length) {
+        await this.db.query("UPDATE integration_sync_runs SET error = $2, updated_at = now() WHERE id = $1", [runId, notes.join(" ")]);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // IntegrationConnectionInvalidError's message is already the clean, user-facing text
+      // (integration-sync.client.ts) — logged distinctly here so an auth failure is grep-able
+      // separately from any other kind of run failure.
+      this.logger.warn(
+        err instanceof IntegrationConnectionInvalidError
+          ? `Sync run ${runId} could not use its ${provider} connection: ${message}`
+          : err instanceof LinearEntityNotFoundError
+            ? `Sync run ${runId} has a stale Linear mapping: ${message}`
+            : err instanceof NotionNotSharedError || err instanceof NotionPermissionError
+              ? `Sync run ${runId} cannot read its Notion database: ${message}`
+              : `Sync run ${runId} failed: ${message}`
+      );
+      await this.runs.failRun(runId, message);
+      // The worker is where an expired or revoked token is most often discovered, and nothing else
+      // records it from here — so say so, to the person who connected it and the workspace owners.
+      if (err instanceof IntegrationConnectionInvalidError) await this.notifyAuthExpired(organizationId, provider);
+    }
+  }
+
+  /**
+   * "Requirement [ID] has been updated." — a synced ticket's content changed. A synced ticket's
+   * assignee is an external name with no Tesbo user behind it and there are no watchers, so the people
+   * told are the ones who own the *coverage* of it: the owners and creators of the test cases linked
+   * to that ticket. Not the person who pressed Sync (their own action); a nightly run has no such
+   * person. At most once a day per requirement per person, however many syncs touch it.
+   */
+  private async notifyRequirementUpdated(projectId: string, provider: SyncProvider, ticket: RemoteTicket, documentId: string, triggeredBy: string | null): Promise<void> {
+    try {
+      // Column names are fixed here, never caller input. Notion links store the page id.
+      const column = provider === "jira" ? "jira_issue_key" : provider === "linear" ? "linear_issue_key" : "notion_page_id";
+      const key = provider === "notion" ? ticket.issueId : ticket.issueKey;
+      const linked = await this.db.query<{ owner_id: string | null; created_by: string | null }>(
+        `SELECT DISTINCT owner_id, created_by FROM testcases WHERE project_id = $1 AND deleted_at IS NULL AND ${column} = $2`,
+        [projectId, key]
+      );
+      const recipients = linked.rows.flatMap((r) => [r.owner_id, r.created_by]);
+      if (!recipients.length) return;
+      await writeNotifications(this.db, recipients, {
+        type: "requirement_updated",
+        title: notificationMessages.requirementUpdated(ticket.issueKey),
+        link: notificationLinks.requirements(projectId),
+        dedupeKey: `requirement_updated:${documentId}:${new Date().toISOString().slice(0, 10)}`,
+        actorId: triggeredBy,
+        memberOf: { projectId }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Requirement notification failed for ${ticket.issueKey} — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async notifyAuthExpired(organizationId: string, provider: SyncProvider): Promise<void> {
+    try {
+      const people = await this.db.query<{ user_id: string | null }>(
+        `SELECT connected_by AS user_id FROM integration_connections WHERE organization_id = $1 AND provider = $2
+         UNION SELECT user_id FROM organization_members WHERE organization_id = $1 AND role = 'owner'`,
+        [organizationId, provider]
+      );
+      await writeNotifications(this.db, people.rows.map((r) => r.user_id), {
+        type: "integration_auth_expired",
+        title: notificationMessages.integrationAuthExpired(provider),
+        link: notificationLinks.integrations(organizationId),
+        dedupeKey: `integration_auth:${organizationId}:${provider}:${new Date().toISOString().slice(0, 10)}`,
+        memberOf: { organizationId }
+      }, this.logger);
+    } catch (err) {
+      this.logger.warn(`Auth-expired notification failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * The ids in `tickets` that an earlier run of this run's pass (synced at/after its window_start)
+   * already stored in the state Jira/Linear/Notion has now — matched on the upstream updated time, so a
+   * ticket edited after it was synced is not skipped. Empty for the first run of a pass, since nothing
+   * has been synced at/after its own window_start yet.
+   */
+  private async syncedInPass(runId: string, projectId: string, connectionId: string, provider: SyncProvider, tickets: RemoteTicket[]): Promise<Set<string>> {
+    if (!tickets.length) return new Set();
+    const c = TICKET_TABLES[provider];
+    const res = await this.db.query<Row>(
+      `SELECT t.${c.issueIdCol} AS issue_id, t.${c.updatedCol} AS updated_at
+       FROM ${c.table} t
+       JOIN integration_sync_runs r ON r.id = $1
+       WHERE t.project_id = $2 AND t.${c.connectionCol} = $3 AND t.${c.issueIdCol} = ANY($4::text[]) AND t.synced_at >= r.window_start`,
+      [runId, projectId, connectionId, tickets.map((ticket) => ticket.issueId)]
+    );
+    const stored = new Map(res.rows.map((row) => [String(row.issue_id), row.updated_at ? new Date(row.updated_at).getTime() : null]));
+    return new Set(
+      tickets
+        .filter((ticket) => ticket.updatedAt && stored.get(ticket.issueId) === new Date(ticket.updatedAt).getTime())
+        .map((ticket) => ticket.issueId)
+    );
+  }
+
+  private async countSyncedInPass(runId: string, projectId: string, provider: SyncProvider): Promise<number> {
+    const c = TICKET_TABLES[provider];
+    const res = await this.db.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM ${c.table} t JOIN integration_sync_runs r ON r.id = $1
+       WHERE t.project_id = $2 AND t.synced_at >= r.window_start`,
+      [runId, projectId]
+    );
+    return res.rows[0]?.n ?? 0;
+  }
+
+  /**
+   * A Notion page's display key is "<database name> <n>" (e.g. "Notes 1"). An already-synced page keeps
+   * the key it has; a new one takes the next number from its database link's own counter, so numbering
+   * starts at 1 per database and a relink of the same database continues where it left off.
+   */
+  private async notionDisplayKey(projectId: string, connectionId: string, pageId: string, databaseId: string): Promise<string> {
+    const existing = await this.db.query<{ notion_page_key: string }>(
+      "SELECT notion_page_key FROM notion_pages WHERE project_id = $1 AND integration_connection_id = $2 AND notion_page_id = $3",
+      [projectId, connectionId, pageId]
+    );
+    const kept = existing.rows[0]?.notion_page_key;
+    if (kept && !kept.startsWith("notion:")) return kept;
+    const next = await this.db.query<{ name: string | null; n: number }>(
+      `UPDATE notion_project_mappings SET page_counter = page_counter + 1
+       WHERE project_id = $1 AND integration_connection_id = $2 AND notion_database_id = $3
+       RETURNING notion_database_name AS name, page_counter AS n`,
+      [projectId, connectionId, databaseId]
+    );
+    const row = next.rows[0];
+    return row ? `${String(row.name || "").trim() || "Page"} ${row.n}` : notionPageKey(pageId);
+  }
+
+  private async upsertTicket(
+    projectId: string,
+    connectionId: string,
+    provider: SyncProvider,
+    ticket: RemoteTicket,
+    mappedRemoteId: string
+  ): Promise<string> {
+    const c = TICKET_TABLES[provider];
+    // Notion differs in two ways. Its page body is read later, in the per-ticket job, so a re-sync must
+    // not blank the description it already holds (the conflict branch leaves it alone). And it also
+    // stores the rendered properties and the archived flag.
+    const isNotion = provider === "notion";
+    if (isNotion) ticket = { ...ticket, issueKey: await this.notionDisplayKey(projectId, connectionId, ticket.issueId, mappedRemoteId) };
+    const res = await this.db.query<{ id: string }>(
+      `INSERT INTO ${c.table} (
+         project_id, ${c.connectionCol}, ${c.issueIdCol}, ${c.issueKeyCol}, summary, description,
+         issue_type, status, priority, assignee, reporter, labels, ${c.createdCol}, ${c.updatedCol}, ${c.urlCol}, synced_at, mapped_remote_id${isNotion ? ", properties_json, archived" : ""}
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16${isNotion ? ", $17::jsonb, $18" : ""})
+       ON CONFLICT ${c.conflict} DO UPDATE SET
+         ${c.issueKeyCol} = EXCLUDED.${c.issueKeyCol},
+         summary = EXCLUDED.summary,
+         ${isNotion ? "properties_json = EXCLUDED.properties_json, archived = EXCLUDED.archived," : "description = EXCLUDED.description,"}
+         issue_type = EXCLUDED.issue_type,
+         status = EXCLUDED.status,
+         priority = EXCLUDED.priority,
+         assignee = EXCLUDED.assignee,
+         reporter = EXCLUDED.reporter,
+         labels = EXCLUDED.labels,
+         ${c.createdCol} = EXCLUDED.${c.createdCol},
+         ${c.updatedCol} = EXCLUDED.${c.updatedCol},
+         ${c.urlCol} = EXCLUDED.${c.urlCol},
+         synced_at = now(),
+         mapped_remote_id = EXCLUDED.mapped_remote_id
+       RETURNING id`,
+      [
+        projectId,
+        connectionId,
+        ticket.issueId,
+        ticket.issueKey,
+        // summary/description are TEXT (V93) — the provider's raw title is unbounded here. Every
+        // other column below is still a fixed-width varchar, so each gets a defensive cap: none of
+        // these have overflowed yet, but they were exactly as unguarded as summary was before V93.
+        ticket.summary,
+        ticket.description,
+        truncateForColumn(ticket.issueType, 128),
+        truncateForColumn(ticket.status, 128),
+        truncateForColumn(ticket.priority, 64),
+        truncateForColumn(ticket.assignee, 256),
+        truncateForColumn(ticket.reporter, 256),
+        ticket.labels,
+        ticket.createdAt,
+        ticket.updatedAt,
+        truncateForColumn(ticket.url, 1024),
+        mappedRemoteId,
+        ...(isNotion ? [JSON.stringify(ticket.properties || {}), ticket.archived === true] : [])
+      ]
+    );
+    return res.rows[0].id;
+  }
+
+  // ── Per-ticket: comments -> decisions -> Knowledge Base document ──
+
+  private async processTicket(payload: SyncTicketJobPayload): Promise<void> {
+    const { runId, organizationId, projectId, provider, ticketId, issueId, folderId, triggeredBy } = payload;
+    const c = TICKET_TABLES[provider];
+
+    const ticketRes = await this.db.query<Row>(`SELECT * FROM ${c.table} WHERE id = $1 AND project_id = $2`, [ticketId, projectId]);
+    const row = ticketRes.rows[0];
+    if (!row) {
+      // Ticket vanished between fan-out and execution. Count it so the run can still finish.
+      await this.runs.recordTicketResult(runId, { processed: 1 });
+      return;
+    }
+
+    const ticket: RemoteTicket = {
+      issueId: String(row[c.issueIdCol] || issueId),
+      issueKey: String(row[c.issueKeyCol] || ""),
+      summary: String(row.summary || ""),
+      description: String(row.description || ""),
+      issueType: String(row.issue_type || ""),
+      status: String(row.status || ""),
+      priority: String(row.priority || ""),
+      assignee: String(row.assignee || ""),
+      reporter: String(row.reporter || ""),
+      labels: String(row.labels || ""),
+      createdAt: row[c.createdCol] ? new Date(row[c.createdCol]).toISOString() : null,
+      updatedAt: row[c.updatedCol] ? new Date(row[c.updatedCol]).toISOString() : null,
+      url: String(row[c.urlCol] || "")
+    };
+
+    const connection = await this.client.loadConnection(organizationId, provider);
+    if (!connection) throw new Error(`${provider} connection disappeared mid-run`);
+
+    // A Notion page's body is read here, per ticket, with the same tolerance as comments: a failed
+    // read reuses the body already cached on the row rather than failing the ticket or blanking the
+    // mirrored document.
+    if (provider === "notion") ticket.description = await this.notionDescription(connection, c.table, ticketId, ticket.issueId, row);
+
+    // Comment fetch failures are tolerated: a document with a stale (or absent) Comments section
+    // still beats failing the ticket and leaving nothing in the Knowledge Base.
+    let comments: RemoteComment[] = [];
+    let commentsFetched = true;
+    try {
+      comments = await this.client.fetchComments(connection, provider, ticket.issueId);
+    } catch (err) {
+      commentsFetched = false;
+      comments = this.storedComments(row);
+      this.logger.warn(`Comment fetch failed for ${ticket.issueKey}, reusing cached: ${err instanceof Error ? err.message : err}`);
+    }
+
+    const commentsHash = createHash("sha256").update(JSON.stringify(comments)).digest("hex");
+    const commentsChanged = commentsFetched && commentsHash !== String(row.comments_hash || "");
+    if (commentsChanged) {
+      await this.db.query(
+        `UPDATE ${c.table} SET comments_json = $2::jsonb, comments_count = $3, comments_hash = $4 WHERE id = $1`,
+        [ticketId, JSON.stringify(comments), comments.length, commentsHash]
+      );
+    }
+
+    // The summary is keyed to the comment hash that produced it, so an unchanged thread never
+    // pays for a second AI call — the single most expensive step in the pipeline.
+    let decisionSummary: string | null = row.decision_summary ? String(row.decision_summary) : null;
+    let summarized = false;
+    if (!comments.length) {
+      decisionSummary = null;
+    } else if (commentsHash !== String(row.decision_summary_hash || "")) {
+      const allocation = await this.decisions.resolveAllocation(projectId);
+      if (allocation) {
+        decisionSummary = await this.decisions.summarize(allocation, ticket, comments);
+        summarized = true;
+        await this.db.query(`UPDATE ${c.table} SET decision_summary = $2, decision_summary_hash = $3 WHERE id = $1`, [
+          ticketId,
+          decisionSummary,
+          commentsHash
+        ]);
+      }
+    }
+
+    const mirror = this.builder.buildMirror(ticket, comments, decisionSummary);
+
+    // Compare against what's already in the Knowledge Base *before* writing anything: an
+    // unattended nightly sync must never touch a document (bump updated_at, re-embed, log an
+    // event) when nothing the reader can see actually changed. "Updated" is stripped from the
+    // comparison because it's derived from the provider's own updated timestamp, which is by
+    // definition newer on every ticket an incremental fetch returns at all — comparing it as-is
+    // would make every fetched ticket look "changed" even when every other field is identical.
+    const stripVolatileMeta = (text: string) => text.replace(/^- \*\*Updated:\*\*.*$/m, "");
+    const existingDoc = await this.db.query<{ id: string; content_text: string; title: string }>(
+      `SELECT id, content_text, title FROM knowledge_documents
+       WHERE project_id = $1 AND source_provider = $2 AND source_external_id = $3 AND source_role = 'mirror' AND is_deleted = false`,
+      [projectId, provider, ticket.issueId]
+    );
+    const previousDoc = existingDoc.rows[0];
+    const contentChanged =
+      previousDoc?.content_text == null ||
+      stripVolatileMeta(previousDoc.content_text) !== stripVolatileMeta(mirror.markdown) ||
+      previousDoc.title !== mirror.title;
+
+    if (!contentChanged) {
+      await this.runs.recordTicketResult(runId, { processed: 1 });
+      return;
+    }
+
+    // Checked only once we know a write is actually needed — an unattended nightly sync must
+    // never silently fill a workspace's storage with nobody having clicked anything. Skips just
+    // this ticket (tallied as failed, so the run still reaches 100% and settles on 'partial'
+    // rather than hanging) rather than aborting the whole run.
+    const incomingBytes = Buffer.byteLength(mirror.markdown, "utf8") + Buffer.byteLength(mirror.html, "utf8");
+    const storageCheck = await this.planLimits.checkStorageAvailable(organizationId, incomingBytes);
+    if (!storageCheck.allowed) {
+      this.logger.warn(`Storage limit reached for ${ticket.issueKey} in run ${runId}: ${storageCheck.reason}`);
+      await this.db
+        .query("UPDATE integration_sync_runs SET error = COALESCE(error, $2), updated_at = now() WHERE id = $1", [runId, storageCheck.reason])
+        .catch(() => undefined);
+      await this.runs.recordTicketResult(runId, { processed: 1, failed: 1 });
+      return;
+    }
+
+    const upserted = await this.db.query<{ id: string; inserted: boolean }>(
+      `INSERT INTO knowledge_documents (
+         organization_id, project_id, folder_id, title, content_text, content_html, document_type, status,
+         source_provider, source_external_id, source_role, source_url, source_synced_by, source_synced_at, is_read_only
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 'requirement_note', 'published', $7, $8, 'mirror', $9, $10, now(), true)
+       ON CONFLICT (project_id, source_provider, source_external_id, source_role) WHERE source_provider IS NOT NULL AND is_deleted = false
+       DO UPDATE SET
+         title = EXCLUDED.title,
+         content_text = EXCLUDED.content_text,
+         content_html = EXCLUDED.content_html,
+         source_url = EXCLUDED.source_url,
+         source_synced_by = EXCLUDED.source_synced_by,
+         source_synced_at = now(),
+         is_read_only = true,
+         -- Re-parents documents mirrored into "Requirements" before V72 into the provider folder.
+         folder_id = EXCLUDED.folder_id,
+         updated_at = now()
+       RETURNING id, (xmax = 0) AS inserted`,
+      [organizationId, projectId, folderId, mirror.title, mirror.markdown, mirror.html, provider, ticket.issueId, ticket.url, triggeredBy]
+    );
+    // Human input on a synced ticket goes to the document's comment thread
+    // (knowledge_document_comments, V73), not to a sibling document — comments live on the
+    // document being discussed and survive the body being rewritten here.
+    const mirrorDoc = upserted.rows[0];
+
+    if (mirrorDoc?.id) {
+      void this.ragIngestion
+        .enqueueEmbedding({ organizationId, projectId, sourceType: "document", sourceId: mirrorDoc.id, reason: "updated" })
+        .catch(() => undefined);
+      const { summary, fields } = summarizeTextChange(previousDoc?.content_text ?? null, mirror.markdown, "Added from sync.", "Updated from sync.");
+      await this.runs
+        .recordSyncEvent(mirrorDoc.id, runId, mirrorDoc.inserted ? "created" : "updated", provider, summary, fields, triggeredBy)
+        .catch((err) => this.logger.warn(`Failed to record sync event for ${ticket.issueKey}: ${err instanceof Error ? err.message : err}`));
+      // Only a requirement that was already there and has now changed — not the first sync that
+      // brings it in, which would announce every ticket of a project on connection.
+      if (!mirrorDoc.inserted) await this.notifyRequirementUpdated(projectId, provider, ticket, mirrorDoc.id, triggeredBy ?? null);
+    }
+
+    await this.runs.recordTicketResult(runId, {
+      processed: 1,
+      created: mirrorDoc?.inserted ? 1 : 0,
+      updated: mirrorDoc?.inserted ? 0 : 1,
+      comments: comments.length,
+      decisions: summarized && decisionSummary ? 1 : 0
+    });
+  }
+
+  private async notionDescription(connection: Row, table: string, ticketId: string, pageId: string, row: Row): Promise<string> {
+    let body = String(row.description || "");
+    try {
+      body = await this.client.fetchNotionBody(connection, pageId);
+      if (body !== String(row.description || "")) {
+        await this.db.query(`UPDATE ${table} SET description = $2 WHERE id = $1`, [ticketId, body]);
+      }
+    } catch (err) {
+      this.logger.warn(`Body fetch failed for Notion page ${pageId}, reusing cached: ${err instanceof Error ? err.message : err}`);
+    }
+    return IntegrationSyncClient.composeNotionDescription(row.properties_json, body);
+  }
+
+  private storedComments(row: Row): RemoteComment[] {
+    const raw = row.comments_json;
+    if (!raw) return [];
+    const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return Array.isArray(parsed) ? (parsed as RemoteComment[]) : [];
+  }
+
+  @OnWorkerEvent("failed")
+  async onFailed(job: Job | undefined): Promise<void> {
+    if (!job) return;
+    if (job.attemptsMade < (job.opts.attempts || 1)) return;
+
+    const message = String(job.failedReason || "Unknown error").slice(0, 500);
+    if (job.name === INTEGRATION_SYNC_RUN_JOB) {
+      await this.runs.failRun(String((job.data as SyncRunJobPayload).runId), message).catch(() => undefined);
+      return;
+    }
+    if (job.name === INTEGRATION_SYNC_TICKET_JOB) {
+      const data = job.data as SyncTicketJobPayload;
+      this.logger.warn(`Ticket ${data.issueKey} permanently failed in run ${data.runId}: ${message}`);
+      // Counted as failed so the run can reach its total and settle on 'partial' rather than
+      // hanging at 99%.
+      await this.runs.recordTicketResult(data.runId, { failed: 1 }).catch(() => undefined);
+    }
+  }
+}

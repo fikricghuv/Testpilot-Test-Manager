@@ -1,0 +1,617 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { IconBell, IconLogout, IconSearch, IconUserCircle, IconX } from "@tabler/icons-react";
+import type { AppNotification, ProjectSummary } from "@/lib/api";
+import { listNotifications, markAllNotificationsRead, markNotificationRead } from "@/lib/api";
+import { useTopBarSlots } from "@/components/TopBarSlots";
+import { useAppData } from "@/components/app/AppDataProvider";
+import { useLogout } from "@/lib/useLogout";
+import { formatDateTime } from "@/lib/date";
+import ThemeToggle from "@/components/ThemeToggle";
+import { ConfirmModal } from "@/components/ui";
+
+const MAX_RESULTS = 8;
+
+import { avatarColor } from "@/lib/avatarColors";
+
+/**
+ * The only shape a notification's link has ever been written with (ZyraArchiveSweepService.
+ * notifyStagedProjects, legacy.service.ts): `zyra_task_board` + a project id. One sweep run can
+ * stage several test cases' worth of candidates under a single notification (one per project per
+ * run, not one per candidate — see the archive-sweep notification work), so there is no single
+ * task to deep-link to; the project's task board list is the correct, always-valid destination —
+ * every candidate the notification is about renders there (including ones a human has since
+ * approved/rejected: the list has no status filter, so an already-actioned or since-deleted
+ * candidate still resolves to a real row instead of a dead link).
+ *
+ * An unrecognized type, or one missing its id (a malformed/older row), yields null — the caller
+ * renders that notification as plain, non-interactive text rather than a link to nowhere.
+ */
+function resolveNotificationHref(n: AppNotification): string | null {
+  const id = n.link_entity_id;
+  if (!id) return null;
+  // Project-scoped entities are stored as "<projectId>:<entityId>" (one VARCHAR column) — see
+  // notification-events.ts on the backend, which is the only writer of these.
+  const [projectId, entityId] = id.split(":");
+  switch (n.link_entity_type) {
+    case "zyra_task_board":
+      return `/projects/${id}/agents/tasks`;
+    case "workspace_members":
+      return "/settings/members";
+    case "invitation":
+      return `/invite/${id}`;
+    case "projects_list":
+      return "/projects";
+    case "project":
+      return `/projects/${id}`;
+    case "project_members":
+      return `/projects/${id}/members`;
+    case "test_run":
+      return projectId && entityId ? `/projects/${projectId}/cycles/${entityId}` : null;
+    case "test_plan":
+      return projectId && entityId ? `/projects/${projectId}/plans/${entityId}` : null;
+    case "project_integration":
+      // "<projectId>:<provider>" — the provider is one of the three integration pages that exist.
+      return projectId && (entityId === "jira" || entityId === "linear" || entityId === "notion")
+        ? `/projects/${projectId}/settings/integrations/${entityId}`
+        : null;
+    case "knowledge_base":
+      return `/projects/${id}/knowledge-base`;
+    case "integrations_settings":
+      return "/settings/integrations";
+    case "testcase":
+      return projectId && entityId ? `/projects/${projectId}/testcases/${entityId}` : null;
+    case "requirements":
+      return `/projects/${id}/requirements`;
+    case "zyra_chat":
+      return `/projects/${id}/agents/zyra`;
+    case "zyra_task":
+      return projectId && entityId ? `/projects/${projectId}/agents/tasks/${entityId}` : null;
+    case "knowledge_document":
+      return projectId && entityId ? `/projects/${projectId}/knowledge-base/documents/${entityId}` : null;
+    case "bug":
+      return projectId && entityId ? `/projects/${projectId}/bugs/${entityId}` : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The project a notification belongs to, read from the same link the click-through uses: the
+ * project-scoped types store "<projectId>:<entityId>", the page-level ones store the project id
+ * alone. Workspace-level types (members, integrations, projects list, invitations) belong to no
+ * project and yield null.
+ */
+const PROJECT_ID_ONLY_TYPES = new Set(["project", "project_members", "knowledge_base", "requirements", "zyra_chat", "zyra_task_board"]);
+const PROJECT_PREFIXED_TYPES = new Set(["test_run", "test_plan", "project_integration", "testcase", "zyra_task", "knowledge_document", "bug"]);
+function notificationProjectId(n: AppNotification): string | null {
+  const id = n.link_entity_id;
+  if (!id) return null;
+  if (PROJECT_ID_ONLY_TYPES.has(n.link_entity_type ?? "")) return id;
+  if (PROJECT_PREFIXED_TYPES.has(n.link_entity_type ?? "")) return id.split(":")[0] || null;
+  return null;
+}
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "U";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
+}
+
+export default function TopBar() {
+  const router = useRouter();
+  const { currentUser: user, projects } = useAppData();
+  const { bindStart, bindEnd, filled } = useTopBarSlots();
+
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const searchBoxRef = useRef<HTMLLabelElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifItems, setNotifItems] = useState<AppNotification[]>([]);
+  const [notifLoading, setNotifLoading] = useState(false);
+  const [notifError, setNotifError] = useState<string | null>(null);
+  const notifBoxRef = useRef<HTMLDivElement>(null);
+
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+  const { isLoggingOut, error: logoutError, logout: onLogout, resetError: resetLogoutError } = useLogout();
+  // Logout asks first. The menu item only opens this dialog; its Logout button runs useLogout's
+  // flow unchanged. Dismissal (Cancel / Esc / backdrop / close) is ignored mid-request by
+  // ConfirmModal itself, since pulling the dialog out from under an in-flight logout would strand it.
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+  const closeLogoutConfirm = () => {
+    if (isLoggingOut) return;
+    setLogoutConfirmOpen(false);
+    resetLogoutError();
+  };
+
+  // Only used for the tooltip text on the search button — the ⌘K/Ctrl+K shortcut itself works on
+  // every platform regardless. Resolved after mount so SSR and the first client render still match.
+  const [isMac, setIsMac] = useState(false);
+  useEffect(() => {
+    setIsMac(/Mac|iPhone|iPad|iPod/i.test(navigator.userAgent));
+  }, []);
+
+  // ⌘K / Ctrl+K focuses the search box from anywhere, matching the shortcut hint shown in it.
+  useEffect(() => {
+    function handleShortcut(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        inputRef.current?.focus();
+      }
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleOutsideClick(e: MouseEvent) {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    return () => document.removeEventListener("mousedown", handleOutsideClick);
+  }, [open]);
+
+  useEffect(() => {
+    if (!notifOpen) return;
+    function handleOutsideClick(e: MouseEvent) {
+      if (notifBoxRef.current && !notifBoxRef.current.contains(e.target as Node)) setNotifOpen(false);
+    }
+    function handleEscape(e: KeyboardEvent) {
+      if (e.key === "Escape") setNotifOpen(false);
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [notifOpen]);
+
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    function handleOutsideClick(e: MouseEvent) {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) setUserMenuOpen(false);
+    }
+    function handleEscape(e: KeyboardEvent) {
+      if (e.key === "Escape") setUserMenuOpen(false);
+    }
+    document.addEventListener("mousedown", handleOutsideClick);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleOutsideClick);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [userMenuOpen]);
+
+  async function loadNotifications() {
+    setNotifLoading(true);
+    setNotifError(null);
+    try {
+      const items = await listNotifications();
+      setNotifItems(items);
+    } catch (e) {
+      setNotifError(e instanceof Error ? e.message : "Could not load notifications.");
+    } finally {
+      setNotifLoading(false);
+    }
+  }
+
+  // Quiet refresh for the unread badge: no "Loading…" flash and no error UI — the badge simply
+  // stays as it was if the request fails. The dropdown's own fetch (above) still reports errors.
+  async function refreshNotifications() {
+    try {
+      setNotifItems(await listNotifications());
+    } catch {
+      /* badge is best-effort */
+    }
+  }
+
+  useEffect(() => {
+    void refreshNotifications();
+    const onFocus = () => void refreshNotifications();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
+
+  const unreadCount = notifItems.filter((n) => !n.read_at).length;
+
+  /**
+   * Optimistic, like a single click: the badge clears at once. If the request fails the list is
+   * fetched again, so the screen goes back to what the server actually holds rather than showing
+   * everything read when it is not.
+   */
+  function handleMarkAllRead() {
+    const now = new Date().toISOString();
+    setNotifItems((prev) => prev.map((item) => (item.read_at ? item : { ...item, read_at: now })));
+    void markAllNotificationsRead().catch(() => void refreshNotifications());
+  }
+
+  function toggleNotifications() {
+    const opening = !notifOpen;
+    setNotifOpen(opening);
+    if (opening) void loadNotifications();
+  }
+
+  /**
+   * Closing the panel synchronously (before the fire-and-forget read-mark or the navigation) is
+   * what keeps a rapid double click harmless: the item is unmounted on the very next render, so a
+   * second click physically cannot land on it. A second tab (or a retried request) hitting POST
+   * .../read for an already-read row is a no-op there too — markNotificationRead's UPDATE uses
+   * COALESCE(read_at, now()), so it re-affirms the same read_at rather than erroring or racing.
+   *
+   * The read-mark is deliberately fire-and-forget: a failed PATCH must not strand the user on the
+   * dropdown instead of where the notification actually pointed them, and the next time they open
+   * the panel a fresh fetch either shows it read (the call landed) or unread again (it didn't) —
+   * either is fine, neither is a broken state.
+   */
+  function handleNotificationClick(n: AppNotification, href: string) {
+    setNotifOpen(false);
+    if (!n.read_at) {
+      setNotifItems((prev) => prev.map((item) => (item.id === n.id ? { ...item, read_at: new Date().toISOString() } : item)));
+      void markNotificationRead(n.id).catch(() => {});
+    }
+    router.push(href);
+  }
+
+  const results = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return projects
+      .filter((p) => [p.name, p.key, p.description ?? ""].some((field) => field.toLowerCase().includes(q)))
+      .slice(0, MAX_RESULTS);
+  }, [projects, query]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query]);
+
+  function goToProject(p: ProjectSummary) {
+    setOpen(false);
+    setQuery("");
+    router.push(`/projects/${p.id}/dashboard`);
+  }
+
+  function clearQuery() {
+    setQuery("");
+    setOpen(false);
+    inputRef.current?.focus();
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!open || results.length === 0) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.min(i + 1, results.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const chosen = results[activeIndex];
+      if (chosen) goToProject(chosen);
+    } else if (e.key === "Escape") {
+      setOpen(false);
+      inputRef.current?.blur();
+    }
+  }
+
+  const displayName = user?.name || user?.email || "";
+  // Seeded on the user id: a display name can be edited and an email can be changed, either of
+  // which would move someone's colour or collide two people. The id is the one field every other
+  // screen (team avatars, activity, admins) also has and never changes.
+  const avatarSeed = user?.userId || user?.email || user?.name || "";
+
+  return (
+    <header className="sticky top-0 z-20 h-14 shrink-0 border-b border-[var(--border-subtle)] bg-[var(--surface)]">
+      <div className="tesbo-topbar-inset flex h-full items-center gap-4">
+      <div className="flex min-w-0 flex-1 items-center gap-3">
+        {/* Page-provided start slot (e.g. breadcrumb). Fills via a portal from the page. */}
+        <div ref={bindStart} className="flex min-w-0 items-center" />
+        {/* Default global search — only when no page has taken over the top bar. */}
+        {!filled && (
+          <label
+            ref={searchBoxRef}
+            title={isMac ? "Search (⌘K)" : "Search (Ctrl+K)"}
+            className="relative flex h-8 w-[260px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]"
+          >
+            <IconSearch size={14} stroke={1.75} className="shrink-0" />
+            <input
+              ref={inputRef}
+              type="text"
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setOpen(true);
+              }}
+              onFocus={() => setOpen(true)}
+              onKeyDown={handleKeyDown}
+              placeholder="Search projects…"
+              className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
+            />
+            {/*
+             * Only the clear (X) affordance is a real button — clicking anywhere in the label
+             * already focuses the input, so a second magnifying-glass icon-button here just to
+             * refocus was a redundant twin of the decorative one on the left with nothing of its
+             * own to do. The keyboard-shortcut hint that used to live in its title now lives on
+             * the label itself, so it's not lost.
+             */}
+            {query && (
+              <button
+                type="button"
+                aria-label="Clear search"
+                title="Clear search"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={clearQuery}
+                className="flex shrink-0 items-center justify-center rounded-[3px] p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+              >
+                <IconX size={14} stroke={1.75} />
+              </button>
+            )}
+
+            {open && query.trim() && (
+              <div className="absolute left-0 top-full z-40 mt-1 w-full max-w-[360px] rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
+                {results.length === 0 ? (
+                  <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No projects found</p>
+                ) : (
+                  results.map((p, idx) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        goToProject(p);
+                      }}
+                      onMouseEnter={() => setActiveIndex(idx)}
+                      className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[13px] transition-colors ${
+                        idx === activeIndex ? "bg-[var(--surface-secondary)]" : ""
+                      }`}
+                    >
+                      <span className="truncate text-[var(--foreground)]">{p.name}</span>
+                      <span className="shrink-0 font-mono text-[11px] uppercase text-[var(--muted-soft)]">{p.key}</span>
+                    </button>
+                  ))
+                )}
+              </div>
+            )}
+          </label>
+        )}
+      </div>
+      <div className="flex items-center gap-2">
+        {/* Page-provided end slot (e.g. page actions). Fills via a portal from the page. */}
+        <div ref={bindEnd} className="flex items-center gap-2 empty:hidden" />
+        <ThemeToggle />
+        <div ref={notifBoxRef} className="relative">
+          <button
+            type="button"
+            aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
+            aria-haspopup="true"
+            aria-expanded={notifOpen}
+            onClick={toggleNotifications}
+            className="relative flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+          >
+            <IconBell size={16} stroke={1.75} />
+            {unreadCount > 0 && (
+              <span
+                data-testid="notification-badge"
+                className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none bg-[var(--brand-highlight)] text-[var(--brand-highlight-foreground)]"
+              >
+                {unreadCount > 9 ? "9+" : unreadCount}
+              </span>
+            )}
+          </button>
+
+          {notifOpen && (
+            <div
+              role="menu"
+              aria-label="Notifications"
+              // max-h + overflow: up to 50 notifications can come back, far more than fit on screen. Without
+              // a height limit the panel grew past the viewport with nothing to scroll.
+              // No top padding (pb-1, not py-1): a sticky child sticks BELOW its scroller's padding, so a
+              // top padding left a strip above the pinned header that scrolled text showed through.
+              className="absolute right-0 top-full z-40 mt-1 max-h-[min(70vh,520px)] w-[320px] max-w-[calc(100vw-2rem)] overflow-y-auto overscroll-contain rounded-xl border border-[var(--border)] bg-[var(--surface)] pb-1 shadow-[var(--shadow-elevated)]"
+            >
+              {notifLoading ? (
+                <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">Loading…</p>
+              ) : notifError ? (
+                <div className="px-3 py-2">
+                  <p className="text-[13px] text-[var(--error-foreground)]">{notifError}</p>
+                  <button
+                    type="button"
+                    onClick={() => void loadNotifications()}
+                    className="mt-1 text-[13px] font-medium text-[var(--brand-primary)] hover:underline"
+                  >
+                    Try again
+                  </button>
+                </div>
+              ) : notifItems.length === 0 ? (
+                <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
+              ) : (
+                <>
+                  {/* Always present once there is a list, and pinned so it stays in reach however far
+                      the list is scrolled. Greyed out (not removed) when nothing is unread: a control
+                      that vanishes reads as a missing feature. */}
+                  <div className="sticky top-0 z-10 flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3 pb-1.5 pt-1">
+                    <span className="text-[12px] text-[var(--muted-soft)]">{unreadCount > 0 ? `${unreadCount} unread` : "All caught up"}</span>
+                    <button
+                      type="button"
+                      onClick={handleMarkAllRead}
+                      disabled={unreadCount === 0}
+                      className="text-[12px] font-medium text-[var(--brand-primary)] hover:underline disabled:cursor-default disabled:text-[var(--muted-soft)] disabled:no-underline disabled:opacity-60"
+                    >
+                      Mark all as read
+                    </button>
+                  </div>
+                {notifItems.map((n) => {
+                  const href = resolveNotificationHref(n);
+                  // Which project it came from, so two projects raising similar notifications can be
+                  // told apart. A project the user can no longer see simply shows no label.
+                  const notifProjectId = notificationProjectId(n);
+                  const notifProject = notifProjectId ? projects.find((p) => p.id === notifProjectId) : undefined;
+                  const body = (
+                    <>
+                      <p className="font-medium text-[var(--foreground)]">{n.title}</p>
+                      {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
+                      {/* When it happened — through lib/date like every other timestamp in the app. */}
+                      <p className="mt-1 flex items-center gap-1.5 text-[11px] text-[var(--muted-soft)]">
+                        <time dateTime={n.created_at}>{formatDateTime(n.created_at)}</time>
+                        {notifProject && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span
+                              data-testid="notification-project"
+                              title={notifProject.name}
+                              className="max-w-[120px] truncate rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-medium text-[var(--muted)]"
+                            >
+                              {notifProject.key}
+                            </span>
+                          </>
+                        )}
+                      </p>
+                    </>
+                  );
+                  // No resolvable link (an unrecognized type, or an older/malformed row missing
+                  // its link id) — plain, non-interactive text, same as before this change.
+                  if (!href) {
+                    return (
+                      <div key={n.id} role="menuitem" className="px-3 py-2 text-left text-[13px]">
+                        {body}
+                      </div>
+                    );
+                  }
+                  return (
+                    <button
+                      key={n.id}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => handleNotificationClick(n, href)}
+                      className="flex w-full items-start gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-[var(--surface-secondary)]"
+                    >
+                      {!n.read_at && (
+                        <span
+                          aria-hidden="true"
+                          className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                          style={{ background: "var(--brand-primary)" }}
+                        />
+                      )}
+                      <span className="min-w-0 flex-1">{body}</span>
+                    </button>
+                  );
+                })}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        <div ref={userMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setUserMenuOpen((o) => !o)}
+            title={displayName || undefined}
+            aria-label="User menu"
+            aria-haspopup="true"
+            aria-expanded={userMenuOpen}
+            className="shrink-0 rounded-full"
+          >
+            <span
+              /*
+               * Seeded from the identity, not a flat brand fill.
+               *
+               * Basecamp 10198836413 — "Display picture initials show different colours across the
+               * website". One person's initials were painted five different ways: the seeded palette on
+               * cycles and plan cards, a flat --cta-primary here and in the workspace switcher, a flat
+               * --brand-soft in knowledge base comments, and a flat --surface-tertiary in Manage Admins.
+               * avatarColor() is the single source, and every swatch in it clears 4.5:1 under white text.
+               */
+              className="grid h-[30px] w-[30px] place-items-center rounded-full text-[11px] font-semibold text-white"
+              style={{ backgroundColor: avatarColor(avatarSeed || "?") }}
+            >
+              {displayName ? getInitials(displayName) : ""}
+            </span>
+          </button>
+
+          {userMenuOpen && (
+            <div
+              role="menu"
+              aria-label="User menu"
+              /*
+               * p-1 (not py-1 + item-level px-3): every item's hover/focus highlight is now inset by
+               * exactly this padding on all four sides, so it reads as a clean rounded chip with no
+               * sliver of uncovered background left between it and the menu's own edge or the divider
+               * above/below — the gap the previous py-1-only version left uncovered on hover.
+               */
+              /*
+               * fade-in (globals.css) is the app's existing subtle-entrance utility, already used by
+               * the reports tabs — reused here rather than a new animation, so opening the menu isn't
+               * an instant hard cut. No exit animation: the menu unmounts immediately on close so
+               * Playwright's/AT's visibility checks (and every e2e assertion keyed on that) still see
+               * a true, instant hide rather than a lingering fading-out element.
+               */
+              className="fade-in absolute right-0 top-full z-40 mt-1.5 w-60 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-elevated)]"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  router.push("/account");
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+              >
+                <IconUserCircle size={16} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
+                My Account
+              </button>
+
+              <div role="none" className="my-1 border-t border-[var(--border-subtle)]" />
+
+              <button
+                type="button"
+                role="menuitem"
+                /*
+                 * Opens the logout confirmation rather than logging out directly — the menu closes so
+                 * the dialog stands alone; a failed logout is reported inside that dialog, which stays
+                 * open with Logout enabled to retry.
+                 *
+                 * Styled as a destructive action throughout — red label at rest (text-[var(--error-
+                 * foreground)]) AND a red-tinted hover (bg-[var(--error-soft)] instead of the neutral
+                 * hover every other item uses) — the same convention as Button's own "danger" variant,
+                 * so Logout reads unmistakably differently from "My Account" in every state.
+                 */
+                onClick={() => {
+                  setUserMenuOpen(false);
+                  resetLogoutError();
+                  setLogoutConfirmOpen(true);
+                }}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)]"
+              >
+                <IconLogout size={16} stroke={1.75} className="shrink-0" />
+                Logout
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      </div>
+      <ConfirmModal
+        open={logoutConfirmOpen}
+        title="Log out"
+        message="Are you sure you want to log out?"
+        confirmLabel="Logout"
+        cancelLabel="Cancel"
+        confirmVariant="destructive"
+        loading={isLoggingOut}
+        loadingLabel="Logging out…"
+        error={logoutError}
+        onConfirm={() => void onLogout()}
+        onCancel={closeLogoutConfirm}
+      />
+    </header>
+  );
+}

@@ -1,0 +1,2647 @@
+import { expect, test, type APIRequestContext, type Browser, type BrowserContext, type Locator, type Page } from "@playwright/test";
+import { exec, literal, scalar } from "../utils/psql";
+import {
+  loginAs,
+  provisionRbacTenant,
+  rbacSuiteSkipReason,
+  writeStorageState,
+  type RbacTenant,
+} from "../utils/rbac-tenant";
+
+/*
+ * The knowledge base screens: the browser at /projects/:id/knowledge-base and the document editor
+ * at /knowledge-base/documents/:documentId.
+ *
+ * What earns a browser here, over the 107 API tests in knowledge-base/kb-files/kb-comments: the API
+ * decides what is *allowed*, the screen decides what is *offered* and what it does with a refusal.
+ * Three things only a browser sees —
+ *
+ *   1. The page has NO role gate. Unlike the custom fields settings screen (which derives canManage
+ *      from project membership), this one renders every control for everybody and lets the API say
+ *      no. So "what does a qa_engineer see, and what happens when they click it" is a real question
+ *      with a real answer, and KBU-20/21 pin it.
+ *   2. Delete goes through window.confirm(), a native dialog Playwright must be told to handle.
+ *      Cancelling it must leave the row alone — a bug that would look identical to a working delete
+ *      in any API test.
+ *   3. There is no trash UI at all. Delete moves items to trash and the restore endpoints exist and
+ *      are owner-or-manager gated, but nothing in the app can reach them. KBU-24 pins that gap so it
+ *      stays a deliberate product decision rather than something nobody noticed.
+ *
+ * Runs against its own disposable workspace ("kb-ui"). Every test starts from an empty knowledge
+ * base — the summary counters are absolute numbers, so one leftover folder turns a correct product
+ * into a red test in whichever spec happens to run first.
+ *
+ * Locator notes, all three learned the hard way against the real DOM:
+ *
+ *   - `Modal` (components/ui/Modal.tsx) renders `role="presentation"`, NOT `role="dialog"`, through a
+ *     portal, with its title as an `h2`. `modal()` below scopes to it by that heading.
+ *   - `FieldLabel` is a bare `<label>` with no `htmlFor`, so getByLabel() resolves nothing anywhere
+ *     on this screen. Inputs are located by placeholder instead.
+ *   - The content panel used to render "Knowledge base" a second time as an `h2`, identical to the
+ *     page's own `h1` (see KBU-47) — fixed, but heading lookups here still pass an explicit level
+ *     rather than relying on there being only one match by name.
+ */
+
+test.describe("knowledge base (UI)", () => {
+  let tenant: RbacTenant | null = null;
+  let api: APIRequestContext;
+  let rootFolderId = "";
+  const states = new Map<string, string>();
+  const contexts: BrowserContext[] = [];
+
+  test.beforeAll(async () => {
+    tenant = await provisionRbacTenant("kb-ui");
+    if (!tenant) return;
+    api = await loginAs(tenant.owner);
+    states.set("owner", await writeStorageState(tenant.owner, "kb-ui-owner"));
+    states.set("qa", await writeStorageState(tenant.qa, "kb-ui-qa"));
+    states.set("guest", await writeStorageState(tenant.guest, "kb-ui-guest"));
+
+    purgeKb(tenant);
+    const tree = await api.get(kbUrl("/folders/tree"));
+    expect(tree.status(), `resolving the KB root folder — ${await tree.text()}`).toBe(200);
+    rootFolderId = (await tree.json()).id;
+  });
+
+  test.afterAll(async () => {
+    if (tenant) purgeKb(tenant);
+    if (api) await api.dispose();
+    await Promise.all(contexts.map((ctx) => ctx.close()));
+  });
+
+  test.beforeEach(() => {
+    const reason = rbacSuiteSkipReason(tenant);
+    test.skip(reason !== null, reason ?? "");
+  });
+
+  test.afterEach(() => {
+    if (tenant) purgeKb(tenant);
+  });
+
+  // ─── Helpers ───────────────────────────────────────────────────────────────
+
+  function kbUrl(suffix: string, projectId?: string): string {
+    return `/api/projects/${projectId ?? tenant!.mainProjectId}/knowledge-base${suffix}`;
+  }
+
+  function purgeKb(t: RbacTenant): void {
+    const projects = `${literal(t.mainProjectId)}, ${literal(t.secondProjectId)}`;
+    exec(
+      `DELETE FROM knowledge_document_versions WHERE document_id IN (SELECT id FROM knowledge_documents WHERE project_id IN (${projects}));`,
+    );
+    exec(`DELETE FROM knowledge_document_comments WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_documents WHERE project_id IN (${projects});`);
+    exec(`DELETE FROM knowledge_files WHERE project_id IN (${projects});`);
+    // The root is kept: `is_root` rows are only ever written by project creation, so deleting one
+    // makes the whole knowledge base unreachable for the rest of the run.
+    exec(`DELETE FROM knowledge_folders WHERE project_id IN (${projects}) AND is_root = false;`);
+  }
+
+  /** Stamped so a re-run against the persistent volume can't collide on the unique name index. */
+  function stamp(label: string): string {
+    return `E2E ${label} ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  }
+
+  async function openKb(browser: Browser, as: "owner" | "qa" | "guest" = "owner"): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: states.get(as) });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base`);
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    return page;
+  }
+
+  /** The panel of an open Modal, scoped by its `h2` title — there is no role="dialog" to use. */
+  function modal(page: Page, title: string): Locator {
+    return page
+      .locator('div[role="presentation"]')
+      .filter({ has: page.getByRole("heading", { name: title, level: 2 }) })
+      .last();
+  }
+
+  /** The item table's row for a named folder/document/file. */
+  function row(page: Page, name: string): Locator {
+    return page.getByRole("row").filter({ hasText: name });
+  }
+
+  /** The row-action (⋯) trigger. The Actions cell nests a button inside a button. */
+  function rowMenu(page: Page, name: string): Locator {
+    return row(page, name).getByRole("cell").last().getByRole("button").first();
+  }
+
+  /**
+   * The open dropdown's panel.
+   *
+   * Menu (components/knowledge-base/Menu.tsx) portals to document.body and positions itself with an
+   * INLINE `position: fixed` so it is never clipped by the table's overflow wrapper. Modal portals
+   * to body too, but positions itself with a class — so the inline style is what tells the two
+   * apart, and scoping to it is what stops a menu item from colliding with an identically-named
+   * button elsewhere ("Create folder" is a MenuItem, the empty state's call to action, AND the
+   * create modal's submit button).
+   */
+  function menuPanel(page: Page): Locator {
+    return page.locator('body > div[style*="position: fixed"]');
+  }
+
+  /** Opens the "New" menu and picks one of its three entries. */
+  async function newMenu(page: Page, item: "Create folder" | "Create document" | "Upload file") {
+    // The trigger nests a button inside a button, so the name matches twice.
+    await page.getByRole("button", { name: "New", exact: true }).first().click();
+    await menuPanel(page).getByRole("button", { name: item, exact: true }).click();
+  }
+
+  /**
+   * The folder tree's own row, by its visible name — distinct from the item table's `row()`.
+   * Rename and Move are only offered from this row's ⋯ menu (components/knowledge-base/FolderTree.tsx),
+   * not from the table.
+   */
+  function treeRow(page: Page, name: string): Locator {
+    return page.locator('div[role="button"]').filter({ hasText: name }).first();
+  }
+
+  /** Opens a tree row's ⋯ menu and picks one of its entries. */
+  async function openTreeMenu(page: Page, folderName: string, action: "Create subfolder" | "Rename" | "Move" | "Delete") {
+    // `.last()` because a folder with children also renders a leading expand/collapse chevron
+    // button — the ⋯ trigger (with its IconDots svg) is always the last real <button> in the row.
+    await treeRow(page, folderName).locator("button:has(svg)").last().click();
+    await menuPanel(page).getByRole("button", { name: action, exact: true }).click();
+  }
+
+  /**
+   * The floating error toast (fixed + high z-index so it stacks above an open Modal, which portals
+   * its own overlay at z-50 — see the `error` state's render in page.tsx). Scoped away from a
+   * modal's own inline FieldError, which shares the same `role="alert"` but renders inside the
+   * dialog panel instead.
+   */
+  function errorToast(page: Page): Locator {
+    return page.locator(".fixed.bottom-5.right-5[role=\"alert\"]");
+  }
+
+  async function createFolder(page: Page, name: string) {
+    await newMenu(page, "Create folder");
+    const dialog = modal(page, "Create folder");
+    await dialog.getByPlaceholder("e.g. Payment Module").fill(name);
+    await dialog.getByRole("button", { name: "Create folder" }).click();
+  }
+
+  function folderCount(): number {
+    return Number(
+      scalar(
+        `SELECT COUNT(*) FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_root = false AND is_deleted = false;`,
+      ),
+    );
+  }
+
+  function documentCount(): number {
+    return Number(
+      scalar(
+        `SELECT COUNT(*) FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND is_deleted = false;`,
+      ),
+    );
+  }
+
+  /**
+   * A mirrored (Jira/Linear) document exactly as a real sync would leave it — seeded directly since
+   * producing one for real means a live Jira/Linear call, which this suite cannot make (see
+   * api/integrations.spec.ts's file-level note). `createdAt`/`updatedAt` are given explicit,
+   * distinct values so "Added on" and "Last updated" can be told apart in the rendered table instead
+   * of both coincidentally reading "Today".
+   */
+  function seedMirrorDocument(
+    title: string,
+    externalId: string,
+    createdDaysAgo: number,
+    updatedDaysAgo: number,
+    provider: "jira" | "linear" = "jira",
+  ): string {
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, " +
+        "document_type, status, source_provider, source_external_id, source_role, is_read_only, created_at, updated_at) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(title)}, ` +
+        `'seeded by the e2e suite', '<p>seeded by the e2e suite</p>', 'requirement_note', 'published', ${literal(provider)}, ` +
+        `${literal(externalId)}, 'mirror', true, now() - interval '${createdDaysAgo} days', now() - interval '${updatedDaysAgo} days');`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND source_external_id = ${literal(externalId)} AND source_role = 'mirror';`,
+    );
+  }
+
+  function seedSyncEvent(
+    documentId: string,
+    eventType: "created" | "updated",
+    changedSummary: string | null,
+    provider: "jira" | "linear" = "jira",
+    changedFields?: Array<{ label: string; oldExcerpt: string; newExcerpt: string; oldLength: number; newLength: number; truncated: boolean }>,
+  ): void {
+    exec(
+      "INSERT INTO knowledge_document_sync_events (document_id, provider, event_type, changed_summary, changed_fields) VALUES (" +
+        `${literal(documentId)}, ${literal(provider)}, ${literal(eventType)}, ${changedSummary === null ? "NULL" : literal(changedSummary)}, ` +
+        `${changedFields ? `${literal(JSON.stringify(changedFields))}::jsonb` : "NULL"});`,
+    );
+  }
+
+  /** The row's info-icon trigger (Update History) — every document row has one now, synced or not
+   *  (see KBU-35); a folder/file row never does. */
+  function changeHistoryTrigger(page: Page, name: string): Locator {
+    return row(page, name).getByRole("button", { name: "Update History" });
+  }
+
+  // ─── The primary flow ──────────────────────────────────────────────────────
+
+  test("KBU-01 a folder is created from the New menu and appears in the table and the tree", { tag: '@tesbo.testId("TES-TC-1000")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const name = stamp("Folder");
+
+    await createFolder(page, name);
+
+    // User-visible outcome first...
+    await expect(row(page, name)).toBeVisible();
+    // ...then the persisted state, which is what the next page load will read.
+    expect(folderCount()).toBe(1);
+
+    // And the tree in the left sidebar, which is a separate render from the table.
+    await expect(page.getByRole("button", { name, exact: true }).first()).toBeVisible();
+  });
+
+  /*
+   * "[Knowledge Base] Remove Duplicate 'Knowledge Base' Label". The content panel repeated the
+   * page's own name a second time right below it: its breadcrumb line rendered kbBreadcrumb's
+   * result verbatim (which always includes the folder itself, so at root that's a single crumb
+   * reading "Knowledge base"), directly above an h2 that — at root — is also forced to read
+   * "Knowledge base" (see setFolderName in page.tsx). Both the one-crumb breadcrumb and the
+   * redundant second heading are now shown only once there's an actual subfolder to name; at root,
+   * the page's own h1 is the only "Knowledge base" text in that area.
+   */
+  test("KBU-47 the root folder's own name is not repeated a second time as a redundant sub-heading", async ({ browser }) => {
+    const page = await openKb(browser);
+
+    // At root: only the page's own h1 says "Knowledge base" — no second, content-panel heading
+    // repeating it, and no one-crumb breadcrumb line where that heading used to sit.
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 2 })).toHaveCount(0);
+
+    // Inside a real subfolder, both ARE useful — the breadcrumb shows the parent chain, and the
+    // heading names the folder actually being viewed, distinct from the page's own h1. This guards
+    // against overcorrecting into hiding them everywhere.
+    const name = stamp("BreadcrumbFolder");
+    await createFolder(page, name);
+    await row(page, name).getByText(name, { exact: true }).click();
+
+    const subfolderHeading = page.getByRole("heading", { name, level: 2 });
+    await expect(subfolderHeading).toBeVisible();
+    const subfolderBlock = subfolderHeading.locator("xpath=..");
+    const breadcrumbLine = subfolderBlock.locator(":scope > div").first();
+    expect(await subfolderBlock.evaluate((el) => el.firstElementChild?.tagName)).toBe("DIV");
+    await expect(breadcrumbLine).toContainText("Knowledge base");
+    await expect(breadcrumbLine).toContainText(name);
+  });
+
+  test("KBU-02 a document created from a template is stored with the template's body", { tag: '@tesbo.testId("TES-TC-1001")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const title = stamp("Doc");
+
+    await newMenu(page, "Create document");
+    const dialog = modal(page, "Create document");
+    await dialog.getByPlaceholder("e.g. Login Requirements").fill(title);
+    // "Test Plan" is one of the six DOCUMENT_TEMPLATES. A template is the difference between a
+    // document with real contentHtml and an empty one, and contentText is what search reads.
+    await dialog.getByRole("button", { name: /Test Plan/ }).click();
+    await dialog.getByRole("button", { name: "Create document" }).click();
+
+    // Creating a document does not drop you back on the table — it opens the new document straight
+    // away, which is the point of picking a template. Assert where the user actually lands.
+    await expect(page).toHaveURL(/\/knowledge-base\/documents\/[0-9a-f-]{36}$/);
+    // The title is an editable field on this screen, not a heading.
+    await expect(page.getByPlaceholder("Untitled document")).toHaveValue(title);
+    // The template's headings are in the editor, not left for the user to type.
+    await expect(page.locator(".ProseMirror").first()).toContainText("Test Strategy");
+
+    expect(documentCount()).toBe(1);
+
+    // And it is in the table once you go back.
+    await page.getByRole("link", { name: /Back to Knowledge base/ }).click();
+    await expect(row(page, title)).toBeVisible();
+
+    const body = scalar(
+      `SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(title)};`,
+    );
+    expect(body.trim(), "a templated document is created with its body already filled in").not.toBe("");
+  });
+
+  test("KBU-03 a document is opened, edited, saved, and the change survives a reload", { tag: '@tesbo.testId("TES-TC-1002")' }, async ({ browser }) => {
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: stamp("Editable"), folderId: rootFolderId, documentType: "general" },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor).toBeVisible();
+
+    const sentence = `Edited by KBU-03 at ${Date.now()}`;
+    await editor.click();
+    await page.keyboard.type(sentence);
+    await page.getByRole("button", { name: "Save" }).click();
+
+    // Assert on what was persisted, not on the toast: the save is only real if a reload shows it.
+    await expect
+      .poll(
+        () => scalar(`SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+        { message: "the edit reaches the stored document" },
+      )
+      .toContain(sentence);
+
+    await page.reload();
+    await expect(page.locator(".ProseMirror").first()).toContainText(sentence);
+  });
+
+  test("KBU-04 an uploaded file appears in the table and is counted in the summary", { tag: '@tesbo.testId("TES-TC-1003")' }, async ({ browser }) => {
+    const page = await openKb(browser);
+    const fileName = `kbu-04-${Date.now()}.txt`;
+
+    await newMenu(page, "Upload file");
+    const dialog = modal(page, "Upload files");
+    // The real input is hidden behind a drop zone; setInputFiles drives it directly.
+    await dialog.locator('input[type="file"]').setInputFiles({
+      name: fileName,
+      mimeType: "text/plain",
+      buffer: Buffer.from("KBU-04 upload fixture"),
+    });
+    await dialog.getByRole("button", { name: /Upload/ }).click();
+
+    await expect(row(page, fileName)).toBeVisible();
+
+    const summary = await (await api.get(kbUrl("/summary"))).json();
+    expect(summary.files, "the summary counts the uploaded file").toBe(1);
+  });
+
+  // ─── Validation ────────────────────────────────────────────────────────────
+
+  test("KBU-05 the create button stays disabled for an empty or whitespace-only folder name", { tag: '@tesbo.testId("TES-TC-1004")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    await newMenu(page, "Create folder");
+    const dialog = modal(page, "Create folder");
+    const submit = dialog.getByRole("button", { name: "Create folder" });
+    const input = dialog.getByPlaceholder("e.g. Payment Module");
+
+    // The screen's validation here is a disabled control, not an error message — `disabled={!name
+    // .trim()}`. Whitespace has to be treated as empty, which is the half a length check misses.
+    await expect(submit, "nothing typed yet").toBeDisabled();
+    await input.fill("   ");
+    await expect(submit, "whitespace is not a name").toBeDisabled();
+    await input.fill("real");
+    await expect(submit).toBeEnabled();
+
+    await page.keyboard.press("Escape");
+    expect(folderCount(), "no folder was created while proving the control is gated").toBe(0);
+  });
+
+  test("KBU-06 two folders cannot share a name under the same parent, but can under different ones", async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const shared = stamp("Shared");
+
+    await createFolder(page, shared);
+    await expect(row(page, shared)).toBeVisible();
+
+    // Same name, same parent — the API refuses, and no second row may appear. The refusal names
+    // the exact field just submitted, so it must land inline next to "Folder name" in the dialog
+    // that is still open — not as the page-level toast, which the dialog's own overlay would hide
+    // from view while it's up.
+    await createFolder(page, shared);
+    const dialog = modal(page, "Create folder");
+    await expect(dialog, "the dialog stays open so the inline error is visible").toBeVisible();
+    await expect(dialog.getByText(/a folder with this name already exists/i)).toBeVisible();
+    await expect(errorToast(page), "a field-specific error must not also surface as a toast").toHaveCount(0);
+    await expect
+      .poll(() => folderCount(), { message: "a duplicate name under the same parent is refused" })
+      .toBe(1);
+    await page.keyboard.press("Escape");
+
+    // The same name under a different parent is legitimate.
+    const other = await api.post(kbUrl("/folders"), {
+      data: { name: stamp("Other"), parentFolderId: rootFolderId },
+    });
+    const otherId = (await other.json()).id;
+    const nested = await api.post(kbUrl("/folders"), { data: { name: shared, parentFolderId: otherId } });
+    expect(nested.status(), "the same name under a different parent is allowed").toBe(201);
+  });
+
+  test("KBU-07 the create button stays disabled for an empty or whitespace-only document title", { tag: '@tesbo.testId("TES-TC-1005")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    await newMenu(page, "Create document");
+    const dialog = modal(page, "Create document");
+    const submit = dialog.getByRole("button", { name: "Create document" });
+    const input = dialog.getByPlaceholder("e.g. Login Requirements");
+
+    await expect(submit).toBeDisabled();
+    await input.fill("   ");
+    await expect(submit, "whitespace is not a title").toBeDisabled();
+
+    await page.keyboard.press("Escape");
+    expect(documentCount()).toBe(0);
+  });
+
+  // ─── Delete, and the native confirm ────────────────────────────────────────
+
+  test("KBU-08 cancelling the delete confirmation leaves the item alone", { tag: '@tesbo.testId("TES-TC-1006")' }, async ({ browser }) => {
+    const page = await openKb(browser);
+    const name = stamp("Keep");
+    await createFolder(page, name);
+    await expect(row(page, name)).toBeVisible();
+
+    // Delete goes through window.confirm(). Playwright auto-dismisses dialogs by default, but the
+    // dismissal is the behaviour under test, so it is handled explicitly and its text asserted.
+    let message = "";
+    page.once("dialog", (dialog) => {
+      message = dialog.message();
+      void dialog.dismiss();
+    });
+
+    await rowMenu(page, name).click();
+    await menuPanel(page).getByRole("button", { name: "Delete", exact: true }).click();
+
+    // Polled, not read straight after the click: confirmFolderDelete asks the API what is in the
+    // folder before it can word the message, so the dialog fires a round trip later.
+    await expect
+      .poll(() => message, { message: "the user is told where the item goes" })
+      .toContain("trash");
+    await expect(row(page, name)).toBeVisible();
+    expect(folderCount(), "dismissing the confirm must not delete anything").toBe(1);
+  });
+
+  test("KBU-09 accepting the confirmation soft-deletes the item and drops it from the table", { tag: '@tesbo.testId("TES-TC-1007")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const name = stamp("Doomed");
+    await createFolder(page, name);
+    await expect(row(page, name)).toBeVisible();
+
+    page.once("dialog", (dialog) => void dialog.accept());
+    await rowMenu(page, name).click();
+    await menuPanel(page).getByRole("button", { name: "Delete", exact: true }).click();
+
+    await expect(row(page, name)).toHaveCount(0);
+
+    // Soft delete, not a hard one: the row survives with is_deleted set, which is what makes the
+    // (UI-less) restore endpoint in KBU-24 meaningful.
+    await expect
+      .poll(
+        () =>
+          scalar(
+            `SELECT COALESCE(is_deleted::text, '') FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(name)};`,
+          ),
+        { message: "delete is a soft delete" },
+      )
+      .toBe("true");
+  });
+
+  /*
+   * The delete confirmation has to describe what will happen to THIS folder.
+   *
+   * Both halves of this were product bugs, in opposite directions. The folder tree claimed "this
+   * folder contains documents/files" unconditionally, so an empty folder warned about contents that
+   * did not exist; and the table's row menu never mentioned contents at all, so deleting a full
+   * folder gave no hint that everything inside went with it. Two tests, because a fix that only
+   * addresses one direction is still wrong.
+   */
+  test("KBU-10 deleting a folder with contents warns that the contents go too", { tag: '@tesbo.testId("TES-TC-1008")' }, async ({ browser }) => {
+    const parent = stamp("Parent");
+    const folder = await api.post(kbUrl("/folders"), { data: { name: parent, parentFolderId: rootFolderId } });
+    const parentId = (await folder.json()).id;
+    await api.post(kbUrl("/documents"), {
+      data: { title: stamp("Child"), folderId: parentId, documentType: "general" },
+    });
+
+    const page = await openKb(browser);
+
+    let message = "";
+    page.once("dialog", (dialog) => {
+      message = dialog.message();
+      void dialog.dismiss();
+    });
+
+    await rowMenu(page, parent).click();
+    await menuPanel(page).getByRole("button", { name: "Delete", exact: true }).click();
+
+    await expect
+      .poll(() => message, { message: "the confirm fires and names the consequence" })
+      .toContain("contents");
+  });
+
+  test("KBU-10b deleting an EMPTY folder from the tree does not claim it has contents", { tag: '@tesbo.testId("TES-TC-1009")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const empty = stamp("Empty");
+    await createFolder(page, empty);
+    await expect(row(page, empty)).toBeVisible();
+
+    let message = "";
+    page.once("dialog", (dialog) => {
+      message = dialog.message();
+      void dialog.dismiss();
+    });
+
+    // Driven through the FOLDER TREE, not the row menu — deliberately. This is the path that used to
+    // assert "This folder contains documents/files" unconditionally, so an empty folder was warned
+    // about contents it did not have. Running it through the row menu instead would pass even
+    // against the unfixed build and prove nothing.
+    const folderTree = page.getByRole("complementary").filter({ hasText: "Folders" });
+    const node = folderTree.getByRole("button", { name: empty, exact: true });
+    await node.getByRole("button").first().click();
+    await menuPanel(page).getByRole("button", { name: "Delete", exact: true }).click();
+
+    await expect.poll(() => message, { message: "the confirm fires" }).not.toBe("");
+    expect(message, "an empty folder must not be described as having contents").not.toContain("contents");
+  });
+
+  // ─── Browsing: filter, search, empty states ────────────────────────────────
+
+  test("KBU-11 an empty knowledge base renders its zero counts rather than an error", { tag: '@tesbo.testId("TES-TC-1010")' }, async ({ browser }) => {
+    const page = await openKb(browser);
+
+    // A fresh project has the root folder and nothing in it. The header states that in words —
+    // and the count excludes the root, so an empty knowledge base reads "0 folders", not "1".
+    await expect(page.getByText("0 items across 0 folders")).toBeVisible();
+    await expect(page.locator("body")).not.toContainText("Something went wrong");
+
+    const summary = await (await api.get(kbUrl("/summary"))).json();
+    expect(summary.documents).toBe(0);
+    expect(summary.files).toBe(0);
+  });
+
+  test("KBU-12 the type filter narrows the table to folders or documents", { tag: '@tesbo.testId("TES-TC-1011")' }, async ({ browser }) => {
+    const folderName = stamp("FilterFolder");
+    const docTitle = stamp("FilterDoc");
+    await api.post(kbUrl("/folders"), { data: { name: folderName, parentFolderId: rootFolderId } });
+    await api.post(kbUrl("/documents"), {
+      data: { title: docTitle, folderId: rootFolderId, documentType: "general" },
+    });
+
+    const page = await openKb(browser);
+    await expect(row(page, folderName)).toBeVisible();
+    await expect(row(page, docTitle)).toBeVisible();
+
+    // Two comboboxes sit side by side — type filter first, sort second.
+    const typeFilter = page.getByRole("combobox").first();
+
+    await typeFilter.selectOption({ label: "Folder" });
+    await expect(row(page, folderName)).toBeVisible();
+    await expect(row(page, docTitle), "a document is not a folder").toHaveCount(0);
+
+    await typeFilter.selectOption({ label: "Document" });
+    await expect(row(page, docTitle)).toBeVisible();
+    await expect(row(page, folderName)).toHaveCount(0);
+
+    await typeFilter.selectOption({ label: "All types" });
+    await expect(row(page, folderName)).toBeVisible();
+    await expect(row(page, docTitle)).toBeVisible();
+  });
+
+  test("KBU-13 search matches a document's body, not only its title", { tag: '@tesbo.testId("TES-TC-1012")' }, async ({ browser }) => {
+    const title = stamp("Findable");
+    const needle = `kbu13needle${Date.now()}`;
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general" },
+    });
+    const documentId = (await created.json()).id;
+    await api.put(kbUrl(`/documents/${documentId}`), {
+      data: { contentText: `A body containing ${needle}`, contentHtml: `<p>A body containing ${needle}</p>` },
+    });
+
+    // A second document that cannot match, so the assertion proves FILTERING and not merely that a
+    // freshly created document is somewhere in the list.
+    const decoyTitle = stamp("Unfindable");
+    await api.post(kbUrl("/documents"), {
+      data: { title: decoyTitle, folderId: rootFolderId, documentType: "general" },
+    });
+
+    const page = await openKb(browser);
+    await expect(row(page, title)).toBeVisible();
+    await expect(row(page, decoyTitle)).toBeVisible();
+
+    // Enter, not fill() alone: this screen's search is a FORM, and searchQuery — the only state the
+    // results read — is set in onSubmit. Typing without submitting leaves the unfiltered list on
+    // screen, so an assertion that the document is visible would pass without searching at all.
+    await page.getByPlaceholder("Search knowledge base…").fill(needle);
+    await page.getByPlaceholder("Search knowledge base…").press("Enter");
+
+    // The title does not contain the needle, so a hit proves the body was searched.
+    await expect(row(page, title)).toBeVisible();
+    await expect(row(page, decoyTitle), "a non-matching document must drop out").toHaveCount(0);
+  });
+
+  test("KBU-14 a whitespace-only search term matches nothing rather than everything", { tag: '@tesbo.testId("TES-TC-1013")' }, async ({ browser }) => {
+    const present = stamp("Present");
+    await api.post(kbUrl("/folders"), { data: { name: present, parentFolderId: rootFolderId } });
+
+    const page = await openKb(browser);
+    await expect(row(page, present)).toBeVisible();
+
+    await page.getByPlaceholder("Search knowledge base…").fill("   ");
+
+    // Whitespace is not a query. The risk this pins is the opposite of a crash: silently falling
+    // back to "match everything" looks like a working search until someone trusts the result.
+    const results = await (await api.get(kbUrl("/search?q=%20%20%20"))).json();
+    const rows = Array.isArray(results) ? results : (results.results ?? results.items ?? []);
+    expect(rows.length, "an empty search term matches nothing").toBe(0);
+  });
+
+  // ─── Authorization, which this page does not gate ──────────────────────────
+
+  test("KBU-20 a qa_engineer is shown the controls and can create — the page has no role gate", { tag: '@tesbo.testId("TES-TC-1014")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser, "qa");
+
+    // Deliberately asserting the current, ungated design rather than a hoped-for one: a project
+    // member of any role may create in the knowledge base (the API allows it), so the button being
+    // present is correct. KBU-21 covers the account that genuinely cannot.
+    await expect(page.getByRole("button", { name: "New", exact: true }).first()).toBeVisible();
+
+    const name = stamp("QaFolder");
+    await createFolder(page, name);
+    await expect(row(page, name)).toBeVisible();
+    expect(folderCount()).toBe(1);
+  });
+
+  test("KBU-21 a workspace member with no access to the project cannot use the knowledge base", { tag: '@tesbo.testId("TES-TC-1015")' }, async ({
+    browser,
+  }) => {
+    const ctx = await browser.newContext({ storageState: states.get("guest") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base`);
+    await page.waitForLoadState("domcontentloaded");
+
+    // Whatever the screen chooses to render, it must not be a working knowledge base: no create
+    // affordance for a project this account is not a member of.
+    await expect(page.getByRole("button", { name: "New", exact: true })).toHaveCount(0);
+  });
+
+  test("KBU-22 a folder from another project is not reachable through this project's URL", { tag: '@tesbo.testId("TES-TC-1016")' }, async ({
+    browser,
+  }) => {
+    const secondRoot = (await (await api.get(kbUrl("/folders/tree", tenant!.secondProjectId))).json()).id;
+    const foreign = await api.post(kbUrl("/folders", tenant!.secondProjectId), {
+      data: { name: stamp("Foreign"), parentFolderId: secondRoot },
+    });
+    expect(foreign.status()).toBe(201);
+    const foreignId = (await foreign.json()).id;
+
+    const page = await openKb(browser);
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base?folderId=${foreignId}`);
+    await page.waitForLoadState("domcontentloaded");
+
+    // The screen must not render another project's folder, and the endpoint behind it must refuse.
+    const items = await api.get(kbUrl(`/folders/${foreignId}/items`), { failOnStatusCode: false });
+    expect([403, 404], "a folder from another project is not reachable through this one").toContain(
+      items.status(),
+    );
+  });
+
+  test("KBU-23 a malformed document id in the URL does not throw in the page", { tag: '@tesbo.testId("TES-TC-1017")' }, async ({ browser }) => {
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/not-a-uuid`);
+    await page.waitForLoadState("domcontentloaded");
+
+    expect(errors, "a URL typo must not throw an uncaught error in the page").toEqual([]);
+    await expect(page.locator("body")).not.toContainText("Application error");
+  });
+
+  // ─── The gap this suite is here to pin ─────────────────────────────────────
+
+  test("KBU-24 deleted items are unreachable from the UI — restore is API-only", { tag: '@tesbo.testId("TES-TC-1018")' }, async ({ browser }) => {
+    const name = stamp("Trashed");
+    const created = await api.post(kbUrl("/folders"), { data: { name, parentFolderId: rootFolderId } });
+    const folderId = (await created.json()).id;
+    await api.delete(kbUrl(`/folders/${folderId}`));
+
+    const page = await openKb(browser);
+
+    // The row is gone from the browser...
+    await expect(row(page, name)).toHaveCount(0);
+    // ...and nothing on the screen offers a way back to it.
+    for (const label of [/^trash$/i, /deleted items/i, /restore/i]) {
+      await expect(
+        page.getByText(label),
+        `the KB screen offers no way to reach deleted items (${label})`,
+      ).toHaveCount(0);
+    }
+
+    // But the endpoint exists and works, which is what makes this a gap rather than a design.
+    const restored = await api.patch(kbUrl(`/folders/${folderId}/restore`));
+    expect(restored.status(), "restore works over the API — only the UI cannot reach it").toBe(200);
+  });
+  // ─── Blank documents (BetterBugs 6a7da01c) ─────────────────────────────────
+  //
+  // "user should not be able to save blank documents add some validation".
+  //
+  // KBU-07 already covers the CREATE modal refusing an empty title. These two are about the editor,
+  // which is a different code path and currently unguarded: handleTitleChange feeds scheduleSave
+  // directly, and scheduleSave's only precondition is a payload size ceiling. So a title can be
+  // cleared to nothing and autosaved, and the document then shows as "Untitled" everywhere it is
+  // listed. Both tests are expected RED until the editor validates before saving.
+
+  test("KBU-25 a document's title cannot be emptied and saved", { tag: '@tesbo.testId("TES-TC-1019")' }, async ({ browser }) => {
+    const title = stamp("KeepsTitle");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general" },
+    });
+    const documentId = (await created.json()).id;
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    const titleBox = page.getByPlaceholder("Untitled document");
+    await expect(titleBox).toHaveValue(title);
+    await titleBox.fill("");
+    await titleBox.blur();
+
+    // The editor autosaves on a debounce, so give it longer than the debounce to do the wrong thing
+    // before concluding it did not.
+    await expect(page.getByText(/Unsaved changes|Saving…|Saved/)).toBeVisible();
+    await page.waitForTimeout(2_000);
+
+    expect(
+      scalar(`SELECT title FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      "an emptied title must not be persisted",
+    ).toBe(title);
+  });
+
+  test("KBU-26 a whitespace-only title is refused the same way an empty one is", { tag: '@tesbo.testId("TES-TC-1020")' }, async ({ browser }) => {
+    const title = stamp("WhitespaceTitle");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general" },
+    });
+    const documentId = (await created.json()).id;
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    const titleBox = page.getByPlaceholder("Untitled document");
+    await expect(titleBox).toHaveValue(title);
+    // Spaces are the loophole an empty-string check alone leaves open — the stored title then looks
+    // present to the database and blank to every human reading the list.
+    await titleBox.fill("      ");
+    await titleBox.blur();
+    await page.waitForTimeout(2_000);
+
+    const stored = scalar(`SELECT title FROM knowledge_documents WHERE id = ${literal(documentId)};`);
+    expect(stored.trim(), "a whitespace-only title must not be persisted").not.toBe("");
+  });
+
+  // ─── Search feedback while typing (BetterBugs 6a7dae14) ────────────────────
+
+  test("KBU-27 search either filters as you type or offers a visible Search control", { tag: '@tesbo.testId("TES-TC-1021")' }, async ({ browser }) => {
+    const present = stamp("TypeAheadHit");
+    const absent = stamp("TypeAheadMiss");
+    for (const name of [present, absent]) {
+      await api.post(kbUrl("/folders"), { data: { name, parentFolderId: rootFolderId } });
+    }
+
+    const page = await openKb(browser);
+    await expect(row(page, present)).toBeVisible();
+    await expect(row(page, absent)).toBeVisible();
+
+    // Typed character by character and deliberately NOT submitted.
+    await page.getByPlaceholder("Search knowledge base…").pressSequentially(present, { delay: 20 });
+
+    /*
+     * The ticket accepts either resolution, so this test does too — it fails only if NEITHER is
+     * offered, which is the state the reporter hit: results arrive only on Enter and there is no
+     * button saying so, leaving the screen looking broken mid-type.
+     *
+     * The "Clear" button next to the box does not count: it appears only once a search has already
+     * been submitted, so it cannot tell a user how to submit one.
+     */
+    const filteredAsTyped = await row(page, absent)
+      .waitFor({ state: "detached", timeout: 3_000 })
+      .then(() => true)
+      .catch(() => false);
+
+    const searchControl = page
+      .getByRole("button", { name: /^Search$/i })
+      .or(page.locator('button[type="submit"]').filter({ hasText: /search/i }));
+    const hasSearchButton = await searchControl.first().isVisible().catch(() => false);
+
+    expect(
+      filteredAsTyped || hasSearchButton,
+      "typing filtered nothing and no Search button was offered — the user cannot tell how to search",
+    ).toBe(true);
+  });
+  // ─── Upload affordances and error copy ─────────────────────────────────────
+
+  /*
+   * Basecamp 10199159265 / BetterBugs 6a7da3ff — "Supported file types and maximum file size are not
+   * displayed in Knowledge Base upload popup".
+   *
+   * The modal says only "Drag and drop files here, or click to browse". The rules it does not mention
+   * are real and enforced server-side:
+   *
+   *   - `KB_ALLOWED_EXTENSIONS` — 33 extensions; anything else is refused with
+   *     "This file type is not supported: <name>"
+   *   - `KB_MAX_UPLOAD_SIZE` — MAX_UPLOAD_SIZE or 100 MB, enforced by FilesInterceptor
+   *   - `FilesInterceptor("files", 10)` — at most 10 files per request
+   *
+   * and the refusal is ATOMIC: one unsupported file in a batch rejects the whole batch. So a user who
+   * is not told the rules loses the entire upload to a single wrong file. The `<input type="file">`
+   * also carries no `accept`, so the OS picker offers files the product will reject.
+   *
+   * Expected RED. The assertion is deliberately about the limits being DISCLOSED, not about exact
+   * wording — any copy naming the formats and the size satisfies it.
+   */
+  test("KBU-28 the upload modal states which files are allowed and how large they may be", { tag: '@tesbo.testId("TES-TC-1022")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    await newMenu(page, "Upload file");
+    const dialog = modal(page, "Upload file");
+    await expect(dialog).toBeVisible();
+
+    const copy = ((await dialog.textContent()) ?? "").toLowerCase();
+
+    // The size ceiling, however it is phrased ("100 MB", "100MB", "max 100 mb").
+    expect(copy, "the modal never mentions a maximum file size").toMatch(/\d+\s*(mb|gb)/);
+
+    // A representative sample of the allowed list, so the copy has to actually enumerate formats
+    // rather than say "supported files only".
+    const named = ["pdf", "docx", "xlsx", "png", "csv"].filter((ext) => copy.includes(ext));
+    expect(
+      named.length,
+      `the modal names none of the supported formats — copy was: ${copy.trim().slice(0, 200)}`,
+    ).toBeGreaterThan(0);
+
+    // And the picker itself should not offer what the server will refuse.
+    const accept = await dialog.locator('input[type="file"]').getAttribute("accept");
+    expect(accept, "the file input has no accept attribute, so the OS picker offers rejected types").toBeTruthy();
+  });
+
+  /*
+   * Basecamp 10199144861 / BetterBugs 6a7da27f — "Technical API error displayed to user during folder
+   * drag-and-drop upload".
+   *
+   * Dropping a FOLDER yields DataTransfer entries with no readable file, the upload request fails, and
+   * the page renders what `lib/api.ts` threw:
+   *
+   *   "Failed to fetch — browser blocked or could not reach the API. Confirm NEXT_PUBLIC_API_URL,
+   *    HTTPS, and that the backend allows this page's origin in CORS_ALLOWED_ORIGINS."
+   *
+   * That string is a developer diagnostic. It names three environment variables and tells the user to
+   * check a CORS allowlist, which is not theirs to check — and because the throw lives in the shared
+   * `api()` wrapper, EVERY network failure anywhere in the app shows it, not just this upload.
+   *
+   * The failure is provoked here by aborting the upload request rather than by dropping a real folder:
+   * Playwright cannot synthesise a directory drop, and the defect is not in the folder handling — it
+   * is in what the page does with any failed request. Aborting reproduces the exact `Failed to fetch`
+   * branch the reporter hit.
+   *
+   * Expected RED until the diagnostic moves to the console and the user gets plain copy.
+   */
+  test("KBU-29 a failed upload shows plain copy, not the API/CORS diagnostic", { tag: '@tesbo.testId("TES-TC-1023")' }, async ({ browser }) => {
+    const page = await openKb(browser);
+
+    await page.route(/\/knowledge-base\/files/, (route) =>
+      route.request().method() === "POST" ? route.abort("failed") : route.continue(),
+    );
+
+    await newMenu(page, "Upload file");
+    const dialog = modal(page, "Upload file");
+    await dialog
+      .locator('input[type="file"]')
+      .setInputFiles({ name: "kbu29.txt", mimeType: "text/plain", buffer: Buffer.from("KBU-29") });
+    await dialog.getByRole("button", { name: /^Upload/ }).click();
+
+    // Something must be said — silence would be its own bug.
+    const alert = page.getByText(/fail|error|unable|could not/i).first();
+    await expect(alert).toBeVisible();
+    const shown = (await page.locator("body").textContent()) ?? "";
+
+    for (const leak of ["NEXT_PUBLIC_API_URL", "CORS_ALLOWED_ORIGINS", "HTTPS", "Failed to fetch"]) {
+      expect(shown, `the page showed the internal diagnostic "${leak}" to the user`).not.toContain(leak);
+    }
+  });
+
+  /*
+   * Basecamp 10199215592 / BetterBugs 6a7da94c — "Full folder name is not visible when truncated".
+   *
+   * Both places a folder name appears clip it with `className="truncate"` and neither carries a
+   * `title`: `FolderTree.tsx`'s tree node and the item table's name cell. The reporter asked for a
+   * tooltip on hover, which `title` is the accessible, zero-JS way to provide.
+   *
+   * Expected RED.
+   */
+  test("KBU-30 a long folder name is readable in full from a tooltip", { tag: '@tesbo.testId("TES-TC-1024")' }, async ({ browser }) => {
+    /*
+     * Comfortably past the tree's width, so it genuinely truncates, but within the folder-name cap.
+     *
+     * The cap is KB_FOLDER_NAME_MAX_LENGTH = 50 (LegacyService, mirrored in Tesbo-Frontend's
+     * lib/validation.ts) — a name longer than that is a 400 now, so the old 124-character fixture
+     * could no longer be created at all. 50 characters in a sidebar tree still truncates, which is
+     * all this test needs; the subject here is the tooltip, not the length limit (KB-A-58 owns that).
+     * Sliced rather than hand-sized because stamp()'s random suffix varies in width, and the slice
+     * keeps the whole timestamp so re-runs still can't collide.
+     */
+    const longName = `${stamp("VeryLongFolderName")} ${"Segment".repeat(12)}`.slice(0, 50);
+    const created = await api.post(kbUrl("/folders"), {
+      data: { name: longName, parentFolderId: rootFolderId },
+    });
+    expect(created.ok(), `creating the long-named folder — ${await created.text()}`).toBeTruthy();
+
+    const page = await openKb(browser);
+
+    // The tree node and the table cell are two separate renders of the same name; the reporter saw
+    // the tree, but a user reads whichever is in front of them.
+    const treeNode = page.locator("span.truncate", { hasText: longName.slice(0, 40) }).first();
+    await expect(treeNode).toBeVisible();
+
+    const withTitle = page.locator(`[title=${JSON.stringify(longName)}]`);
+    await expect(
+      withTitle.first(),
+      "no element exposes the full folder name, so a truncated name cannot be read at all",
+    ).toBeAttached();
+  });
+  /*
+   * Basecamp 10199290648 — "Resolving a comment deletes the comment and its replies".
+   *
+   * It does not: resolve sets is_resolved (delete is a separate endpoint), the list endpoint still
+   * returns the thread, and it can be reopened — all pinned API-side by KBC-A-10..13. What the
+   * reporter actually hit was a disappearance: a resolved thread is hidden from the default view, and
+   * the only thing saying so was a 12px grey underlined link in the header's far corner. When the
+   * resolved thread is the LAST open one the entire list empties at once, which reads as destruction.
+   *
+   * Asserts the behaviour is non-destructive AND that the screen says so. Fails against the old UI on
+   * the chip locator and on the empty-state wording.
+   */
+  test("KBU-31 resolving a comment hides it without ever looking like a deletion", { tag: '@tesbo.testId("TES-TC-1025")' }, async ({ browser }) => {
+    const docName = stamp("Comment doc");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: docName, folderId: rootFolderId, contentText: "Body under discussion." },
+      failOnStatusCode: false,
+    });
+    expect(created.status(), `seeding the document — ${await created.text()}`).toBe(201);
+    const documentId = (await created.json()).id;
+
+    const threadBody = stamp("Please review this passage");
+    const thread = await api.post(kbUrl(`/documents/${documentId}/comments`), {
+      data: { body: threadBody },
+      failOnStatusCode: false,
+    });
+    expect(thread.status(), `seeding the thread — ${await thread.text()}`).toBe(201);
+    const threadId = (await thread.json()).id;
+    const replyBody = stamp("Agreed");
+    await api.post(kbUrl(`/documents/${documentId}/comments`), {
+      data: { body: replyBody, parentCommentId: threadId },
+      failOnStatusCode: false,
+    });
+
+    const page = await openKb(browser);
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    // The thread and its reply are both on screen, and there is nothing resolved yet.
+    await expect(page.getByText(threadBody)).toBeVisible();
+    await expect(page.getByText(replyBody)).toBeVisible();
+    await expect(page.getByTestId("toggle-resolved-comments")).toHaveCount(0);
+
+    await page.getByRole("button", { name: /Resolve/ }).first().click();
+
+    // It leaves the default view — that part is intended.
+    await expect(page.getByText(threadBody)).toHaveCount(0);
+    await expect(page.getByText(replyBody)).toHaveCount(0);
+
+    // But the screen must make it obvious the thread was kept, not destroyed.
+    const chip = page.getByTestId("toggle-resolved-comments");
+    await expect(chip, "nothing prominent says where the resolved thread went").toBeVisible();
+    await expect(chip).toContainText("1 resolved");
+    // This was the only open thread, so the list is now empty — the moment the reporter read as a
+    // deletion. The empty state has to say otherwise.
+    await expect(page.getByText(/Nothing was deleted/i)).toBeVisible();
+
+    // And it is genuinely recoverable from the UI.
+    await chip.click();
+    await expect(page.getByText(threadBody)).toBeVisible();
+    await expect(page.getByText(replyBody), "the reply was not restored with its thread").toBeVisible();
+    await page.getByRole("button", { name: /Reopen/ }).first().click();
+    await expect(page.getByTestId("toggle-resolved-comments")).toHaveCount(0);
+    await expect(page.getByText(threadBody)).toBeVisible();
+
+    // Proof it was never deleted: the API still serves both rows, undeleted.
+    const listed = await (await api.get(kbUrl(`/documents/${documentId}/comments`))).json();
+    const bodies = listed.map((c: { body: string }) => c.body);
+    expect(bodies, "the thread or its reply was actually deleted").toContain(threadBody);
+    expect(bodies).toContain(replyBody);
+  });
+
+  // ─── Error placement: inline in the dialog vs. a floating toast ────────────
+  //
+  // Basecamp report: a rename's permission error rendered as a page-level banner, invisible behind
+  // the still-open Modal (which portals its own overlay at z-50) until the dialog was closed — and,
+  // separately, a duplicate-name refusal (a message about the very field just submitted) surfaced
+  // the same way instead of inline next to the input. Three tests: the two error-worthy field
+  // conflicts land inline in their own dialogs (renaming a folder, moving one into its own
+  // subtree), and a permission refusal — which isn't about any field on screen — floats above the
+  // dialog as a toast instead of hiding behind it.
+
+  test("KBU-32 renaming a folder to a name already taken under the same parent is refused inline, not as a toast", { tag: '@tesbo.testId("TES-TC-1339")' }, async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const shared = stamp("Taken");
+    const toRename = stamp("Renaming");
+    await createFolder(page, shared);
+    await createFolder(page, toRename);
+    await expect(row(page, toRename)).toBeVisible();
+
+    await openTreeMenu(page, toRename, "Rename");
+    const dialog = modal(page, "Rename folder");
+    await dialog.locator("input").fill(shared);
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    await expect(dialog, "the dialog stays open so the inline error is visible").toBeVisible();
+    await expect(dialog.getByText(/a folder with this name already exists/i)).toBeVisible();
+    await expect(errorToast(page), "a field-specific error must not also surface as a toast").toHaveCount(0);
+    expect(
+      scalar(
+        `SELECT name FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(toRename)};`,
+      ),
+      "the rejected rename must not have been persisted",
+    ).toBe(toRename);
+  });
+
+  test("KBU-33 moving a folder into its own subfolder is refused inline under the destination field, not as a toast", { tag: '@tesbo.testId("TES-TC-1340")' }, async ({
+    browser,
+  }) => {
+    const parentName = stamp("MoveParent");
+    const parent = await api.post(kbUrl("/folders"), { data: { name: parentName, parentFolderId: rootFolderId } });
+    expect(parent.status()).toBe(201);
+    const parentId = (await parent.json()).id;
+    const childName = stamp("MoveChild");
+    const child = await api.post(kbUrl("/folders"), { data: { name: childName, parentFolderId: parentId } });
+    expect(child.status()).toBe(201);
+    const childId = (await child.json()).id;
+
+    const page = await openKb(browser);
+    // Expand the tree so the child row (and the parent's row menu) are actually on screen.
+    await page.getByRole("button", { name: parentName, exact: true }).first().click();
+    await expect(page.getByRole("button", { name: childName, exact: true }).first()).toBeVisible();
+
+    await openTreeMenu(page, parentName, "Move");
+    const dialog = modal(page, "Move to folder");
+    // The destination list only excludes the folder being moved itself, not its descendants — so
+    // its own child is a selectable (and, on submit, refused) option.
+    await dialog.locator("select").selectOption(childId);
+    await dialog.getByRole("button", { name: "Move" }).click();
+
+    await expect(dialog, "the dialog stays open so the inline error is visible").toBeVisible();
+    await expect(dialog.getByText(/cannot be moved into itself/i)).toBeVisible();
+    await expect(errorToast(page), "a field-specific error must not also surface as a toast").toHaveCount(0);
+    expect(
+      scalar(`SELECT parent_folder_id FROM knowledge_folders WHERE id = ${literal(parentId)};`),
+      "the rejected move must not have changed the folder's parent",
+    ).toBe(rootFolderId);
+  });
+
+  test("KBU-34 a permission refusal on rename floats above the still-open dialog as a toast, not a hidden page banner", { tag: '@tesbo.testId("TES-TC-1341")' }, async ({
+    browser,
+  }) => {
+    // A QA engineer is no longer offered Rename on someone else's folder, so the refusal is reached
+    // the way it still can be: they open Rename on a folder they created, and it changes hands
+    // before they save (a stale page). kbRequireMutateAccess (legacy.service.ts) then refuses with
+    // "You can only modify items you created".
+    const ownersFolder = stamp("OwnersFolder");
+    const asQa = await loginAs(tenant!.qa);
+    let folderId = "";
+    try {
+      const created = await asQa.post(kbUrl("/folders"), { data: { name: ownersFolder, parentFolderId: rootFolderId } });
+      expect(created.status(), await created.text()).toBe(201);
+      folderId = (await created.json()).id;
+    } finally {
+      await asQa.dispose();
+    }
+
+    const page = await openKb(browser, "qa");
+    await expect(row(page, ownersFolder)).toBeVisible();
+
+    await openTreeMenu(page, ownersFolder, "Rename");
+    const dialog = modal(page, "Rename folder");
+    await dialog.locator("input").fill(stamp("Attempted"));
+    exec(
+      `UPDATE knowledge_folders SET created_by = (SELECT created_by FROM knowledge_folders WHERE id = ${literal(rootFolderId)}) ` +
+        `WHERE id = ${literal(folderId)};`,
+    );
+    await dialog.getByRole("button", { name: "Save" }).click();
+
+    const toast = errorToast(page).filter({ hasText: "You can only modify items you created" });
+    await expect(toast, "the permission refusal must be visible, not silently absorbed").toBeVisible();
+    // Not a client-side validation message — it can only have come back from the API, so this also
+    // proves the toast is reachable while the dialog it was triggered from is still open.
+    await expect(dialog, "the rename dialog must still be open underneath the toast").toBeVisible();
+
+    // The mechanism of the fix: `position: fixed` plus a z-index above the Modal's own z-50
+    // overlay is what makes the toast render on top instead of behind it.
+    await expect.poll(() => toast.evaluate((el) => getComputedStyle(el).position)).toBe("fixed");
+    await expect
+      .poll(() => toast.evaluate((el) => Number(getComputedStyle(el).zIndex)))
+      .toBeGreaterThan(50);
+
+    expect(
+      scalar(`SELECT name FROM knowledge_folders WHERE project_id = ${literal(tenant!.mainProjectId)} AND name = ${literal(ownersFolder)};`),
+      "the refused rename must not have been persisted",
+    ).toBe(ownersFolder);
+  });
+
+  // ─── Actions offered match what the API allows (kbRequireMutateAccess) ─────────────────────────
+  // A QA engineer was offered Delete (and Rename/Move) on owners' items, confirmed, and only then
+  // got "You can only modify items you created". Owners/managers may change anything; anyone else
+  // only what they created — the UI now offers exactly that.
+
+  /** An owner-created folder, document and file in the root, plus the owner's user id. */
+  async function seedOwnersItems(): Promise<{ folder: string; doc: string; docId: string; file: string }> {
+    const folder = stamp("Owners folder");
+    const folderRes = await api.post(kbUrl("/folders"), { data: { name: folder, parentFolderId: rootFolderId } });
+    expect(folderRes.status(), await folderRes.text()).toBe(201);
+    const ownerId = scalar(`SELECT created_by FROM knowledge_folders WHERE id = ${literal((await folderRes.json()).id)};`);
+    const doc = stamp("Owners doc");
+    const docRes = await api.post(kbUrl("/documents"), {
+      data: { folderId: rootFolderId, documentType: "general", title: doc, contentText: "Owner's notes.", contentHtml: "<p>Owner's notes.</p>" },
+    });
+    expect(docRes.status(), await docRes.text()).toBe(201);
+    // No upload helper exists in the suite; a row is all the list renders for a file.
+    const file = `${stamp("Owners file")}.txt`;
+    exec(
+      "INSERT INTO knowledge_files (organization_id, project_id, folder_id, file_name, original_file_name, uploaded_by) " +
+        `VALUES (${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(file)}, ${literal(file)}, ${literal(ownerId)});`,
+    );
+    return { folder, doc, docId: (await docRes.json()).id, file };
+  }
+
+  async function rowMenuItems(page: Page, name: string): Promise<string[]> {
+    await rowMenu(page, name).click();
+    const items = (await menuPanel(page).getByRole("button").allInnerTexts()).map((t) => t.trim());
+    await page.keyboard.press("Escape");
+    return items;
+  }
+
+  test("KBU-P1 a QA engineer is not offered Move or Delete on an owner's document, file or folder — read actions stay", async ({ browser }) => {
+    const { folder, doc, file } = await seedOwnersItems();
+    const page = await openKb(browser, "qa");
+
+    const docItems = await rowMenuItems(page, doc);
+    expect(docItems).toEqual(expect.arrayContaining(["Open", "Duplicate"]));
+    expect(docItems).not.toContain("Move");
+    expect(docItems).not.toContain("Delete");
+
+    const fileItems = await rowMenuItems(page, file);
+    expect(fileItems).toEqual(expect.arrayContaining(["Open", "Download"]));
+    expect(fileItems).not.toContain("Move");
+    expect(fileItems).not.toContain("Delete");
+
+    expect(await rowMenuItems(page, folder)).not.toContain("Delete");
+
+    // The folder tree: subfolders can still be created by anyone; changing the folder cannot.
+    await treeRow(page, folder).locator("button:has(svg)").last().click();
+    const treeItems = (await menuPanel(page).getByRole("button").allInnerTexts()).map((t) => t.trim());
+    expect(treeItems).toContain("Create subfolder");
+    for (const action of ["Rename", "Move", "Delete"]) expect(treeItems).not.toContain(action);
+  });
+
+  test("KBU-P2 a QA engineer keeps every action on items they created, and Delete really deletes", async ({ browser }) => {
+    const asQa = await loginAs(tenant!.qa);
+    const folder = stamp("QA folder");
+    const doc = stamp("QA doc");
+    try {
+      expect((await asQa.post(kbUrl("/folders"), { data: { name: folder, parentFolderId: rootFolderId } })).status()).toBe(201);
+      const docRes = await asQa.post(kbUrl("/documents"), {
+        data: { folderId: rootFolderId, documentType: "general", title: doc, contentText: "QA notes.", contentHtml: "<p>QA notes.</p>" },
+      });
+      expect(docRes.status(), await docRes.text()).toBe(201);
+    } finally {
+      await asQa.dispose();
+    }
+    const page = await openKb(browser, "qa");
+
+    expect(await rowMenuItems(page, doc)).toEqual(expect.arrayContaining(["Move", "Delete"]));
+    await treeRow(page, folder).locator("button:has(svg)").last().click();
+    expect((await menuPanel(page).getByRole("button").allInnerTexts()).map((t) => t.trim())).toEqual(
+      expect.arrayContaining(["Rename", "Move", "Delete"]),
+    );
+    await page.keyboard.press("Escape");
+
+    // A document delete confirms with window.confirm (handleDeleteItem), not a modal.
+    page.once("dialog", (d) => d.accept());
+    await rowMenu(page, doc).click();
+    await menuPanel(page).getByRole("button", { name: "Delete", exact: true }).click();
+    await expect
+      .poll(() => scalar(`SELECT is_deleted::text FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = ${literal(doc)};`))
+      .toBe("true");
+  });
+
+  test("KBU-P3 an owner is offered every action on everyone's items", async ({ browser }) => {
+    const asQa = await loginAs(tenant!.qa);
+    const doc = stamp("QA-made doc");
+    try {
+      const res = await asQa.post(kbUrl("/documents"), {
+        data: { folderId: rootFolderId, documentType: "general", title: doc, contentText: "x", contentHtml: "<p>x</p>" },
+      });
+      expect(res.status(), await res.text()).toBe(201);
+    } finally {
+      await asQa.dispose();
+    }
+    const { folder } = await seedOwnersItems();
+    const page = await openKb(browser, "owner");
+    expect(await rowMenuItems(page, doc)).toEqual(expect.arrayContaining(["Move", "Delete"]));
+    await treeRow(page, folder).locator("button:has(svg)").last().click();
+    expect((await menuPanel(page).getByRole("button").allInnerTexts()).map((t) => t.trim())).toEqual(
+      expect.arrayContaining(["Rename", "Move", "Delete"]),
+    );
+  });
+
+  test("KBU-P4 the document page offers Delete to the owner and to the document's QA creator, never to another QA engineer", async ({ browser }) => {
+    const { docId } = await seedOwnersItems();
+
+    const qaPage = await openDocument(browser, docId, "qa");
+    await qaPage.getByRole("button", { name: "More actions" }).click();
+    await expect(qaPage.getByRole("button", { name: "View history" })).toBeVisible();
+    await expect(qaPage.getByRole("button", { name: "Delete", exact: true })).toHaveCount(0);
+
+    const ownerPage = await openDocument(browser, docId, "owner");
+    await ownerPage.getByRole("button", { name: "More actions" }).click();
+    await expect(ownerPage.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
+
+    const asQa = await loginAs(tenant!.qa);
+    let qaDocId = "";
+    try {
+      const res = await asQa.post(kbUrl("/documents"), {
+        data: { folderId: rootFolderId, documentType: "general", title: stamp("QA own doc"), contentText: "x", contentHtml: "<p>x</p>" },
+      });
+      expect(res.status(), await res.text()).toBe(201);
+      qaDocId = (await res.json()).id;
+    } finally {
+      await asQa.dispose();
+    }
+    const ownDocPage = await openDocument(browser, qaDocId, "qa");
+    await ownDocPage.getByRole("button", { name: "More actions" }).click();
+    await expect(ownDocPage.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
+  });
+
+  // ─── Nightly sync cron follow-through: "Added on", "Last updated", and the change-history popover ──
+
+  test("KBU-35 a synced row shows distinct Added on / Last updated dates, its icon sits in Last updated, and a manually-created row gets the same icon", { tag: '@tesbo.testId("TES-TC-254")' }, async ({ browser }) => {
+    const mirrorTitle = stamp("E2E-80: Synced ticket");
+    seedMirrorDocument(mirrorTitle, "kbu-added-on-1", 5, 0);
+
+    const plainTitle = stamp("Plain human document");
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, document_type, status) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, ${literal(plainTitle)}, 'not synced', 'general', 'draft');`,
+    );
+
+    const page = await openKb(browser);
+    await expect(page.getByRole("columnheader", { name: "Added on" })).toBeVisible();
+
+    const mirrorRow = row(page, mirrorTitle);
+    await expect(mirrorRow).toBeVisible();
+    const cells = await mirrorRow.getByRole("cell").allTextContents();
+    // Name, Type, Updated by, Added on, Last updated, Size, Actions (no search query active, so
+    // the Folder path column is absent) — Added on (created 5 days ago) must read differently from
+    // Last updated (touched moments ago), not just coincidentally both say "Today".
+    expect(cells[3]).not.toContain("Today");
+    expect(cells[4]).toContain("Today");
+
+    // The icon lives in the Last updated cell, not Type — assert it directly rather than just
+    // "somewhere in the row", since that's the exact placement that was reported wrong.
+    const lastUpdatedCell = mirrorRow.getByRole("cell").nth(4);
+    await expect(lastUpdatedCell.getByRole("button", { name: "Update History" })).toBeVisible();
+    await expect(mirrorRow.getByRole("cell").nth(1).getByRole("button", { name: "Update History" })).toHaveCount(0);
+
+    // A manually-created, human-authored row gets the very same icon now — its own timeline is
+    // synthesized from version snapshots instead of a sync log, but the entry point is identical.
+    await expect(changeHistoryTrigger(page, mirrorTitle)).toBeVisible();
+    await expect(changeHistoryTrigger(page, plainTitle)).toBeVisible();
+  });
+
+  test("KBU-35b a Linear-synced row gets the same Update History icon, popover, and provider label as a Jira one", { tag: '@tesbo.testId("TES-TC-2050")' }, async ({ browser }) => {
+    const title = stamp("E2E-80b: Linear ticket");
+    const documentId = seedMirrorDocument(title, "kbu-linear-1", 5, 0, "linear");
+    seedSyncEvent(documentId, "updated", "Priority updated.", "linear");
+
+    const page = await openKb(browser);
+    await expect(changeHistoryTrigger(page, title)).toBeVisible();
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel.getByText("Priority updated.")).toBeVisible();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await expect(page.getByText("Synced from Linear")).toBeVisible();
+  });
+
+  test("KBU-36 the change-history popover opens on hover as well as click, and lists the timeline newest first", { tag: '@tesbo.testId("TES-TC-255")' }, async ({ browser }) => {
+    const title = stamp("E2E-81: Has history");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-2", 5, 0);
+    seedSyncEvent(documentId, "created", null);
+    seedSyncEvent(documentId, "updated", "Status: To Do -> In Progress updated.");
+
+    const page = await openKb(browser);
+    const panel = menuPanel(page);
+
+    // Hovering, not clicking, must open it — this is the behavior that was reported broken.
+    await changeHistoryTrigger(page, title).hover();
+    await expect(panel.getByText("Update History")).toBeVisible();
+    await expect(panel.getByText("Status: To Do -> In Progress updated.")).toBeVisible();
+    await expect(panel.getByText("Added", { exact: false }).first()).toBeVisible();
+
+    // Moving onto the popover itself (not away from the row) must not close it.
+    await panel.hover();
+    await expect(panel).toBeVisible();
+
+    // Moving away closes it again.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).hover();
+    await expect(panel).not.toBeVisible();
+
+    // Click opens it too, independent of hover (covers touch/keyboard users with no real hover).
+    await changeHistoryTrigger(page, title).click();
+    await expect(menuPanel(page).getByText("Update History")).toBeVisible();
+
+    // An outside click closes it — the only way a tap-only device can dismiss it.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).click();
+    await expect(menuPanel(page)).toHaveCount(0);
+
+    // A document with no change history recorded (e.g. one mirrored before this feature shipped)
+    // shows a plain empty state rather than an error or a blank popup.
+    const untracked = stamp("E2E-82: No history recorded");
+    seedMirrorDocument(untracked, "kbu-added-on-3", 1, 1);
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+    await changeHistoryTrigger(page, untracked).hover();
+    await expect(menuPanel(page).getByText("No update history recorded yet.")).toBeVisible();
+  });
+
+  test("KBU-37 the popover paginates 5 per page with calendar/clock icons in DD/MM/YYYY 12-hour format, and never crops off-screen", { tag: '@tesbo.testId("TES-TC-258")' }, async ({ browser }) => {
+    const title = stamp("E2E-83: Long timeline");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-4", 3, 0);
+    for (let i = 1; i <= 7; i++) seedSyncEvent(documentId, "updated", `Change ${i}`);
+
+    const page = await openKb(browser);
+    // Narrow enough that the table's right-hand columns — where the icon now lives, in Last
+    // updated — crowd the screen edge, the exact layout the cropping was reported against.
+    await page.setViewportSize({ width: 700, height: 720 });
+
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel).toBeVisible();
+
+    // Never off-screen on any edge, regardless of where the trigger sits in the row.
+    const viewport = page.viewportSize();
+    await expect(async () => {
+      const box = await panel.boundingBox();
+      expect(box, "the popover must report a real bounding box").not.toBeNull();
+      if (!box || !viewport) return;
+      expect(box.x, "popover left edge is off-screen").toBeGreaterThanOrEqual(0);
+      expect(box.x + box.width, "popover right edge overflows the viewport").toBeLessThanOrEqual(viewport.width);
+      expect(box.y, "popover top edge is off-screen").toBeGreaterThanOrEqual(0);
+      expect(box.y + box.height, "popover bottom edge overflows the viewport").toBeLessThanOrEqual(viewport.height);
+    }).toPass();
+
+    // Calendar and clock icons (Tabler icons render as inline <svg>) on every entry.
+    const firstEntry = panel.locator("li").first();
+    await expect(firstEntry.locator("svg")).toHaveCount(2);
+
+    // DD/MM/YYYY and 12-hour HH:MM:SS AM/PM — the seeded events are `now()`, so today's date must
+    // render in exactly that format, and the time must carry a literal AM/PM marker.
+    const now = new Date();
+    const expectedDate = `${String(now.getDate()).padStart(2, "0")}/${String(now.getMonth() + 1).padStart(2, "0")}/${now.getFullYear()}`;
+    await expect(firstEntry).toContainText(expectedDate);
+    await expect(firstEntry).toContainText(/\d{2}:\d{2}:\d{2} (AM|PM)/);
+
+    // Page 1 of a 7-event timeline: exactly 5 rows, newest ("Change 7") first, Next enabled and
+    // Previous disabled — there is nowhere earlier to go from the first page.
+    await expect(panel.locator("li")).toHaveCount(5);
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+    const nextButton = panel.getByRole("button", { name: "Next" });
+    const previousButton = panel.getByRole("button", { name: "Previous" });
+    await expect(previousButton).toBeDisabled();
+    await expect(nextButton).toBeEnabled();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+
+    await nextButton.click();
+    // Page 2: the remaining 2 (oldest) rows, Next now disabled — nothing further to page to.
+    await expect(panel.getByText("Page 2")).toBeVisible();
+    await expect(panel.locator("li")).toHaveCount(2);
+    await expect(panel.getByText("Change 1", { exact: false })).toBeVisible();
+    await expect(nextButton).toBeDisabled();
+    await expect(previousButton).toBeEnabled();
+
+    await previousButton.click();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+  });
+
+  // Regression: ChangeDiffModal is a React child of ChangeHistoryList, which lives inside this
+  // popover's own subtree. The popover auto-closes on hover-out (a 200ms timer) and on any
+  // mousedown outside trigger/panel — and the diff modal, once open, is a full-viewport overlay
+  // that (a) makes the browser refire mouseleave on the panel with no real pointer movement, and
+  // (b) puts every click inside the diff modal itself outside panelRef. Either one used to tear
+  // the popover down mid-click, taking the diff modal down with it before it could be read.
+  test("KBU-37c the diff modal opened from the info-icon popover survives the popover's own hover-out and outside-click auto-close", { tag: '@tesbo.testId("TES-TC-2053")' }, async ({ browser }) => {
+    const title = stamp("E2E-83c: Popover diff survives");
+    const documentId = seedMirrorDocument(title, "kbu-popover-diff", 2, 0);
+    seedSyncEvent(documentId, "updated", "Details, Comments updated.", "jira", [
+      {
+        label: "Details",
+        oldExcerpt: "- **Status:** To Do\n- **Priority:** Low",
+        newExcerpt: "- **Status:** To Do\n- **Priority:** Highest",
+        oldLength: 40,
+        newLength: 44,
+        truncated: false,
+      },
+      {
+        label: "Comments",
+        oldExcerpt: "_No comments on the source ticket._",
+        newExcerpt: "### reporter — 2026-09-08\n\ntest comment",
+        oldLength: 36,
+        newLength: 42,
+        truncated: false,
+      },
+    ]);
+
+    const page = await openKb(browser);
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    const diffButton = panel.getByRole("button", { name: "View Details" });
+    await expect(diffButton).toBeVisible();
+    await diffButton.click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+    await expect(diffModal.getByText("Highest")).toBeVisible();
+
+    // Move away from both the trigger and the popover panel — exactly what schedules the
+    // popover's hover-out close — and wait past its 200ms timer. Before the fix this tore the
+    // diff modal down along with the popover; it must now stay put.
+    await page.getByRole("heading", { name: "Knowledge base", level: 1 }).hover();
+    await page.waitForTimeout(400);
+    await expect(diffModal).toBeVisible();
+
+    // Reading the diff — clicking inside its own content — must not count as an "outside click"
+    // that closes the popover (and the diff modal riding inside it) either.
+    await diffModal.getByText("Highest").click();
+    await expect(diffModal).toBeVisible();
+
+    // Escape closes only the diff modal; the popover behind it is untouched and still shows the
+    // same entry, so a second look doesn't require re-opening the whole popover from scratch.
+    await page.keyboard.press("Escape");
+    await expect(diffModal).not.toBeVisible();
+    await expect(panel.getByText("Details, Comments updated.")).toBeVisible();
+  });
+
+  /*
+   * Regression: a Zyra AI Memory section is labelled by its own `## <ISO timestamp>` heading
+   * (groupSections, text-diff.util.ts), and that raw label flows straight into the "<label>
+   * updated." summary sentence stored on the event row (changed_summary). ChangeDiffModal already
+   * reformats a raw-ISO *field label* inside the diff modal (see KBU-44), but the popover/modal
+   * list's own summary line rendered that same shape completely unformatted — the "T", milliseconds
+   * and "Z" all visible, unlike every other date in the product. ChangeHistory.tsx now reformats any
+   * ISO-timestamp substring inside changedSummary too, at render time, so this is fixed for rows
+   * that already have the raw string cached in the database as well as new ones.
+   */
+  test("KBU-37d the popover/modal list's own change summary formats a Zyra-memory-style timestamp too, not just the diff modal's field label", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso = "2026-09-18T14:28:46.521Z";
+    const title = stamp("E2E-83d: Raw ISO summary");
+    const documentId = seedMirrorDocument(title, "kbu-popover-iso-summary", 2, 0);
+    // A single-section change: summarizeTextChange's sentence is just "<label> updated.", so a raw
+    // label reaches the row unmodified by anything else in the sentence — the exact shape the
+    // screenshot bug report showed.
+    seedSyncEvent(documentId, "updated", `${iso} updated.`);
+
+    const page = await openKb(browser);
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel.getByText("Update History")).toBeVisible();
+
+    await expect(panel.getByText(`${expectedLabel(iso)} updated.`)).toBeVisible();
+    await expect(panel.getByText(iso, { exact: false })).toHaveCount(0);
+  });
+
+  test("KBU-37b a failed fetch on page 2+ still leaves Previous clickable — it must not strand the user on the errored page", async ({ browser }) => {
+    const title = stamp("E2E-83b: Broken page 2");
+    const documentId = seedMirrorDocument(title, "kbu-added-on-4b", 3, 0);
+    for (let i = 1; i <= 7; i++) seedSyncEvent(documentId, "updated", `Change ${i}`);
+
+    const page = await openKb(browser);
+
+    // Only the page-2 request (offset=5) fails — a transient blip on one page, not the whole
+    // feature being down. route.abort("failed") reproduces the exact browser-level transport
+    // failure, same technique as the other network-error specs in this suite. Registered before
+    // the popover ever opens so it also catches the background prefetch of page 2 that fires
+    // right after page 1 renders (see ChangeHistory.tsx) — otherwise that prefetch would quietly
+    // succeed and cache page 2 before Next is even clicked, and the click would just render the
+    // cached page instead of ever exercising the failure this test is for.
+    await page.route(/\/knowledge-base\/documents\/[^/]+\/history\?/, (route) => {
+      const requestUrl = new URL(route.request().url());
+      return requestUrl.searchParams.get("offset") === "5" ? route.abort("failed") : route.continue();
+    });
+
+    await changeHistoryTrigger(page, title).click();
+    const panel = menuPanel(page);
+    await expect(panel).toBeVisible();
+
+    const nextButton = panel.getByRole("button", { name: "Next" });
+    const previousButton = panel.getByRole("button", { name: "Previous" });
+    await expect(previousButton).toBeDisabled();
+    await expect(nextButton).toBeEnabled();
+
+    await nextButton.click();
+    await expect(panel.getByText("Couldn't load change history.")).toBeVisible();
+    // The bug this guards: the whole pager (Previous included) used to disappear on any fetch
+    // error, trapping the user on the errored page with no way back short of closing the modal.
+    await expect(previousButton).toBeVisible();
+    await expect(previousButton).toBeEnabled();
+    await expect(nextButton).toBeDisabled();
+
+    await previousButton.click();
+    await expect(panel.getByText("Page 1")).toBeVisible();
+    await expect(panel.getByText("Change 7", { exact: false })).toBeVisible();
+  });
+
+  test("KBU-38 a synced document's View history shows the change timeline with date/time/who, and a manual document gets the same timeline instead of a bare version list", { tag: '@tesbo.testId("TES-TC-260")' }, async ({ browser }) => {
+    const mirrorTitle = stamp("E2E-84: View history mirror");
+    const documentId = seedMirrorDocument(mirrorTitle, "kbu-view-history-1", 2, 0);
+    seedSyncEvent(documentId, "updated", "Description updated.");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+
+    // The modal is titled "Update History" for a mirror, not "Version history" — same distinction
+    // as the info-icon popover, since a mirror has no manually saved versions to list.
+    const changeHistoryDialog = modal(page, "Update History");
+    await expect(changeHistoryDialog).toBeVisible();
+    await expect(changeHistoryDialog.getByText("Description updated.")).toBeVisible();
+    // No triggering user was seeded (a nightly-style event) — labelled explicitly, not blank.
+    await expect(changeHistoryDialog.getByText("Nightly sync", { exact: false })).toBeVisible();
+    // Calendar + clock icons, and the DD/MM/YYYY + 12-hour time format, same as the popover.
+    await expect(changeHistoryDialog.locator("li").first().locator("svg")).toHaveCount(2);
+    await expect(changeHistoryDialog).toContainText(/\d{2}:\d{2}:\d{2} (AM|PM)/);
+    // "Restore" only makes sense against a manually saved version — never offered for a mirror.
+    await expect(changeHistoryDialog.getByRole("button", { name: "Restore" })).toHaveCount(0);
+    // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
+    await page.keyboard.press("Escape");
+
+    // A second mirror with no sync-event rows (e.g. synced before this feature existed) gets the
+    // same empty state as the popover, not a misleading "No earlier versions yet."
+    const untrackedTitle = stamp("E2E-85: View history mirror, no events");
+    const untrackedId = seedMirrorDocument(untrackedTitle, "kbu-view-history-2", 1, 1);
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${untrackedId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    await expect(modal(page, "Update History").getByText("No update history recorded yet.")).toBeVisible();
+    // Modal.tsx has no close button — Escape (or a backdrop click) is how it dismisses.
+    await page.keyboard.press("Escape");
+
+    // A regular, human-authored document gets the identical "Update History" modal and the same
+    // empty-state copy — it's never had an edit yet either, so there is nothing but "Added".
+    const created = await api.post(kbUrl("/documents"), { data: { title: stamp("Plain doc"), folderId: rootFolderId } });
+    expect(created.status()).toBe(201);
+    const plainDocumentId = (await created.json()).id;
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${plainDocumentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const plainDialog = modal(page, "Update History");
+    await expect(plainDialog).toBeVisible();
+    await expect(plainDialog.getByText("Added", { exact: false })).toBeVisible();
+    // Never had an edit, so there is nothing to restore — no version-diff entry exists yet.
+    await expect(plainDialog.getByRole("button", { name: "Restore" })).toHaveCount(0);
+  });
+
+  // ─── Restore confirmation (BetterBugs: "Restore old version feature is not working") ──────
+  //
+  // The reported bug traced to the editor never re-rendering after a restore: the API call
+  // genuinely succeeded, but TipTap only reads its initial content once, so the visible body never
+  // changed and users kept re-clicking a "broken" Restore, piling up junk versions. These pin the
+  // fix (the body itself, not just the title, must change) alongside the new confirm/cancel step.
+
+  /** Seeds a version row directly, rather than waiting out the 15-minute snapshot-coalescing
+   *  window (KB-A-25 in the API suite) that a real second edit would otherwise hit. */
+  function seedDocumentVersion(documentId: string, title: string, contentText: string): void {
+    exec(
+      "INSERT INTO knowledge_document_versions (document_id, version_number, title, content_html, content_text, created_by) VALUES (" +
+        `${literal(documentId)}, 1, ${literal(title)}, ${literal(`<p>${contentText}</p>`)}, ${literal(contentText)}, NULL);`,
+    );
+  }
+
+  test("KBU-39 restoring a version asks for confirmation first — Cancel makes no request, Confirm restores and updates the visible body", { tag: '@tesbo.testId("TES-TC-1920")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("Restorable");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content", contentHtml: "<p>v2 content</p>" },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await expect(page.locator(".ProseMirror").first()).toContainText("v2 content");
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Restore" }).click();
+
+    // Confirming is a separate step — opening it must not itself have called the restore endpoint.
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
+    await page.waitForTimeout(500);
+    expect(
+      scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      "opening the confirmation must not restore anything on its own",
+    ).toBe("v2 content");
+
+    // Cancel backs out with no side effect, and the version list is reachable again.
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog.getByRole("button", { name: "Restore" })).toBeVisible();
+    expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`)).toBe("v2 content");
+
+    // Confirming actually restores — and the editor itself, not just the database, shows it. This
+    // is the regression check for the reported bug: before the fix, content_text flipped in the
+    // database but the on-screen body never did.
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
+    await dialog.getByRole("button", { name: "Restore" }).click();
+
+    await expect(page.locator(".ProseMirror").first()).toContainText("v1 content");
+    await expect(dialog).toBeHidden();
+    expect(scalar(`SELECT content_text FROM knowledge_documents WHERE id = ${literal(documentId)};`)).toBe("v1 content");
+
+    // Restoring is itself reversible: the pre-restore ("v2") state was snapshotted before the
+    // overwrite, so the timeline now shows two distinct restorable entries, not a repeat of the
+    // same one — proof the reversibility actually happened, not just that a version count went up.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const reopened = modal(page, "Update History");
+    await expect(reopened.getByRole("button", { name: "Restore" })).toHaveCount(2);
+  });
+
+  test("KBU-40 two rapid clicks on Confirm restore exactly once, and the dialog is left in a normal, usable state afterward", { tag: '@tesbo.testId("TES-TC-1921")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("DoubleClickRestore");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content" },
+    });
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    const confirmButton = dialog.getByRole("button", { name: "Restore" });
+    await expect(confirmButton).toBeVisible();
+
+    // Two native click events dispatched back-to-back in the same browser task, ahead of any React
+    // re-render — the guard this proves is a synchronous ref, specifically because disabling the
+    // button via React state alone cannot close a window this tight.
+    await confirmButton.evaluate((el) => {
+      (el as HTMLButtonElement).click();
+      (el as HTMLButtonElement).click();
+    });
+
+    await expect(page.locator(".ProseMirror").first()).toContainText("v1 content");
+    expect(
+      scalar(`SELECT COUNT(*) FROM knowledge_document_versions WHERE document_id = ${literal(documentId)};`),
+      "exactly one restore applied, so exactly one new snapshot — not two",
+    ).toBe("2");
+
+    // Not stuck: history opens again with its Restore buttons enabled, not disabled from before.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const reopened = modal(page, "Update History");
+    await expect(reopened.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
+  });
+
+  test("KBU-41 a restore that fails server-side shows the error inline, and both buttons stay usable — not stuck loading", { tag: '@tesbo.testId("TES-TC-1922")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("FailedRestore");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: "v2 content" },
+    });
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "v1 content");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText(/Restore to the version from/)).toBeVisible();
+
+    // Someone else deletes the document between the confirmation opening and being confirmed —
+    // the same 404 the API already returns for a restore against a soft-deleted document.
+    exec(`UPDATE knowledge_documents SET is_deleted = true WHERE id = ${literal(documentId)};`);
+
+    await dialog.getByRole("button", { name: "Restore" }).click();
+    await expect(dialog.getByText("Document not found")).toBeVisible();
+
+    // Not stuck: Cancel is still clickable, and backs out to the timeline rather than staying
+    // wedged on the errored confirmation. Undeleting before Cancel (not after): Cancel remounts the
+    // timeline, which refetches immediately — done here so that refetch lands against a document
+    // that exists again, rather than racing the very undelete this line performs.
+    await expect(dialog.getByRole("button", { name: "Cancel" })).toBeEnabled();
+    exec(`UPDATE knowledge_documents SET is_deleted = false WHERE id = ${literal(documentId)};`);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog.getByRole("button", { name: "Restore" }).first()).toBeEnabled();
+  });
+
+  test("KBU-42 a large content change shows a compact badge with an on-demand 'View Details' modal — a small change stays a plain sentence with no button", { tag: '@tesbo.testId("TES-TC-2052")' }, async ({
+    browser,
+  }) => {
+    const title = stamp("LargeDiff");
+    const longText = "New paragraph about the change. ".repeat(10); // well over the 160-char threshold
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: longText, contentHtml: `<p>${longText}</p>` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, "short old text");
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await expect(dialog).toBeVisible();
+
+    // The row itself stays a one-line badge — the full old/new text only appears once asked for.
+    await expect(dialog.getByText("short old text")).toHaveCount(0);
+    const diffButton = dialog.getByRole("button", { name: "View Details" });
+    await expect(diffButton).toBeVisible();
+    await diffButton.click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+    await expect(diffModal.getByText("short old text", { exact: false })).toBeVisible();
+    await expect(diffModal.getByText("New paragraph about the change.", { exact: false }).first()).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    // A small, single-field change stays exactly as compact as it always has been: no badge.
+    const smallTitle = stamp("SmallDiff");
+    const smallCreated = await api.post(kbUrl("/documents"), {
+      data: { title: smallTitle, folderId: rootFolderId, documentType: "general", contentText: "new short text" },
+    });
+    const smallDocumentId = (await smallCreated.json()).id;
+    seedDocumentVersion(smallDocumentId, smallTitle, "old short text");
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${smallDocumentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const smallDialog = modal(page, "Update History");
+    await expect(smallDialog.getByText("Details updated.", { exact: false })).toBeVisible();
+    await expect(smallDialog.getByRole("button", { name: "View Details" })).toHaveCount(0);
+  });
+
+  /*
+   * Regression: a Zyra AI Memory scratchpad entry is stored as `## <ISO timestamp>\n<note>`
+   * (rememberZyraMemory, legacy.service.ts) — groupSections (text-diff.util.ts) uses that heading
+   * as the changed field's own `label`, so it used to reach this modal as a raw
+   * "2026-09-11T15:31:09.877Z" string: the T, the milliseconds and the Z all still there, unlike
+   * every other date shown anywhere else in the product. ChangeDiffModal now reformats a label in
+   * exactly that shape into the same DD/MM/YYYY, hh:mm:ss AM/PM the Update History list next to it
+   * already uses — computed here the same way the component does (local Date fields), so this
+   * assertion holds regardless of which timezone it runs in.
+   */
+  test("KBU-44 a Zyra-memory-style timestamp heading is formatted as DD/MM/YYYY, hh:mm:ss AM/PM in the Update History modal, not left as a raw ISO string", async ({
+    browser,
+  }) => {
+    function expectedLabel(iso: string): string {
+      const d = new Date(iso);
+      const dd = String(d.getDate()).padStart(2, "0");
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const hours24 = d.getHours();
+      const period = hours24 >= 12 ? "PM" : "AM";
+      const hours12 = String(hours24 % 12 || 12).padStart(2, "0");
+      const minutes = String(d.getMinutes()).padStart(2, "0");
+      const seconds = String(d.getSeconds()).padStart(2, "0");
+      return `${dd}/${mm}/${d.getFullYear()}, ${hours12}:${minutes}:${seconds} ${period}`;
+    }
+
+    const iso1 = "2026-09-10T11:41:15.253Z";
+    const iso2 = "2026-09-11T15:31:09.877Z";
+    const oldNote1 = "User triggered test case generation for the login page, producing 8 draft test cases.";
+    const newNote1 = `${oldNote1} Edited so this section alone clears the large-change threshold for its own diff button.`;
+    const oldNote2 = "User triggered test case generation targeting coverage gaps, producing 10 draft test cases.";
+    const newNote2 = `${oldNote2} Edited so this section too clears the threshold.`;
+
+    const title = stamp("ZyraMemoryHeading");
+    const created = await api.post(kbUrl("/documents"), {
+      data: {
+        title,
+        folderId: rootFolderId,
+        documentType: "general",
+        contentText: `## ${iso1}\n${newNote1}\n\n## ${iso2}\n${newNote2}`,
+      },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso1}\n${oldNote1}\n\n## ${iso2}\n${oldNote2}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // Both headings are formatted, consistently, and neither raw ISO string leaks through anywhere
+    // in the modal (as a label, or duplicated into the excerpt body underneath it).
+    await expect(diffModal.getByText(expectedLabel(iso1), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(expectedLabel(iso2), { exact: true })).toBeVisible();
+    await expect(diffModal.getByText(iso1, { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(iso2, { exact: false })).toHaveCount(0);
+
+    // The diff content itself is untouched by the label formatting. newNoteN extends oldNoteN, so
+    // scope each check to its own colored old/new box (ChangeDiffModal.tsx renders the excerpt as
+    // markdown now, so the "−"/"+" marker is a separate element from the note text rather than one
+    // concatenated string — the class-based scoping below, not a shared text node, is what tells
+    // an old box from a new one).
+    const oldBoxes = diffModal.locator('[class*="error-foreground"]');
+    const newBoxes = diffModal.locator('[class*="success-foreground"]');
+    await expect(oldBoxes.filter({ hasText: oldNote1 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote1 })).toHaveCount(1);
+    await expect(oldBoxes.filter({ hasText: oldNote2 })).toHaveCount(1);
+    await expect(newBoxes.filter({ hasText: newNote2 })).toHaveCount(1);
+
+    // The two sections are visually separated, not run together — a divider between them, distinct
+    // from the space-y-1.5 gap between one section's own old/new boxes.
+    await expect(diffModal.locator(".border-t")).toHaveCount(1);
+  });
+
+  /*
+   * Regression: the Update History modal used to render an excerpt as raw text (ChangeDiffModal.tsx),
+   * so a Zyra AI Memory note's own markdown — the "- " bullets Zyra writes its multi-point notes
+   * with — showed up as literal "- " characters instead of an actual bulleted list. Fixed by
+   * rendering the excerpt through the same renderMarkdown()/zyra-prose pairing
+   * ZyraContextDrawer.tsx already uses for this exact content elsewhere in the product.
+   */
+  test("KBU-45 a note's own markdown (bullets, a heading) renders as real elements in the Update History modal, not literal '- '/'## ' text", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-12T09:46:29.466Z";
+    const oldNote = `## Recap\n- First point about the run.\n- Second point about the run.`;
+    const newNote = `## Recap\n- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.`;
+
+    const title = stamp("ZyraMemoryMarkdown");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // The note's own "## Recap" heading and "- " bullets render as real elements...
+    await expect(diffModal.getByRole("heading", { name: "Recap", level: 2 })).toHaveCount(2); // one per old/new box
+    await expect(diffModal.locator("li", { hasText: "First point about the run." })).toHaveCount(2); // unchanged line, in both boxes
+    await expect(diffModal.locator("li", { hasText: "Third point added to clear the threshold." })).toHaveCount(1);
+
+    // ...so the raw markdown syntax itself is never visible as literal text anywhere in the modal.
+    await expect(diffModal.getByText("## Recap", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText(/^- /)).toHaveCount(0);
+  });
+
+  /*
+   * Regression: rendering the excerpt as markdown (KBU-45) fixed the raw "- " text, but the box's
+   * own −/+ old-vs-new marker was still glued directly in front of a bulleted note's first list
+   * item — first inline beside it, then (briefly) as a caption line above it — so a list still
+   * read as "− • User requested…" or "− REMOVED" sitting redundantly next to the colour-coded box
+   * that already says the same thing. Settled on: no marker or caption at all — the box's own
+   * red/green colour is the only old-vs-new signal, so nothing but the bullets themselves shows.
+   */
+  test("KBU-46 a bulleted note renders with no −/+ marker or caption, just its own clean bullets", async ({
+    browser,
+  }) => {
+    const iso = "2026-09-13T08:00:00.000Z";
+    const oldNote = "- First point about the run.\n- Second point about the run.";
+    const newNote = "- First point about the run.\n- Second point, edited, about the run.\n- Third point added to clear the threshold.";
+
+    const title = stamp("ZyraMemoryMarkerSpacing");
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title, folderId: rootFolderId, documentType: "general", contentText: `## ${iso}\n${newNote}` },
+    });
+    expect(created.status()).toBe(201);
+    const documentId = (await created.json()).id;
+    seedDocumentVersion(documentId, title, `## ${iso}\n${oldNote}`);
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const dialog = modal(page, "Update History");
+    await dialog.getByRole("button", { name: "View Details" }).click();
+
+    const diffModal = modal(page, "Update History");
+    await expect(diffModal).toBeVisible();
+
+    // Each bullet's own text is clean — no stray leading "-" or marker character in front of it.
+    const firstPointItem = diffModal.locator("li", { hasText: "First point about the run." }).first();
+    await expect(firstPointItem).toHaveText("First point about the run.");
+    await expect(diffModal.locator("li", { hasText: "−" })).toHaveCount(0);
+
+    // No "− Removed"/"+ Added" caption (or any other marker) sits above the list either — the
+    // colour-coded box alone is the old-vs-new signal now.
+    await expect(diffModal.getByText("Removed", { exact: false })).toHaveCount(0);
+    await expect(diffModal.getByText("Added", { exact: false })).toHaveCount(0);
+    const oldBox = diffModal.locator('[class*="error-foreground"]').filter({ hasText: "First point about the run." });
+    const newBox = diffModal.locator('[class*="success-foreground"]').filter({ hasText: "Third point added" });
+    await expect(oldBox.locator(":scope > *")).toHaveCount(1); // only the rendered list, nothing else
+    await expect(newBox.locator(":scope > *")).toHaveCount(1);
+  });
+
+  // ─── Regression: disconnecting Jira/Linear left the "Jira"/"Linear" folder ensureProviderFolder
+  //     created fully visible in this exact screen, looking exactly like a still-connected
+  //     integration. See e2e/api/integrations.spec.ts (INT-A-43..51) for the full DB-level proof
+  //     (never a hard delete, never restorable, org-wide, race-safe) — this pins the one thing only
+  //     a browser sees: the folder actually disappears from the tree the user is looking at. ───
+
+  test("KBU-43 the provider folder disappears from the visible tree after disconnecting the integration", async ({ browser }) => {
+    // A crashed prior run could have left this behind (the `finally` below never ran) — clear it
+    // up-front so this test's INSERT never collides with the (organization_id, provider) unique
+    // constraint on integration_connections.
+    exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    exec(
+      "INSERT INTO integration_connections (organization_id, provider, external_id, site_url, access_token, refresh_token, token_expires_at, connected_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, 'jira', 'kbu-43-site', 'https://e2e.invalid', 'e2e-not-a-real-token', '', now() + interval '1 hour', ${literal(tenant!.owner.userId)});`,
+    );
+    exec(
+      "INSERT INTO knowledge_folders (organization_id, project_id, parent_folder_id, name, source_provider, created_by, updated_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, 'Jira', 'jira', ` +
+        `${literal(tenant!.owner.userId)}, ${literal(tenant!.owner.userId)});`,
+    );
+
+    try {
+      const page = await openKb(browser);
+      await expect(treeRow(page, "Jira")).toBeVisible();
+
+      const disconnectRes = await api.delete("/api/workspace/integrations/jira/disconnect", { failOnStatusCode: false });
+      expect(disconnectRes.ok(), `disconnect answered ${disconnectRes.status()}: ${await disconnectRes.text()}`).toBe(true);
+
+      await page.reload();
+      await expect(page.getByRole("heading", { name: "Knowledge base", level: 1 })).toBeVisible();
+      await expect(treeRow(page, "Jira")).toHaveCount(0);
+      // No dangling "0 items" ghost folder anywhere else on the page either.
+      await expect(page.getByText("Jira")).toHaveCount(0);
+    } finally {
+      exec(`DELETE FROM integration_connections WHERE organization_id = ${literal(tenant!.organizationId)} AND provider = 'jira';`);
+    }
+  });
+
+  // ─── Regression: Markdown pasted into a document was stored as raw text ("# Title", "* item",
+  //     "**bold**" all literal, one paragraph per line) because the editor only ever parsed a
+  //     clipboard's HTML. Markdown is now parsed on paste — but only when there is no rich HTML to
+  //     prefer, and never inside code, where the characters are the content. ───
+
+  /** Creates an empty document and opens it in the editor, caret in the (empty) body. */
+  async function openEmptyDocument(browser: Browser, label: string): Promise<{ page: Page; editor: Locator; documentId: string }> {
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: stamp(label), folderId: rootFolderId, documentType: "general" },
+    });
+    expect(created.status(), `creating the document — ${await created.text()}`).toBe(201);
+    const documentId = (await created.json()).id;
+
+    const ctx = await browser.newContext({ storageState: states.get("owner") });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor).toBeVisible();
+    await editor.click();
+    return { page, editor, documentId };
+  }
+
+  /**
+   * A synthetic paste carrying exactly the given clipboard flavours. The real OS clipboard is not
+   * used on purpose: it is one machine-wide buffer shared by every parallel worker, and it can't
+   * express "text/plain only" vs "text/plain + text/html" — the distinction this feature turns on.
+   * ProseMirror reads `event.clipboardData`, which a constructed ClipboardEvent supplies in Chromium.
+   */
+  async function paste(editor: Locator, data: { text: string; html?: string }) {
+    await editor.evaluate((el, { text, html }) => {
+      const dt = new DataTransfer();
+      dt.setData("text/plain", text);
+      if (html) dt.setData("text/html", html);
+      el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+    }, data);
+  }
+
+  /** Saves, then waits until the stored HTML shows `marker` — the save is only real once it's persisted. */
+  async function saveAndReadStored(page: Page, documentId: string, marker: string): Promise<{ html: string; text: string }> {
+    await page.getByRole("button", { name: "Save" }).click();
+    await expect
+      .poll(() => scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`), {
+        message: "the pasted content reaches the stored document",
+      })
+      .toContain(marker);
+    return {
+      html: scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      text: scalar(`SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+    };
+  }
+
+  test("KBU-48 pasted Markdown becomes headings, bold and a bullet list — stored without the # / ** / * syntax, and survives a reload", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Markdown paste");
+    // The body from the bug report, as copied out of a plain-text source (no text/html flavour).
+    await paste(editor, {
+      text: [
+        "# Payment & Booking Confirmation Module – Scope Document",
+        "## Module Overview",
+        "This module handles payment processing and confirms a booking after **successful payment**.",
+        "## In Scope",
+        "### Booking Summary",
+        "Before payment, the system displays:",
+        "* Movie name",
+        "* Cinema",
+        "* Convenience fee",
+      ].join("\n"),
+    });
+
+    await expect(editor.locator("h1")).toHaveText("Payment & Booking Confirmation Module – Scope Document");
+    await expect(editor.locator("h2")).toHaveText(["Module Overview", "In Scope"]);
+    await expect(editor.locator("h3")).toHaveText("Booking Summary");
+    await expect(editor.locator("strong")).toHaveText("successful payment");
+    await expect(editor.locator("ul > li")).toHaveText(["Movie name", "Cinema", "Convenience fee"]);
+
+    const stored = await saveAndReadStored(page, documentId, "<h3>Booking Summary</h3>");
+    expect(stored.html).toContain("<h2>Module Overview</h2>");
+    expect(stored.html).toContain("<strong>successful payment</strong>");
+    expect(stored.html).toMatch(/<ul>\s*<li>\s*<p>Movie name<\/p>\s*<\/li>/);
+    // The bug itself: none of the Markdown syntax is left behind as text.
+    expect(stored.text).not.toContain("#");
+    expect(stored.text).not.toContain("**");
+    expect(stored.text).not.toMatch(/^\* /m);
+
+    await page.reload();
+    await expect(page.locator(".ProseMirror").first().locator("h2").first()).toHaveText("Module Overview");
+    await expect(page.locator(".ProseMirror").first().locator("ul > li")).toHaveCount(3);
+  });
+
+  test("KBU-49 Markdown copied from a code editor — whose clipboard HTML is only styled spans around the raw text — is converted too", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Editor Markdown paste");
+    // The shape VS Code puts on the clipboard: presentational <div>/<span> wrappers, no structure.
+    await paste(editor, {
+      text: "## Copied from an editor\n* first point",
+      html: '<div style="color: #d4d4d4;"><div><span style="color: #569cd6;">## Copied from an editor</span></div><div><span>* first point</span></div></div>',
+    });
+
+    await expect(editor.locator("h2")).toHaveText("Copied from an editor");
+    await expect(editor.locator("ul > li")).toHaveText("first point");
+    const stored = await saveAndReadStored(page, documentId, "<h2>Copied from an editor</h2>");
+    expect(stored.text).not.toContain("##");
+  });
+
+  test("KBU-50 a rich HTML paste keeps its HTML structure — the Markdown-looking plain-text twin on the clipboard is ignored", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Rich paste");
+    // A browser/Docs copy carries both flavours. The <em> exists only in the HTML, so seeing it is
+    // proof the HTML was used rather than the text/plain Markdown.
+    await paste(editor, {
+      text: "## Rich heading\n\n**Bold** and italic\n\n* item one",
+      html: "<h2>Rich heading</h2><p><strong>Bold</strong> and <em>italic</em></p><ul><li><p>item one</p></li></ul>",
+    });
+
+    await expect(editor.locator("h2")).toHaveText("Rich heading");
+    await expect(editor.locator("em")).toHaveText("italic");
+    const stored = await saveAndReadStored(page, documentId, "<em>italic</em>");
+    expect(stored.html).toContain("<h2>Rich heading</h2>");
+    expect(stored.html).toContain("<strong>Bold</strong>");
+    expect(stored.html).toMatch(/<li>\s*<p>item one<\/p>\s*<\/li>/);
+    expect(stored.text).not.toContain("##");
+  });
+
+  test("KBU-51 Markdown inside pasted code spans and fenced blocks stays literal", async ({ browser }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Markdown code paste");
+    await paste(editor, { text: "Use `**not bold**` here\n\n```\n# not a heading\n* not a list\n```" });
+
+    await expect(editor.locator("p code")).toHaveText("**not bold**");
+    await expect(editor.locator("pre")).toContainText("# not a heading");
+    await expect(editor.locator("h1")).toHaveCount(0);
+    await expect(editor.locator("strong")).toHaveCount(0);
+    await expect(editor.locator("ul")).toHaveCount(0);
+
+    const stored = await saveAndReadStored(page, documentId, "<code>**not bold**</code>");
+    expect(stored.html).toMatch(/<pre><code>[^<]*# not a heading\n\* not a list[^<]*<\/code><\/pre>/);
+  });
+
+  test("KBU-52 Markdown pasted into a code block or with the caret in inline code is inserted literally", async ({ browser }) => {
+    // Two separate documents, so no caret movement is ever needed *after* a paste: pressing End with
+    // the caret inside an inline <code> run did not reliably reach the end of the line in Chromium,
+    // and the following Enter then split the paragraph mid-word.
+
+    // 1. A code block in an empty document.
+    const block = await openEmptyDocument(browser, "Paste into code block");
+    await block.page.getByRole("button", { name: "Code block" }).click();
+    await paste(block.editor, { text: "## block literal\n* still text" });
+    await expect(block.editor.locator("pre")).toContainText("## block literal");
+    await expect(block.editor.locator("h2")).toHaveCount(0);
+    await expect(block.editor.locator("ul")).toHaveCount(0);
+    const storedBlock = await saveAndReadStored(block.page, block.documentId, "## block literal");
+    expect(storedBlock.html).toMatch(/<pre><code>## block literal\n\* still text<\/code><\/pre>/);
+
+    // 2. The caret inside an inline-code run: turn inline code on, type a word, step back into it.
+    //    No selection is ever made: the toolbar re-focuses the editor asynchronously, and a key
+    //    pressed before focus returned was lost — with a word selected, the next ArrowLeft then
+    //    collapsed to its *start* and the paste landed outside the intended spot.
+    const inline = await openEmptyDocument(browser, "Paste into inline code");
+    await inline.page.getByRole("button", { name: "Inline code" }).click();
+    await expect(inline.editor).toBeFocused();
+    await inline.page.keyboard.type("codeword");
+    await expect(inline.editor.locator("code")).toHaveText("codeword");
+    await inline.page.keyboard.press("ArrowLeft");
+    await inline.page.keyboard.press("ArrowLeft");
+    await paste(inline.editor, { text: "**inline literal**" });
+    await expect(inline.editor.locator("strong")).toHaveCount(0);
+    await expect(inline.editor.locator("code")).toHaveText("codewo**inline literal**rd");
+    const storedInline = await saveAndReadStored(inline.page, inline.documentId, "**inline literal**");
+    expect(storedInline.html).toContain("<code>codewo**inline literal**rd</code>");
+    expect(storedInline.html).not.toContain("<strong>");
+  });
+
+  test("KBU-53 plain text with no Markdown in it pastes exactly as before — one paragraph per line, nothing reformatted", async ({
+    browser,
+  }) => {
+    const { page, editor, documentId } = await openEmptyDocument(browser, "Plain paste");
+    await paste(editor, { text: "First plain line\nSecond line: 2 * 3 = 6" });
+
+    await expect(editor.locator("p")).toHaveText(["First plain line", "Second line: 2 * 3 = 6"]);
+    const stored = await saveAndReadStored(page, documentId, "Second line: 2 * 3 = 6");
+    expect(stored.html).toContain("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
+  });
+
+  // ─── Regression: the Create document dialog's Content box (Blank document template) stored every
+  //     line verbatim as its own paragraph, so Markdown typed or pasted there — "# Title",
+  //     "* item", "**bold**", "---" — was saved as literal text. This path never touches the
+  //     editor's paste handler (KBU-48..53); the text is converted when the document is created. ───
+
+  /** Creates a Blank document through the dialog with `content` in its Content box; returns its id. */
+  async function createBlankDocument(page: Page, title: string, content: string): Promise<string> {
+    await newMenu(page, "Create document");
+    const dialog = modal(page, "Create document");
+    await dialog.getByPlaceholder("e.g. Login Requirements").fill(title);
+    // "Blank document" is the default template, and the only one that shows the Content box.
+    await dialog.getByPlaceholder(/Write something before creating/).fill(content);
+    await dialog.getByRole("button", { name: "Create document" }).click();
+    await expect(page).toHaveURL(/\/knowledge-base\/documents\/[0-9a-f-]{36}$/);
+    return page.url().split("/").pop()!;
+  }
+
+  function storedDocument(documentId: string): { html: string; text: string } {
+    return {
+      html: scalar(`SELECT COALESCE(content_html, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+      text: scalar(`SELECT COALESCE(content_text, '') FROM knowledge_documents WHERE id = ${literal(documentId)};`),
+    };
+  }
+
+  test("KBU-54 Markdown in the Create document Content box is stored as headings, lists, bold and a divider — not raw syntax", async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    // The body from the bug report.
+    const documentId = await createBlankDocument(
+      page,
+      stamp("Create Markdown"),
+      [
+        "# SmartCart Test Document",
+        "",
+        "## 1. Feature Overview",
+        "",
+        "SmartCart is an online shopping application.",
+        "",
+        "### 1.1 Main Features",
+        "",
+        "* User Registration",
+        "* Product Search",
+        "",
+        "### 1.2 Important Rules",
+        "",
+        "**User must be logged in before placing an order.**",
+        "",
+        "---",
+        "",
+        "```",
+        "# not a heading",
+        "```",
+      ].join("\n"),
+    );
+
+    const editor = page.locator(".ProseMirror").first();
+    await expect(editor.locator("h1")).toHaveText("SmartCart Test Document");
+    await expect(editor.locator("h2")).toHaveText("1. Feature Overview");
+    await expect(editor.locator("h3")).toHaveText(["1.1 Main Features", "1.2 Important Rules"]);
+    await expect(editor.locator("ul > li")).toHaveText(["User Registration", "Product Search"]);
+    await expect(editor.locator("strong")).toHaveText("User must be logged in before placing an order.");
+    await expect(editor.locator("hr")).toHaveCount(1);
+    // Markdown inside a fenced block stays literal.
+    await expect(editor.locator("pre")).toContainText("# not a heading");
+
+    // Persisted at create time — not dependent on the editor's autosave.
+    const stored = storedDocument(documentId);
+    expect(stored.html).toContain("<h1>SmartCart Test Document</h1>");
+    expect(stored.html).toContain("<h3>1.1 Main Features</h3>");
+    expect(stored.html).toContain("<strong>User must be logged in before placing an order.</strong>");
+    expect(stored.html).toContain("<hr>");
+    expect(stored.text).not.toMatch(/^#{1,3} /m);
+    expect(stored.text).not.toMatch(/^\* /m);
+    expect(stored.text).not.toContain("**");
+
+    await page.reload();
+    await expect(page.locator(".ProseMirror").first().locator("h1")).toHaveText("SmartCart Test Document");
+  });
+
+  test("KBU-55 plain text with no Markdown in the Create document Content box is stored as before — one paragraph per line", async ({
+    browser,
+  }) => {
+    const page = await openKb(browser);
+    const documentId = await createBlankDocument(page, stamp("Create plain"), "First plain line\nSecond line: 2 * 3 = 6");
+
+    await expect(page.locator(".ProseMirror").first().locator("p")).toHaveText(["First plain line", "Second line: 2 * 3 = 6"]);
+    expect(storedDocument(documentId).html).toBe("<p>First plain line</p><p>Second line: 2 * 3 = 6</p>");
+  });
+
+  // ─── Zyra AI Memory: managed by Zyra, corrected one entry at a time ────────
+  //
+  // rememberZyraMemory (legacy.service.ts) stores each entry as `## <ISO timestamp>\n<note>` in
+  // content_text, with content_html as that text escaped inside a bare <pre>.
+  //
+  // "[Knowledgebase] Zyra Memory should show proper date and time format same as other sections":
+  // entry timestamps show in lib/date.ts's formatDateTime shape ("05 Oct 2026, 06:21 PM",
+  // viewer-local), never the raw ISO string, and never as one code block.
+  //
+  // "[Knowledge Base] Zyra Memory Should Not Support Unrestricted Direct Editing": Zyra reads this
+  // body back as context, so the page has no free-form editor for it — the API flags it
+  // (isManagedByZyra) and returns its entries parsed; owners/managers correct or remove one entry at
+  // a time (ZyraMemoryEntries.tsx), everyone else only reads. Ordinary documents are unchanged.
+
+  const MEMORY_ISO_1 = "2026-10-05T12:21:14.614Z";
+  const MEMORY_ISO_2 = "2026-10-05T12:20:05.524Z";
+  const MEMORY_NOTE_1 = "QAB-242 was re-run and produced 26 testcase drafts using 3 knowledge-base sources.";
+  const MEMORY_NOTE_2 = "QAB-243 produced 24 testcase drafts using 2 knowledge-base sources and 1 Linear ticket.";
+  const MEMORY_TEXT = `## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1}\n\n## ${MEMORY_ISO_2}\n- ${MEMORY_NOTE_2}`;
+
+  /** lib/date.ts formatDateTime's shape, from local Date fields — holds in whatever timezone this runs. */
+  function memoryHeading(iso: string): string {
+    const d = new Date(iso);
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const hours12 = String(d.getHours() % 12 || 12).padStart(2, "0");
+    const period = d.getHours() >= 12 ? "PM" : "AM";
+    return `${String(d.getDate()).padStart(2, "0")} ${months[d.getMonth()]} ${d.getFullYear()}, ${hours12}:${String(d.getMinutes()).padStart(2, "0")} ${period}`;
+  }
+
+  /** The bare-<pre> HTML rememberZyraMemory writes (`<pre>${escapeHtml(content)}</pre>`). */
+  function zyraPreHtml(text: string): string {
+    return `<pre>${text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;")}</pre>`;
+  }
+
+  /**
+   * Inserted directly, as rememberZyraMemory does: the API refuses the reserved title, and producing a
+   * real one means a live model call. afterEach's purgeKb removes it (and its versions).
+   */
+  function seedZyraMemory(options: { text?: string; contentJson?: unknown } = {}): string {
+    const text = options.text ?? MEMORY_TEXT;
+    const json = options.contentJson === undefined ? "NULL" : `${literal(JSON.stringify(options.contentJson))}::jsonb`;
+    exec(
+      "INSERT INTO knowledge_documents (organization_id, project_id, folder_id, title, content_text, content_html, content_json, " +
+        "document_type, status, is_ai_generated, created_by, updated_by) VALUES (" +
+        `${literal(tenant!.organizationId)}, ${literal(tenant!.mainProjectId)}, ${literal(rootFolderId)}, 'Zyra AI Memory', ` +
+        `${literal(text)}, ${literal(zyraPreHtml(text))}, ${json}, 'general', 'published', true, ` +
+        `${literal(tenant!.owner.userId)}, ${literal(tenant!.owner.userId)});`,
+    );
+    return scalar(
+      `SELECT id FROM knowledge_documents WHERE project_id = ${literal(tenant!.mainProjectId)} AND title = 'Zyra AI Memory' AND is_deleted = false ORDER BY created_at DESC LIMIT 1;`,
+    );
+  }
+
+  async function openDocument(browser: Browser, documentId: string, as: "owner" | "qa" = "owner"): Promise<Page> {
+    const ctx = await browser.newContext({ storageState: states.get(as) });
+    contexts.push(ctx);
+    const page = await ctx.newPage();
+    await page.goto(`/projects/${tenant!.mainProjectId}/knowledge-base/documents/${documentId}`);
+    await expect(page.getByTestId("zyra-memory-banner").or(page.locator(".ProseMirror").first())).toBeVisible();
+    return page;
+  }
+
+  function memoryEntry(page: Page, iso: string): Locator {
+    return page.locator(`[data-testid="zyra-memory-entry"][data-entry-id="${iso}"]`);
+  }
+
+  test("KBU-56 Zyra AI Memory shows each entry under a sitewide-format date, as rendered notes — no raw ISO, no code block, no editor", async ({
+    browser,
+  }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+
+    const entries = page.getByTestId("zyra-memory-entry");
+    await expect(entries.locator("h2")).toHaveText([memoryHeading(MEMORY_ISO_1), memoryHeading(MEMORY_ISO_2)]);
+    await expect(entries.locator("li")).toHaveText([MEMORY_NOTE_1, MEMORY_NOTE_2]);
+    await expect(page.locator(".ProseMirror"), "Zyra's memory must not get the free-form editor").toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entries").locator("pre")).toHaveCount(0);
+    const shown = await page.getByTestId("zyra-memory-entries").innerText();
+    expect(shown).not.toContain(MEMORY_ISO_1);
+    expect(shown).not.toContain(MEMORY_ISO_2);
+    expect(shown, "no Markdown heading syntax left visible").not.toContain("## ");
+
+    // Display only: opening the document must not write anything back. The autosave debounce is
+    // 1.2s, so wait past it before reading the row.
+    await page.waitForTimeout(2500);
+    expect(storedDocument(documentId)).toEqual({ html: zyraPreHtml(MEMORY_TEXT), text: MEMORY_TEXT });
+  });
+
+  test("KBU-57 the memory page has no direct-edit controls: read-only title, no Save, no Delete, a managed-by-Zyra banner", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("Managed by Zyra");
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("correct or remove individual entries");
+    await expect(page.getByPlaceholder("Untitled document")).toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "More actions" }).click();
+    await expect(page.getByRole("button", { name: "View history" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Delete", exact: true }), "the memory can't be deleted, so no Delete is offered").toHaveCount(0);
+  });
+
+  test("KBU-58 Edit opens the regular Knowledge Base editor with the entry formatted, and Save stores it back as Markdown", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+    const entryRequests: string[] = [];
+    page.on("request", (req) => {
+      if (req.url().includes("/memory-entries/")) entryRequests.push(req.method());
+    });
+
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    await entry.getByRole("button", { name: "Edit" }).click();
+    // The same editor ordinary documents use: toolbar and a contenteditable ProseMirror surface,
+    // with the note shown formatted (a real bullet) rather than its "- " Markdown source.
+    const editor = entry.locator(".ProseMirror");
+    await expect(editor).toHaveAttribute("contenteditable", "true");
+    await expect(entry.getByTitle("Bold")).toBeVisible();
+    await expect(editor.locator("li")).toHaveText(MEMORY_NOTE_1);
+    expect(await editor.innerText(), "raw Markdown syntax in the editor").not.toMatch(/^- |##/m);
+
+    // Saving without typing anything sends nothing, so the stored note can't be re-serialised.
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+    expect(entryRequests, "an untouched Save made a request").toEqual([]);
+
+    // Cancel discards typed changes.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" throwaway");
+    await entry.getByRole("button", { name: "Cancel" }).click();
+    await expect(entry.locator("li")).toHaveText(MEMORY_NOTE_1);
+    expect(entryRequests).toEqual([]);
+
+    // Emptying the editor disables Save — an empty entry is removed, not saved.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror").click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.press("Delete");
+    await expect(entry.getByRole("button", { name: "Save entry" })).toBeDisabled();
+    await entry.getByRole("button", { name: "Cancel" }).click();
+
+    // A real edit is stored as Markdown, under the same timestamp; the other entry is untouched.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" (corrected)");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+    await expect(entry.locator("li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await expect(entry.locator("h2")).toHaveText(memoryHeading(MEMORY_ISO_1));
+    await expect(memoryEntry(page, MEMORY_ISO_2).locator("li")).toHaveText(MEMORY_NOTE_2);
+    expect(storedDocument(documentId).text).toBe(`## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1} (corrected)\n\n## ${MEMORY_ISO_2}\n- ${MEMORY_NOTE_2}`);
+
+    // Survives a reload, and re-opening Edit shows the saved content formatted again.
+    await page.reload();
+    const reloaded = memoryEntry(page, MEMORY_ISO_1);
+    await expect(reloaded.locator("li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await reloaded.getByRole("button", { name: "Edit" }).click();
+    await expect(reloaded.locator(".ProseMirror li")).toHaveText(`${MEMORY_NOTE_1} (corrected)`);
+    await reloaded.getByRole("button", { name: "Cancel" }).click();
+
+    // The correction is in View history, but a whole-document restore is not offered for the memory.
+    await page.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("button", { name: "View history" }).click();
+    const history = modal(page, "Update History");
+    await expect(history).toBeVisible();
+    // Wait for the timeline itself (the correction's version row), so the absence below is real.
+    await expect(history.getByText("Updated", { exact: true }).first()).toBeVisible();
+    await expect(history.getByRole("button", { name: /^Restor/ })).toHaveCount(0);
+  });
+
+  test("KBU-64 a formatted note keeps its heading, bold and list structure through View -> Edit -> Save", async ({ browser }) => {
+    const note = "### Context\n\n- **Login** flow covered\n- Second point";
+    const documentId = seedZyraMemory({ text: `## ${MEMORY_ISO_1}\n${note}` });
+    const page = await openDocument(browser, documentId);
+
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    // View: rendered, not raw.
+    await expect(entry.locator("h3")).toHaveText("Context");
+    await expect(entry.locator("strong")).toHaveText("Login");
+    await expect(entry.locator("li")).toHaveText(["Login flow covered", "Second point"]);
+
+    // Edit: the same structure inside the editor.
+    await entry.getByRole("button", { name: "Edit" }).click();
+    const editor = entry.locator(".ProseMirror");
+    await expect(editor.locator("h3")).toHaveText("Context");
+    await expect(editor.locator("strong")).toHaveText("Login");
+    await expect(editor.locator("li")).toHaveText(["Login flow covered", "Second point"]);
+
+    await editor.locator("li").last().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" (edited)");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    await expect(entry.locator(".ProseMirror")).toHaveCount(0);
+
+    // Stored back as Markdown with the structure intact.
+    const stored = storedDocument(documentId).text;
+    expect(stored.startsWith(`## ${MEMORY_ISO_1}\n`), stored).toBe(true);
+    expect(stored).toContain("### Context");
+    expect(stored).toContain("**Login** flow covered");
+    expect(stored).toContain("- Second point (edited)");
+    // And View shows it formatted again.
+    await expect(entry.locator("h3")).toHaveText("Context");
+    await expect(entry.locator("li")).toHaveText(["Login flow covered", "Second point (edited)"]);
+  });
+
+  test("KBU-59 an owner removes one entry after confirming; cancelling the confirmation keeps it", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+
+    const entry = memoryEntry(page, MEMORY_ISO_2);
+    await entry.getByRole("button", { name: "Remove" }).click();
+    const confirm = modal(page, "Remove memory entry");
+    await expect(confirm).toBeVisible();
+    await confirm.getByRole("button", { name: "Cancel" }).click();
+    await expect(entry).toBeVisible();
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+
+    await entry.getByRole("button", { name: "Remove" }).click();
+    await modal(page, "Remove memory entry").getByRole("button", { name: "Remove entry" }).click();
+    await expect(entry).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entry")).toHaveCount(1);
+    expect(storedDocument(documentId).text).toBe(`## ${MEMORY_ISO_1}\n- ${MEMORY_NOTE_1}`);
+  });
+
+  test("KBU-60 a QA engineer reads the memory but gets no Edit or Remove, and is told who can change it", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId, "qa");
+
+    await expect(page.getByTestId("zyra-memory-entry")).toHaveCount(2);
+    await expect(page.getByRole("button", { name: "Edit" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Remove" })).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-banner")).toContainText("Only project owners and managers can correct or remove entries");
+  });
+
+  test("KBU-61 a failed correction shows the API's error and leaves the entry as it was", async ({ browser }) => {
+    const documentId = seedZyraMemory();
+    const page = await openDocument(browser, documentId);
+    // Forced server-side refusal: the UI must surface it rather than pretend the save worked.
+    await page.route("**/memory-entries/**", (route) =>
+      route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({ error: "E2E forced refusal" }) }),
+    );
+
+    const entry = memoryEntry(page, MEMORY_ISO_1);
+    await entry.getByRole("button", { name: "Edit" }).click();
+    await entry.locator(".ProseMirror li").first().click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" should not land");
+    await entry.getByRole("button", { name: "Save entry" }).click();
+    // Scoped: Next's route announcer is also a role="alert" on the page.
+    await expect(page.getByTestId("zyra-memory-entries").getByRole("alert")).toContainText("E2E forced refusal");
+    // Still in the editor with the typed text, so nothing is silently lost.
+    await expect(entry.locator(".ProseMirror li")).toHaveText(`${MEMORY_NOTE_1} should not land`);
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+  });
+
+  test("KBU-62 text an old direct edit left above the entries shows as 'Unstructured notes' and can be removed", async ({ browser }) => {
+    // Rows saved through the old editor carry its JSON too; it must not be what the page shows.
+    const staleJson = { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Stale editor copy" }] }] };
+    // A flattened timestamp line (what an old editor save left behind), followed by the blank-line
+    // run empty paragraphs produce.
+    const documentId = seedZyraMemory({ text: `06 Oct 2026, 01:06 PM\n\n\n\n\nHand-typed line\n\n${MEMORY_TEXT}`, contentJson: staleJson });
+    const page = await openDocument(browser, documentId);
+
+    const unstructured = memoryEntry(page, "unstructured");
+    await expect(unstructured.locator("h2")).toHaveText("Unstructured notes");
+    await expect(unstructured).toContainText("Hand-typed line");
+    // The date line heads its own group, bold, directly above the text it belongs to.
+    const group = unstructured.getByTestId("zyra-memory-note-group").first();
+    const date = group.getByText("06 Oct 2026, 01:06 PM", { exact: true });
+    await expect(date).toHaveCSS("font-weight", "600");
+    await expect(group).toContainText("Hand-typed line");
+    // Blank-line runs leave no line breaks behind — spacing comes from paragraph margins only.
+    await expect(unstructured.locator("br")).toHaveCount(0);
+    await expect(page.getByTestId("zyra-memory-entries")).not.toContainText("Stale editor copy");
+
+    await unstructured.getByRole("button", { name: "Remove" }).click();
+    await modal(page, "Remove memory entry").getByRole("button", { name: "Remove entry" }).click();
+    await expect(unstructured).toHaveCount(0);
+    expect(storedDocument(documentId).text).toBe(MEMORY_TEXT);
+  });
+
+  test("KBU-63 an ordinary document keeps its editor, editable title, Save and Delete", async ({ browser }) => {
+    const created = await api.post(kbUrl("/documents"), {
+      data: { title: stamp("Ordinary editable"), folderId: rootFolderId, documentType: "general", contentText: `## ${MEMORY_ISO_1}\nnot memory` },
+    });
+    expect(created.status(), await created.text()).toBe(201);
+    const documentId = (await created.json()).id;
+    const page = await openDocument(browser, documentId);
+
+    await expect(page.getByTestId("zyra-memory-banner")).toHaveCount(0);
+    await expect(page.locator(".ProseMirror").first()).toHaveAttribute("contenteditable", "true");
+    await expect(page.getByPlaceholder("Untitled document")).not.toHaveAttribute("readonly", "");
+    await expect(page.getByRole("button", { name: "Save", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "More actions" }).click();
+    await expect(page.getByRole("button", { name: "Delete", exact: true })).toBeVisible();
+  });
+});
