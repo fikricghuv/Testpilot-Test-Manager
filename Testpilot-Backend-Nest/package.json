@@ -57,7 +57,7 @@
     "@types/cookie-parser": "^1.4.8",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.14",
-    "@types/multer": "^1.4.12",
+    "@types/multer": "^2.3.0",
     "@types/node": "^22.10.7",
     "@types/pdf-parse": "^1.1.5",
     "@types/pg": "^8.11.10",
