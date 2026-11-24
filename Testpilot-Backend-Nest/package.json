@@ -23,7 +23,7 @@
     "@langfuse/otel": "^5.10.1",
     "@langfuse/tracing": "^5.10.1",
     "@nestjs/bullmq": "^10.2.3",
-    "@nestjs/common": "^10.4.15",
+    "@nestjs/common": "^12.6.0",
     "@nestjs/core": "^10.4.15",
     "@nestjs/platform-express": "^10.4.15",
     "@opentelemetry/api": "^1.9.1",
