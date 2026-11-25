@@ -16,6 +16,7 @@ import {
   IconGitCompare,
   IconListCheck,
   IconMessage2Bolt,
+  IconPlayerPlay,
   IconSettings2,
   IconShieldCheck,
   IconWand,
@@ -40,6 +41,8 @@ const CAPABILITY_META: Record<keyof ZyraCapabilities, { icon: ChipIcon; label: s
   knowledgeBase: { icon: IconBook, label: "Knowledge base" },
   testcaseStorage: { icon: IconDatabase, label: "Testcase storage" },
   suiteOperations: { icon: IconListCheck, label: "Suite operations" },
+  runOperations: { icon: IconPlayerPlay, label: "Run operations" },
+  bugOperations: { icon: IconBug, label: "Bug operations" },
 };
 
 const futureAgents: Array<{

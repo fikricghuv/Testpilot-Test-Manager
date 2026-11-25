@@ -32,20 +32,29 @@ interface ZyraSettingsData {
 }
 
 const RANGE_OPTIONS: { value: TestcaseRange; num: string; label: string; description: string }[] = [
-  { value: "1-10",    num: "1–10",  label: "Focused",    description: "High-quality coverage" },
-  { value: "10-30",   num: "10–30", label: "Broad",      description: "Coverage with edge cases" },
-  { value: "30-50",   num: "30–50", label: "Extensive",  description: "Deep coverage across scenarios" },
-  { value: "all",     num: "All",   label: "Exhaustive", description: "Every scenario Zyra can find" },
+  { value: "1-10", num: "1–10", label: "Focused", description: "High-quality coverage" },
+  { value: "10-30", num: "10–30", label: "Broad", description: "Coverage with edge cases" },
+  { value: "30-50", num: "30–50", label: "Extensive", description: "Deep coverage across scenarios" },
+  { value: "all", num: "All", label: "Exhaustive", description: "Every scenario Zyra can find" },
 ];
 
 const DEFAULT_TESTCASE_RANGE: TestcaseRange = "all";
-const DEFAULT_CAPABILITIES: ZyraCapabilities = { generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true };
+const DEFAULT_CAPABILITIES: ZyraCapabilities = {
+  generation: true,
+  knowledgeBase: true,
+  testcaseStorage: true,
+  suiteOperations: true,
+  runOperations: true,
+  bugOperations: true,
+};
 
 const CAPABILITY_FIELDS: { key: keyof ZyraCapabilities; label: string; description: string }[] = [
   { key: "generation", label: "Test case generation", description: "Author and generate new test cases in chat and on the task board. Core feature." },
   { key: "knowledgeBase", label: "Knowledge base access", description: "Let Zyra read this project's knowledge base for richer, grounded answers." },
   { key: "testcaseStorage", label: "Test case storage operations", description: "Create, update, delete/archive, and bulk-edit test cases from chat." },
   { key: "suiteOperations", label: "Suite operations", description: "Create suites and move/assign existing test cases into suites." },
+  { key: "runOperations", label: "Test run operations", description: "Create, update, and delete test runs (cycles) from chat." },
+  { key: "bugOperations", label: "Bug operations", description: "Create, update, and delete bugs from chat." },
 ];
 
 function capitalize(value: string): string {
@@ -304,11 +313,10 @@ export default function ZyraSettingsPage() {
 
                 {connectionResult && (
                   <div
-                    className={`mx-5 mb-5 flex items-start gap-2 rounded-[6px] border p-3 text-[12px] ${
-                      connectionResult.ok
-                        ? "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success-foreground)]"
-                        : "border-[var(--error-border)] bg-[var(--error-soft)] text-[var(--error-foreground)]"
-                    }`}
+                    className={`mx-5 mb-5 flex items-start gap-2 rounded-[6px] border p-3 text-[12px] ${connectionResult.ok
+                      ? "border-[var(--success-border)] bg-[var(--success-soft)] text-[var(--success-foreground)]"
+                      : "border-[var(--error-border)] bg-[var(--error-soft)] text-[var(--error-foreground)]"
+                      }`}
                   >
                     {connectionResult.ok ? (
                       <IconCircleCheck size={15} stroke={1.9} className="mt-0.5 shrink-0" />
@@ -379,11 +387,10 @@ export default function ZyraSettingsPage() {
                     // the same defect class the theme pass fixed elsewhere.
                     aria-pressed={active}
                     onClick={() => selectTestcaseRange(option.value)}
-                    className={`rounded-[8px] border p-3.5 text-left transition-colors ${
-                      active
-                        ? "border-[var(--brand-primary)] bg-[var(--brand-soft)]"
-                        : "border-[var(--border)] bg-[var(--surface-secondary)] hover:border-[var(--brand-border)]"
-                    }`}
+                    className={`rounded-[8px] border p-3.5 text-left transition-colors ${active
+                      ? "border-[var(--brand-primary)] bg-[var(--brand-soft)]"
+                      : "border-[var(--border)] bg-[var(--surface-secondary)] hover:border-[var(--brand-border)]"
+                      }`}
                   >
                     <div className={`font-mono text-[15px] font-semibold ${active ? "text-[var(--accent-light)]" : "text-[var(--foreground)]"}`}>
                       {option.num}

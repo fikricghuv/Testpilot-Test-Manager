@@ -1041,6 +1041,8 @@ export interface ZyraCapabilities {
   knowledgeBase: boolean;
   testcaseStorage: boolean;
   suiteOperations: boolean;
+  runOperations: boolean;
+  bugOperations: boolean;
 }
 
 export interface ZyraAgentState {

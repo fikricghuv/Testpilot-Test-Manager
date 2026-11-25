@@ -197,7 +197,7 @@ describe("applyZyraChatOperations — a batch's suite is looked up once, not onc
   function setup() {
     const query = jest.fn(() => Promise.resolve({ rows: [{ id: "req-1" }] })) as unknown as Query;
     const svc = makeLegacy(query);
-    jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true });
+    jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true });
     jest.spyOn(internals(svc), "resolveZyraActor").mockResolvedValue("actor-1");
     jest.spyOn(internals(svc), "recordZyraPendingReviewRequest").mockResolvedValue(undefined);
     const log = jest.spyOn(internals(svc), "logProjectActivity").mockResolvedValue(undefined);

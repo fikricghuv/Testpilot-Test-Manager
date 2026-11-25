@@ -63,7 +63,7 @@ function makeLegacy(): LegacyService {
 
 function mockCapabilitiesAndActor(svc: LegacyService): void {
   jest.spyOn(svc as unknown as { zyraProjectCapabilities: (...a: unknown[]) => Promise<unknown> }, "zyraProjectCapabilities")
-    .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true });
+    .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true });
   jest.spyOn(svc as unknown as { resolveZyraActor: (...a: unknown[]) => Promise<unknown> }, "resolveZyraActor").mockResolvedValue("actor-1");
 }
 

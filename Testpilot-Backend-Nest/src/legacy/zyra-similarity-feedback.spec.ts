@@ -380,7 +380,7 @@ describe("generateZyraChatTestcasesWithAi — create-path wiring", () => {
     global.fetch = fetchMock as unknown as typeof fetch;
 
     const findSimilarTestcases = jest.fn().mockResolvedValue({ matches: [{ testcaseId: "tc-1", cosineSimilarity: 0.97 }], semanticSearchRan: true, reason: "" });
-    const capabilities = { generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true };
+    const capabilities = { generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true };
     const dbQuery = jest.fn((sql: string) => {
       if (String(sql).includes("EXISTS") && String(sql).includes("testcase_embeddings")) return Promise.resolve({ rows: [{ exists: true }] });
       if (String(sql).includes("SELECT id, external_id, title FROM testcases")) return Promise.resolve({ rows: [{ id: "tc-1", external_id: "EAD-12", title: "Session expiry blocks login" }] });
@@ -442,7 +442,7 @@ describe("generateZyraChatTestcasesWithAi — create-path wiring", () => {
     });
     const svc = makeLegacy(findSimilarTestcases, dbQuery);
     jest.spyOn(svc as unknown as { zyraProjectCapabilities: (...a: unknown[]) => Promise<unknown> }, "zyraProjectCapabilities")
-      .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true });
+      .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true });
     jest.spyOn(svc as unknown as { resolveZyraActor: (...a: unknown[]) => Promise<unknown> }, "resolveZyraActor").mockResolvedValue("actor-1");
     jest.spyOn(svc as unknown as { resolveOrCreateSuiteByName: (...a: unknown[]) => Promise<unknown> }, "resolveOrCreateSuiteByName")
       .mockResolvedValue({ id: "suite-1", name: "Zyra Drafts", created: false });
@@ -484,7 +484,7 @@ describe("generateZyraChatTestcasesWithAi — create-path wiring", () => {
     });
     const svc = makeLegacy(findSimilarTestcases, dbQuery);
     jest.spyOn(svc as unknown as { zyraProjectCapabilities: (...a: unknown[]) => Promise<unknown> }, "zyraProjectCapabilities")
-      .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true });
+      .mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true });
     jest.spyOn(svc as unknown as { resolveZyraActor: (...a: unknown[]) => Promise<unknown> }, "resolveZyraActor").mockResolvedValue("actor-1");
     jest.spyOn(svc as unknown as { resolveOrCreateSuiteByName: (...a: unknown[]) => Promise<unknown> }, "resolveOrCreateSuiteByName")
       .mockResolvedValue({ id: "suite-1", name: "Zyra Drafts", created: false });

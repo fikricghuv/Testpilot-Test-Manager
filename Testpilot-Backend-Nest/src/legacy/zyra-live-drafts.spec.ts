@@ -224,7 +224,7 @@ function makeReviewDb(initial: { status?: string; activity?: Body[] } = {}) {
   });
   const svc = makeLegacy({ query, transaction: (fn: (client: { query: typeof query }) => unknown) => fn({ query }) } as unknown as Partial<DatabaseService>);
   jest.spyOn(internals(svc), "resolveZyraActor").mockResolvedValue("actor-1");
-  jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true });
+  jest.spyOn(internals(svc), "zyraProjectCapabilities").mockResolvedValue({ generation: true, knowledgeBase: true, testcaseStorage: true, suiteOperations: true, runOperations: true, bugOperations: true });
   const suiteLookup = jest.spyOn(internals(svc), "resolveOrCreateSuiteByName").mockResolvedValue({ id: "suite-z", name: "Zyra generated test cases", created: false });
   jest.spyOn(internals(svc), "zyraMoveBreakdown").mockResolvedValue([]);
   jest.spyOn(internals(svc), "logProjectActivity").mockResolvedValue(undefined);
