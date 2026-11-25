@@ -4763,6 +4763,17 @@ export async function activateTestCaseScriptVersion(
   );
 }
 
+export async function deleteTestCaseScriptVersion(
+  projectId: string,
+  testcaseId: string,
+  versionId: string
+): Promise<TestScriptStateResponse> {
+  return api<TestScriptStateResponse>(
+    `/api/projects/${projectId}/testcases/${testcaseId}/script/versions/${versionId}`,
+    { method: "DELETE" }
+  );
+}
+
 export async function deleteTestCaseScript(projectId: string, testcaseId: string): Promise<{ deleted: boolean }> {
   return api<{ deleted: boolean }>(`/api/projects/${projectId}/testcases/${testcaseId}/script`, {
     method: "DELETE",

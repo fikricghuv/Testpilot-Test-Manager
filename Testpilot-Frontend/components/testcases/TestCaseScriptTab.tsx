@@ -15,6 +15,7 @@ import {
 import {
   activateTestCaseScriptVersion,
   deleteTestCaseScript,
+  deleteTestCaseScriptVersion,
   getTestCaseScript,
   getTestCaseScriptRun,
   runTestCaseScript,
@@ -223,21 +224,33 @@ export function TestCaseScriptTab({
   }
 
   async function handleDelete() {
+    const activeVersionId = state?.script?.activeVersionId;
+    const deletedVersionNum = state?.script?.activeVersion;
     setDeleting(true);
     setError(null);
     setSuccess(null);
     try {
-      await deleteTestCaseScript(projectId, testcaseId);
-      setState({ script: null, versions: [], recentRuns: [] });
-      setScriptContent("");
-      setTargetUrl("");
-      setStatus("draft");
-      setNotes("");
-      setDirty(false);
-      setActiveRun(null);
-      setSuccess("Automation script removed.");
+      if (activeVersionId) {
+        const updated = await deleteTestCaseScriptVersion(projectId, testcaseId, activeVersionId);
+        applyLoadedState(updated);
+        setSuccess(
+          updated.script
+            ? `Deleted version v${deletedVersionNum ?? ""}. Active version is now v${updated.script.activeVersion ?? ""}.`
+            : "Automation script removed."
+        );
+      } else {
+        await deleteTestCaseScript(projectId, testcaseId);
+        setState({ script: null, versions: [], recentRuns: [] });
+        setScriptContent("");
+        setTargetUrl("");
+        setStatus("draft");
+        setNotes("");
+        setDirty(false);
+        setActiveRun(null);
+        setSuccess("Automation script removed.");
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete script.");
+      setError(err instanceof Error ? err.message : "Failed to delete script version.");
     } finally {
       setDeleting(false);
     }

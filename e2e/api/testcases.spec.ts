@@ -2420,11 +2420,18 @@ test.describe("automation script CRUD, versioning, and runner", () => {
       expect(evBody.list.length).toBeGreaterThanOrEqual(1);
       expect(evBody.list.some((item: { evidenceKind?: string; contentType?: string }) => item.evidenceKind === "screenshot" && item.contentType === "image/png")).toBeTruthy();
 
-      // Delete script
-      const delRes = await request.delete(base);
-      expect(delRes.ok()).toBeTruthy();
-      expect((await delRes.json()).deleted).toBe(true);
-      expect(await (await request.get(base)).json()).toEqual({ script: null, versions: [], recentRuns: [] });
+      // Delete only v2 -> v1 remains active
+      const v2Id = save2.versions[0].id;
+      const delV2Res = await request.delete(`${base}/versions/${v2Id}`);
+      expect(delV2Res.ok()).toBeTruthy();
+      const afterDelV2 = await delV2Res.json();
+      expect(afterDelV2.script.activeVersion).toBe(1);
+      expect(afterDelV2.versions).toHaveLength(1);
+
+      // Delete remaining v1 -> script is removed
+      const delV1Res = await request.delete(`${base}/versions/${v1Id}`);
+      expect(delV1Res.ok()).toBeTruthy();
+      expect(await delV1Res.json()).toEqual({ script: null, versions: [], recentRuns: [] });
     } finally {
       for (const cycleId of createdCycleIds) {
         await request.delete(`/api/projects/${ctx.projectId}/cycles/${cycleId}`, { failOnStatusCode: false });
@@ -2462,6 +2469,64 @@ test.describe("automation script CRUD, versioning, and runner", () => {
     } finally {
       await asB.dispose();
       await anon.dispose();
+      await deleteCase(request, tc.id);
+    }
+  });
+
+  test("captures API JSON and trace evidence (without screenshots) for API-only Playwright tests", async ({ request }) => {
+    const tc = await createCase(request, { title: `E2E API Script Evidence ${Date.now()}` });
+    const base = `/api/projects/${ctx.projectId}/testcases/${tc.id}/script`;
+    let cycleId: string | null = null;
+
+    try {
+      const apiScript = [
+        `import { test, expect } from "@playwright/test";`,
+        `test("api health check", async ({ request }) => {`,
+        `  const res = await request.get("http://127.0.0.1:7000/health");`,
+        `  expect(res.status()).toBe(200);`,
+        `});`,
+      ].join("\n");
+
+      const saveRes = await request.put(base, {
+        data: { scriptContent: apiScript, status: "verified" },
+      });
+      expect(saveRes.ok()).toBeTruthy();
+
+      const runRes = await request.post(`${base}/run`, { data: {} });
+      expect(runRes.ok()).toBeTruthy();
+      let run = (await runRes.json()).run;
+      cycleId = run.cycleId ?? null;
+
+      await expect
+        .poll(
+          async () => {
+            const r = await request.get(`${base}/runs/${run.id}`);
+            run = (await r.json()).run;
+            return run.status;
+          },
+          { timeout: 60_000, intervals: [500, 1000, 1500] }
+        )
+        .toBe("passed");
+
+      const evRes = await request.get(`/api/cycles/${run.cycleId}/executions/${run.executionId}/attachments`);
+      expect(evRes.ok()).toBeTruthy();
+      const evList = (await evRes.json()).list as Array<{ id: string; evidenceKind?: string; fileName?: string }>;
+
+      const apiAttachment = evList.find((item) => item.evidenceKind === "api");
+      expect(apiAttachment).toBeTruthy();
+      expect(apiAttachment?.fileName).toBe("api-response.json");
+      expect(evList.some((item) => item.evidenceKind === "trace")).toBe(false);
+      expect(evList.some((item) => item.evidenceKind === "screenshot")).toBe(false);
+
+      const contentRes = await request.get(
+        `/api/cycles/${run.cycleId}/executions/${run.executionId}/attachments/${apiAttachment!.id}/api-content`
+      );
+      expect(contentRes.ok()).toBeTruthy();
+      const content = await contentRes.json();
+      expect(content.data?.calls?.length).toBeGreaterThanOrEqual(1);
+      expect(content.data?.calls[0]?.response?.body).toBeTruthy();
+    } finally {
+      if (cycleId) await request.delete(`/api/projects/${ctx.projectId}/cycles/${cycleId}`, { failOnStatusCode: false });
       await deleteCase(request, tc.id);
     }
   });

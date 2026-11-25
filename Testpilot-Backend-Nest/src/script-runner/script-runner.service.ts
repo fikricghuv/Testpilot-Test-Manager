@@ -7,6 +7,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import * as zlib from "node:zlib";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
 import { StorageService } from "../storage/storage.service";
@@ -305,6 +306,54 @@ export class ScriptRunnerService {
     return this.readState(projectId, testcaseId);
   }
 
+  async deleteVersion(
+    userId: string | null | undefined,
+    projectId: string,
+    testcaseId: string,
+    versionId: string
+  ): Promise<TestScriptStateResponse> {
+    const uid = this.legacy.requireSession(userId);
+    await this.legacy.requireProjectAccess(uid, projectId);
+    await this.assertTestCaseInProject(projectId, testcaseId);
+    if (!isUuid(versionId)) {
+      throw new BadRequestException({ error: "Invalid versionId." });
+    }
+
+    await this.db.transaction(async (client) => {
+      const targetRes = await client.query<{ script_id: string; active_version_id: string | null }>(
+        `SELECT s.id AS script_id, s.active_version_id
+         FROM test_script_versions v
+         JOIN test_scripts s ON s.id = v.script_id
+         WHERE v.id = $1 AND s.project_id = $2 AND s.testcase_id = $3
+         FOR UPDATE OF s`,
+        [versionId, projectId, testcaseId]
+      );
+      const target = targetRes.rows[0];
+      if (!target) {
+        throw new NotFoundException({ error: "Script version not found." });
+      }
+
+      await client.query(`DELETE FROM test_script_versions WHERE id = $1`, [versionId]);
+
+      const remainingRes = await client.query<{ id: string }>(
+        `SELECT id FROM test_script_versions WHERE script_id = $1 ORDER BY version DESC LIMIT 1`,
+        [target.script_id]
+      );
+      const nextActive = remainingRes.rows[0]?.id ?? null;
+
+      if (!nextActive) {
+        await client.query(`DELETE FROM test_scripts WHERE id = $1`, [target.script_id]);
+      } else if (target.active_version_id === versionId) {
+        await client.query(
+          `UPDATE test_scripts SET active_version_id = $2, updated_by = $3, updated_at = now() WHERE id = $1`,
+          [target.script_id, nextActive, uid]
+        );
+      }
+    });
+
+    return this.readState(projectId, testcaseId);
+  }
+
   async deleteScript(userId: string | null | undefined, projectId: string, testcaseId: string): Promise<{ deleted: boolean }> {
     const uid = this.legacy.requireSession(userId);
     await this.legacy.requireProjectAccess(uid, projectId);
@@ -466,7 +515,7 @@ export class ScriptRunnerService {
         `  outputDir: ${JSON.stringify(resultsDir)},`,
         `  timeout: ${SCRIPT_EXECUTION_TIMEOUT_MS},`,
         `  reporter: [["list"]],`,
-        `  use: { headless: true, ${baseUrlLine} screenshot: "on" }`,
+        `  use: { headless: true, ${baseUrlLine} screenshot: "on", trace: "on" }`,
         `});`
       ].join("\n");
 
@@ -489,7 +538,7 @@ export class ScriptRunnerService {
         }
       );
 
-      await this.collectAndStoreScreenshots(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
+      await this.collectAndStoreEvidence(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
 
       await this.finalizeRun(runId, jobData.cycle_id, jobData.execution_id, {
         status: "passed",
@@ -508,7 +557,7 @@ export class ScriptRunnerService {
         "Playwright execution failed.";
 
       if (resultsDir) {
-        await this.collectAndStoreScreenshots(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
+        await this.collectAndStoreEvidence(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
       }
 
       await this.finalizeRun(runId, jobData.cycle_id, jobData.execution_id, {
@@ -525,21 +574,144 @@ export class ScriptRunnerService {
     }
   }
 
-  private async findPngFiles(dir: string): Promise<string[]> {
+  private async findFilesByExt(dir: string, ext: string): Promise<string[]> {
     const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
     const files: string[] = [];
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        files.push(...(await this.findPngFiles(fullPath)));
-      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".png")) {
+        files.push(...(await this.findFilesByExt(fullPath, ext)));
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith(ext)) {
         files.push(fullPath);
       }
     }
     return files;
   }
 
-  private async collectAndStoreScreenshots(
+  private extractZipEntries(zipBuffer: Buffer): Map<string, Buffer> {
+    const files = new Map<string, Buffer>();
+    // Locate End of Central Directory (EOCD) signature 0x06054b50 from the tail
+    let eocdOffset = -1;
+    const minOffset = Math.max(0, zipBuffer.length - 65557);
+    for (let i = zipBuffer.length - 22; i >= minOffset; i--) {
+      if (zipBuffer.readUInt32LE(i) === 0x06054b50) {
+        eocdOffset = i;
+        break;
+      }
+    }
+    if (eocdOffset === -1) return files;
+
+    const totalEntries = zipBuffer.readUInt16LE(eocdOffset + 10);
+    let offset = zipBuffer.readUInt32LE(eocdOffset + 16);
+
+    for (let idx = 0; idx < totalEntries && offset + 46 <= zipBuffer.length; idx++) {
+      if (zipBuffer.readUInt32LE(offset) !== 0x02014b50) break;
+      const compressionMethod = zipBuffer.readUInt16LE(offset + 10);
+      const compressedSize = zipBuffer.readUInt32LE(offset + 20);
+      const nameLen = zipBuffer.readUInt16LE(offset + 28);
+      const extraLen = zipBuffer.readUInt16LE(offset + 30);
+      const commentLen = zipBuffer.readUInt16LE(offset + 32);
+      const localHeaderOffset = zipBuffer.readUInt32LE(offset + 42);
+      const fileName = zipBuffer.subarray(offset + 46, offset + 46 + nameLen).toString("utf8");
+      offset += 46 + nameLen + extraLen + commentLen;
+
+      if (localHeaderOffset + 30 > zipBuffer.length || zipBuffer.readUInt32LE(localHeaderOffset) !== 0x04034b50) {
+        continue;
+      }
+      const localNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
+      const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
+      const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
+      const compressed = zipBuffer.subarray(dataStart, dataStart + compressedSize);
+
+      if (compressionMethod === 0) {
+        files.set(fileName, compressed);
+      } else if (compressionMethod === 8) {
+        files.set(fileName, zlib.inflateRawSync(compressed));
+      }
+    }
+    return files;
+  }
+
+  extractApiResponseEvidence(zipBuffer: Buffer): {
+    calls: Array<{
+      method: string;
+      url: string;
+      status: number | null;
+      statusText: string | null;
+      durationMs: number | null;
+      request: { headers: Array<[string, string]>; body: string | null };
+      response: { headers: Array<[string, string]>; body: string | null };
+    }>;
+  } | null {
+    const entriesMap = this.extractZipEntries(zipBuffer);
+    const calls: Array<{
+      method: string;
+      url: string;
+      status: number | null;
+      statusText: string | null;
+      durationMs: number | null;
+      request: { headers: Array<[string, string]>; body: string | null };
+      response: { headers: Array<[string, string]>; body: string | null };
+    }> = [];
+
+    for (const [name, buf] of entriesMap.entries()) {
+      if (!name.endsWith(".network")) continue;
+      const lines = buf.toString("utf8").split(/\r?\n/);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed?.type !== "resource-snapshot" || !parsed.snapshot) continue;
+          const snap = parsed.snapshot;
+          const resFile = snap.response?.content?._file;
+          let responseBody: string | null =
+            typeof snap.response?.content?.text === "string" ? snap.response.content.text : null;
+          if (typeof resFile === "string" && entriesMap.has(resFile)) {
+            responseBody = entriesMap.get(resFile)!.toString("utf8");
+          }
+          if (responseBody && responseBody.length > MAX_SCRIPT_OUTPUT_LENGTH) {
+            responseBody = `${responseBody.slice(0, MAX_SCRIPT_OUTPUT_LENGTH)}\n...[truncated]`;
+          }
+
+          calls.push({
+            method: String(snap.request?.method || "GET"),
+            url: String(snap.request?.url || ""),
+            status: typeof snap.response?.status === "number" ? snap.response.status : null,
+            statusText: typeof snap.response?.statusText === "string" ? snap.response.statusText : null,
+            durationMs: typeof snap.time === "number" ? Math.round(snap.time) : null,
+            request: { headers: [], body: null },
+            response: { headers: [], body: responseBody }
+          });
+        } catch {
+          // Ignore malformed trace line
+        }
+      }
+    }
+
+    return calls.length > 0 ? { calls } : null;
+  }
+
+  private async storeAttachment(
+    projectId: string,
+    executionId: string,
+    uploadedBy: string | null,
+    fileName: string,
+    ext: string,
+    contentType: string,
+    evidenceKind: "screenshot" | "api" | "trace",
+    buffer: Buffer
+  ): Promise<void> {
+    const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}.${ext}`;
+    await this.storage.put(storageKey, buffer, contentType);
+    await this.db.query(
+      `INSERT INTO attachments
+         (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, evidence_kind)
+       VALUES ($1, 'execution', $2, $3, $4, $5, $6, $7, $8)`,
+      [projectId, executionId, fileName, contentType, buffer.length, storageKey, uploadedBy, evidenceKind]
+    );
+  }
+
+  private async collectAndStoreEvidence(
     resultsDir: string,
     projectId: string,
     executionId: string | null,
@@ -547,22 +719,39 @@ export class ScriptRunnerService {
   ): Promise<void> {
     if (!executionId) return;
     try {
-      const pngPaths = await this.findPngFiles(resultsDir);
-      for (let i = 0; i < pngPaths.length; i++) {
-        const buffer = await fs.readFile(pngPaths[i]);
-        const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}.png`;
-        const fileName = pngPaths.length === 1 ? "screenshot.png" : `screenshot-${i + 1}.png`;
-        await this.storage.put(storageKey, buffer, "image/png");
-        await this.db.query(
-          `INSERT INTO attachments
-             (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, evidence_kind)
-           VALUES ($1, 'execution', $2, $3, 'image/png', $4, $5, $6, 'screenshot')`,
-          [projectId, executionId, fileName, buffer.length, storageKey, uploadedBy]
-        );
+      const pngPaths = await this.findFilesByExt(resultsDir, ".png");
+      if (pngPaths.length > 0) {
+        // Web UI runs already have screenshots — keep evidence focused on those.
+        for (let i = 0; i < pngPaths.length; i++) {
+          const buffer = await fs.readFile(pngPaths[i]);
+          const fileName = pngPaths.length === 1 ? "screenshot.png" : `screenshot-${i + 1}.png`;
+          await this.storeAttachment(projectId, executionId, uploadedBy, fileName, "png", "image/png", "screenshot", buffer);
+        }
+        return;
+      }
+
+      // API-only runs (no browser screenshots): store compact response-only JSON evidence.
+      const tracePaths = await this.findFilesByExt(resultsDir, ".zip");
+      for (let i = 0; i < tracePaths.length; i++) {
+        const zipBuffer = await fs.readFile(tracePaths[i]);
+        const apiEvidence = this.extractApiResponseEvidence(zipBuffer);
+        if (apiEvidence) {
+          const apiFileName = tracePaths.length === 1 ? "api-response.json" : `api-response-${i + 1}.json`;
+          await this.storeAttachment(
+            projectId,
+            executionId,
+            uploadedBy,
+            apiFileName,
+            "json",
+            "application/json",
+            "api",
+            Buffer.from(JSON.stringify(apiEvidence), "utf8")
+          );
+        }
       }
     } catch (err) {
       this.logger.warn(
-        `Failed to store screenshots for execution ${executionId}: ${err instanceof Error ? err.message : String(err)}`
+        `Failed to store evidence for execution ${executionId}: ${err instanceof Error ? err.message : String(err)}`
       );
     }
   }

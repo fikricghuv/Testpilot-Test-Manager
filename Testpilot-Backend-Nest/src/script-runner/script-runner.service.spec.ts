@@ -1,4 +1,5 @@
 import { BadRequestException, NotFoundException } from "@nestjs/common";
+import archiver from "archiver";
 import { ScriptRunnerService } from "./script-runner.service";
 import { SCRIPT_RUNNER_JOB } from "./script-runner.constants";
 
@@ -182,5 +183,125 @@ describe("ScriptRunnerService", () => {
       { runId },
       expect.objectContaining({ removeOnComplete: 50, removeOnFail: 50 })
     );
+  });
+
+  it("deletes only the active version and falls back to the latest remaining version", async () => {
+    const { service, query, clientQuery } = createMocks();
+    const now = new Date("2026-11-25T10:00:00Z");
+    const v2Id = "77777777-7777-4777-8777-777777777777";
+
+    query
+      .mockResolvedValueOnce({ rows: [{ id: TESTCASE_ID, title: "Login", external_id: "TC-1" }] })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: SCRIPT_ID,
+          project_id: PROJECT_ID,
+          testcase_id: TESTCASE_ID,
+          framework: "playwright-ts",
+          target_url: null,
+          status: "draft",
+          active_version_id: VERSION_ID,
+          active_version: 1,
+          script_content: "test('v1', async () => {});",
+          source: "manual",
+          created_at: now,
+          updated_at: now
+        }]
+      })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: VERSION_ID,
+          script_id: SCRIPT_ID,
+          version: 1,
+          script_content: "test('v1', async () => {});",
+          source: "manual",
+          notes: null,
+          verified_locators: {},
+          created_by: USER_ID,
+          created_at: now
+        }]
+      })
+      .mockResolvedValueOnce({ rows: [] });
+
+    clientQuery
+      .mockResolvedValueOnce({ rows: [{ script_id: SCRIPT_ID, active_version_id: v2Id }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: VERSION_ID }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await service.deleteVersion(USER_ID, PROJECT_ID, TESTCASE_ID, v2Id);
+    expect(res.script?.activeVersion).toBe(1);
+    expect(res.versions).toHaveLength(1);
+    expect(clientQuery).toHaveBeenCalledWith(
+      expect.stringContaining("UPDATE test_scripts SET active_version_id = $2"),
+      [SCRIPT_ID, VERSION_ID, USER_ID]
+    );
+  });
+
+  it("deletes parent test_scripts row when deleting the last remaining version", async () => {
+    const { service, query, clientQuery } = createMocks();
+
+    query
+      .mockResolvedValueOnce({ rows: [{ id: TESTCASE_ID, title: "Login", external_id: "TC-1" }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    clientQuery
+      .mockResolvedValueOnce({ rows: [{ script_id: SCRIPT_ID, active_version_id: VERSION_ID }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await service.deleteVersion(USER_ID, PROJECT_ID, TESTCASE_ID, VERSION_ID);
+    expect(res).toEqual({ script: null, versions: [], recentRuns: [] });
+    expect(clientQuery).toHaveBeenCalledWith(`DELETE FROM test_scripts WHERE id = $1`, [SCRIPT_ID]);
+  });
+
+  it("extracts compact response-only API evidence from a Playwright trace.zip", async () => {
+    const { service } = createMocks();
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    const chunks: Buffer[] = [];
+    archive.on("data", (chunk: Buffer) => chunks.push(chunk));
+    const done = new Promise<Buffer>((resolve, reject) => {
+      archive.on("end", () => resolve(Buffer.concat(chunks)));
+      archive.on("error", reject);
+    });
+
+    const snapshotLine = JSON.stringify({
+      type: "resource-snapshot",
+      snapshot: {
+        startedDateTime: "2026-11-26T00:00:00.000Z",
+        time: 12.4,
+        request: {
+          method: "POST",
+          url: "https://api.example.com/ProgramDetail",
+          headers: [{ name: "content-type", value: "application/json" }],
+          postData: { mimeType: "application/json", text: "", _file: "resources/req.json" }
+        },
+        response: {
+          status: 200,
+          statusText: "OK",
+          headers: [{ name: "content-type", value: "application/json" }],
+          content: { mimeType: "application/json", _file: "resources/res.json" }
+        }
+      }
+    });
+
+    archive.append(`${snapshotLine}\n`, { name: "0-trace.network" });
+    archive.append(JSON.stringify({ FIDProgram: 75 }), { name: "resources/req.json" });
+    archive.append(JSON.stringify({ ok: true }), { name: "resources/res.json" });
+    await archive.finalize();
+
+    const zipBuffer = await done;
+    const evidence = service.extractApiResponseEvidence(zipBuffer);
+    expect(evidence?.calls).toHaveLength(1);
+    expect(evidence?.calls[0]).toEqual({
+      method: "POST",
+      url: "https://api.example.com/ProgramDetail",
+      status: 200,
+      statusText: "OK",
+      durationMs: 12,
+      request: { headers: [], body: null },
+      response: { headers: [], body: '{"ok":true}' }
+    });
   });
 });

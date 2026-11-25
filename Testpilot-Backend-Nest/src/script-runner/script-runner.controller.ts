@@ -36,6 +36,16 @@ export class ScriptRunnerController {
     return this.scriptRunner.activateVersion(req.userId, projectId, testcaseId, versionId);
   }
 
+  @Delete("/api/projects/:projectId/testcases/:testcaseId/script/versions/:versionId")
+  deleteVersion(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Param("versionId") versionId: string
+  ) {
+    return this.scriptRunner.deleteVersion(req.userId, projectId, testcaseId, versionId);
+  }
+
   @Delete("/api/projects/:projectId/testcases/:testcaseId/script")
   deleteScript(
     @Req() req: AuthenticatedRequest,

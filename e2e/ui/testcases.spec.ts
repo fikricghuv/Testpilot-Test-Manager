@@ -1497,6 +1497,15 @@ test.describe("automation script tab", () => {
       const scriptState = await (await api.get(`/api/projects/${ctx.projectId}/testcases/${tcId}/script`)).json();
       cycleId = scriptState.recentRuns?.[0]?.cycleId ?? null;
 
+      // Save v2 so deleting active version only removes v2 and falls back to v1
+      await panel.locator("textarea").fill(`${script}\n// v2`);
+      await panel.getByRole("button", { name: "Save Script" }).click();
+      await expect(panel.getByText("Saved version v2.")).toBeVisible();
+
+      await panel.getByRole("button", { name: "Delete Script" }).click();
+      await expect(panel.getByText("Deleted version v2. Active version is now v1.")).toBeVisible();
+
+      // Deleting the last remaining version removes the script completely
       await panel.getByRole("button", { name: "Delete Script" }).click();
       await expect(panel.getByText("Automation script removed.")).toBeVisible();
     } finally {
