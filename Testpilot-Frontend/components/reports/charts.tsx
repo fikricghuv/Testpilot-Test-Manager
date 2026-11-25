@@ -96,7 +96,7 @@ export function HorizontalBarChart({ data }: { data: { label: string; value: num
           <span className="w-24 shrink-0 truncate text-right text-[12px] text-[var(--muted)]">{d.label}</span>
           <div className="h-5 flex-1 overflow-hidden rounded-full bg-[var(--surface-secondary)]">
             <div
-              className="h-full rounded-full transition-all duration-500"
+              className="h-full rounded-full transition-[width] duration-300 ease-[var(--ease-out-quad)]"
               style={{ width: `${(d.value / max) * 100}%`, background: d.color, minWidth: d.value > 0 ? "8px" : "0px" }}
             />
           </div>
@@ -156,7 +156,7 @@ export function StackedBarChart<T extends { groupId: string; groupName: string; 
               return (
                 <div
                   key={status}
-                  className="h-full transition-all duration-500"
+                  className="h-full transition-[width] duration-300 ease-[var(--ease-out-quad)]"
                   style={{ width: `${pct}%`, background: STATUS_COLORS[status], minWidth: "4px" }}
                   title={`${status}: ${val}`}
                 />

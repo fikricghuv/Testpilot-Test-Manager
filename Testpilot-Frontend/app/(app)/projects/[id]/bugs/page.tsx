@@ -8,6 +8,7 @@ import { IconPencil, IconShare2, IconTrash } from "@tabler/icons-react";
 import {
   listBugs,
   createBug,
+  updateBug,
   deleteBug,
   getJiraStatus,
   getLinearStatus,
@@ -121,12 +122,18 @@ function ViewToggle({
 function KanbanCard({
   bug,
   projectId,
+  isDragging = false,
+  onDragStart,
+  onDragEnd,
   onView,
   onEdit,
   onDelete,
 }: {
   bug: BugItem;
   projectId: string;
+  isDragging?: boolean;
+  onDragStart?: (e: React.DragEvent<HTMLDivElement>) => void;
+  onDragEnd?: () => void;
   onView: () => void;
   onEdit: () => void;
   onDelete: () => void;
@@ -135,6 +142,9 @@ function KanbanCard({
     <div
       role="button"
       tabIndex={0}
+      draggable
+      onDragStart={onDragStart}
+      onDragEnd={onDragEnd}
       onClick={onView}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -142,7 +152,9 @@ function KanbanCard({
           onView();
         }
       }}
-      className="group bg-[var(--surface)] border border-[var(--border-subtle)] rounded-lg p-3 cursor-pointer hover:border-[var(--brand-primary)]/40 hover:shadow-sm transition-all"
+      className={`group bg-[var(--surface)] border border-[var(--border-subtle)] rounded-lg p-2.5 cursor-grab active:cursor-grabbing hover:border-[var(--brand-primary)]/40 hover:shadow-sm transition-[border-color,box-shadow,opacity,transform] duration-150 ease-[var(--ease-out-quad)] ${
+        isDragging ? "opacity-50 scale-[0.98] ring-1 ring-[var(--brand-primary)]" : ""
+      }`}
     >
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="min-w-0">
@@ -231,11 +243,11 @@ function KanbanCard({
         )}
       </div>
 
-      <div className="flex items-center justify-between mt-2.5 pt-2 border-t border-[var(--border-subtle)]">
-        <span className="text-[10px] text-[var(--muted-soft)]">
+      <div className="flex items-center justify-between gap-2 mt-2.5 pt-2 border-t border-[var(--border-subtle)]">
+        <span className="text-[10px] text-[var(--muted-soft)] truncate min-w-0">
           {bug.reporterName || bug.reporterEmail || "Unknown"}
         </span>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 shrink-0">
           {bug.assigneeId && bug.assigneeName && <MemberAvatar name={bug.assigneeName} seed={bug.assigneeId} size={16} />}
           <span className="text-[10px] text-[var(--muted-soft)]">
             {formatDate(bug.createdAt)}
@@ -251,6 +263,13 @@ function KanbanColumn({
   status,
   bugs,
   projectId,
+  draggingBugId,
+  isDragOver,
+  onDragStartBug,
+  onDragEndBug,
+  onDragOverColumn,
+  onDragLeaveColumn,
+  onDropColumn,
   onView,
   onEdit,
   onDelete,
@@ -258,6 +277,13 @@ function KanbanColumn({
   status: string;
   bugs: BugItem[];
   projectId: string;
+  draggingBugId: string | null;
+  isDragOver: boolean;
+  onDragStartBug: (bugId: string) => void;
+  onDragEndBug: () => void;
+  onDragOverColumn: (status: string) => void;
+  onDragLeaveColumn: (status: string) => void;
+  onDropColumn: (status: string, droppedBugId?: string) => void;
   onView: (b: BugItem) => void;
   onEdit: (b: BugItem) => void;
   onDelete: (id: string) => void;
@@ -265,17 +291,38 @@ function KanbanColumn({
   const color = STATUS_COLOR[status] || "var(--muted)";
 
   return (
-    <div className="flex flex-col min-w-[280px] w-[280px] shrink-0">
-      <div className="flex items-center gap-2 mb-3 px-1">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        onDragOverColumn(status);
+      }}
+      onDragLeave={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          onDragLeaveColumn(status);
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        const droppedId = e.dataTransfer.getData("text/plain") || undefined;
+        onDropColumn(status, droppedId);
+      }}
+      className={`flex flex-col min-w-0 w-full rounded-xl border p-2.5 transition-[background-color,border-color,box-shadow] duration-150 ease-[var(--ease-out-quad)] ${
+        isDragOver
+          ? "border-[var(--brand-primary)]/50 bg-[var(--brand-primary)]/5 ring-2 ring-dashed ring-[var(--brand-primary)]/40"
+          : "border-[var(--border-subtle)] bg-[var(--surface-secondary)]"
+      }`}
+    >
+      <div className="flex items-center gap-2 mb-2.5 px-1 pt-0.5">
         <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
         <h3 className="text-sm font-semibold text-[var(--foreground)]">{status}</h3>
-        <span className="ml-auto text-xs font-medium text-[var(--muted)] bg-[var(--surface-raised)] px-1.5 py-0.5 rounded-full">
+        <span className="ml-auto text-xs font-medium text-[var(--muted)] bg-[var(--surface)] border border-[var(--border-subtle)] px-2 py-0.5 rounded-full">
           {bugs.length}
         </span>
       </div>
-      <div className="flex flex-col gap-2 flex-1 overflow-y-auto max-h-[calc(100vh-280px)] pr-1 pb-4 custom-scrollbar">
+      <div className="flex flex-col gap-2 flex-1 overflow-y-auto max-h-[calc(100vh-280px)] pr-0.5 pb-1 custom-scrollbar">
         {bugs.length === 0 ? (
-          <div className="flex items-center justify-center py-8 text-xs text-[var(--muted-soft)] border border-dashed border-[var(--border-subtle)] rounded-lg">
+          <div className="flex items-center justify-center py-8 text-xs text-[var(--muted-soft)] border border-dashed border-[var(--border)] rounded-lg bg-[var(--surface)]/40">
             No bugs
           </div>
         ) : (
@@ -284,6 +331,13 @@ function KanbanColumn({
               key={b.id}
               bug={b}
               projectId={projectId}
+              isDragging={draggingBugId === b.id}
+              onDragStart={(e) => {
+                e.dataTransfer.setData("text/plain", b.id);
+                e.dataTransfer.effectAllowed = "move";
+                onDragStartBug(b.id);
+              }}
+              onDragEnd={onDragEndBug}
               onView={() => onView(b)}
               onEdit={() => onEdit(b)}
               onDelete={() => onDelete(b.id)}
@@ -682,6 +736,50 @@ export default function BugsPage() {
     }
   }
 
+  /* drag-and-drop status move on Kanban board */
+  const [draggingBugId, setDraggingBugId] = useState<string | null>(null);
+  const [dragOverStatus, setDragOverStatus] = useState<string | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
+
+  async function handleMoveBug(targetStatus: string, droppedBugId?: string) {
+    const bugId = droppedBugId || draggingBugId;
+    setDraggingBugId(null);
+    setDragOverStatus(null);
+    if (!bugId) return;
+
+    const bug = bugs.find((b) => b.id === bugId);
+    if (!bug || bug.status === targetStatus) return;
+
+    const previousStatus = bug.status;
+    setMoveError(null);
+    setBugs((prev) =>
+      prev.map((b) => (b.id === bugId ? { ...b, status: targetStatus } : b))
+    );
+    if (viewBug?.id === bugId) {
+      setViewBug((prev) => (prev ? { ...prev, status: targetStatus } : prev));
+    }
+
+    try {
+      const updated = await updateBug(bugId, { status: targetStatus });
+      setBugs((prev) =>
+        prev.map((b) => (b.id === bugId ? { ...b, ...updated } : b))
+      );
+      if (viewBug?.id === bugId) {
+        setViewBug((prev) => (prev ? { ...prev, ...updated } : prev));
+      }
+    } catch (err) {
+      setBugs((prev) =>
+        prev.map((b) => (b.id === bugId ? { ...b, status: previousStatus } : b))
+      );
+      if (viewBug?.id === bugId) {
+        setViewBug((prev) => (prev ? { ...prev, status: previousStatus } : prev));
+      }
+      setMoveError(
+        err instanceof Error ? err.message : "Failed to move bug to " + targetStatus + "."
+      );
+    }
+  }
+
   if (loading) {
     return <PageLoader variant="content" />;
   }
@@ -695,9 +793,8 @@ export default function BugsPage() {
     !createSelectedIssue;
 
   return (
-    <div className="min-h-screen bg-[var(--background)]">
-      <main className="testpilot-page max-w-7xl mx-auto">
-        <ListWorkspaceLayout
+    <>
+      <ListWorkspaceLayout
           header={
             <PageHeader
               title="Bugs"
@@ -812,6 +909,18 @@ export default function BugsPage() {
           {/* ───── Kanban View ───── */}
           {viewMode === "kanban" && (
             <>
+              {moveError && (
+                <div className="mb-3 flex items-center justify-between rounded-lg border border-[var(--error)]/30 bg-[var(--error-soft)] px-3 py-2 text-xs text-[var(--status-fail-text)]">
+                  <span>{moveError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setMoveError(null)}
+                    className="ml-3 font-medium underline hover:no-underline"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
               {bugs.length === 0 ? (
                 <Card>
                   <div className="text-center py-12 text-sm text-[var(--muted-soft)]">
@@ -820,13 +929,27 @@ export default function BugsPage() {
                   </div>
                 </Card>
               ) : (
-                <div className="flex gap-4 overflow-x-auto pb-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pb-2">
                   {kanbanColumns.map((col) => (
                     <KanbanColumn
                       key={col.status}
                       status={col.status}
                       bugs={col.bugs}
                       projectId={projectId}
+                      draggingBugId={draggingBugId}
+                      isDragOver={dragOverStatus === col.status}
+                      onDragStartBug={setDraggingBugId}
+                      onDragEndBug={() => {
+                        setDraggingBugId(null);
+                        setDragOverStatus(null);
+                      }}
+                      onDragOverColumn={(s) => {
+                        if (dragOverStatus !== s) setDragOverStatus(s);
+                      }}
+                      onDragLeaveColumn={(s) => {
+                        if (dragOverStatus === s) setDragOverStatus(null);
+                      }}
+                      onDropColumn={handleMoveBug}
                       onView={setViewBug}
                       onEdit={openEdit}
                       onDelete={setDeletingId}
@@ -1042,7 +1165,6 @@ export default function BugsPage() {
             </>
           )}
         </ListWorkspaceLayout>
-      </main>
 
       {/* ───── Bug Detail Panel (right side) ─────
           Same shared Drawer the Test Run detail panel uses: header with the close control, a
@@ -1380,6 +1502,6 @@ export default function BugsPage() {
           </Button>
         </div>
       </Modal>
-    </div>
+    </>
   );
 }

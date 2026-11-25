@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { cx } from "@/components/ui/cx";
 
@@ -14,6 +14,24 @@ type ModalProps = {
 };
 
 export default function Modal({ open, onClose, title, children, className }: ModalProps) {
+  const [rendered, setRendered] = useState(open);
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setRendered(true);
+      setClosing(false);
+      return;
+    }
+    if (!rendered) return;
+    setClosing(true);
+    const timer = window.setTimeout(() => {
+      setRendered(false);
+      setClosing(false);
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [open, rendered]);
+
   useEffect(() => {
     if (!open) return;
     function onKeyDown(e: KeyboardEvent) {
@@ -47,18 +65,22 @@ export default function Modal({ open, onClose, title, children, className }: Mod
     };
   }, [open]);
 
-  if (!open || typeof document === "undefined") return null;
+  if (!rendered || typeof document === "undefined") return null;
 
   return createPortal(
     <div
       role="presentation"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay-backdrop)] p-4 backdrop-blur-sm animate-modal-backdrop"
+      className={cx(
+        "fixed inset-0 z-50 flex items-center justify-center bg-[var(--overlay-backdrop)] p-4 backdrop-blur-sm",
+        closing ? "animate-modal-backdrop-exit" : "animate-modal-backdrop",
+      )}
       onClick={onClose}
     >
       <div
         role="presentation"
         className={cx(
-          "flex max-h-[calc(100dvh-2rem)] w-full flex-col overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface-overlay)] shadow-[var(--shadow-elevated)] animate-modal-scale",
+          "flex max-h-[calc(100dvh-2rem)] w-full flex-col overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface-overlay)] shadow-[var(--shadow-elevated)]",
+          closing ? "animate-modal-scale-exit" : "animate-modal-scale",
           className === undefined ? "max-w-[560px]" : className,
         )}
         onClick={(event) => event.stopPropagation()}

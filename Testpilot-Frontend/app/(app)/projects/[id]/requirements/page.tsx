@@ -850,8 +850,7 @@ export default function RequirementsPage() {
           </p>
           <Link
             href={`/projects/${projectId}/settings?tab=integrations`}
-            style={{ color: "#fff" }}
-            className="mt-4 inline-flex items-center justify-center rounded-lg bg-[var(--brand-primary)] px-5 py-2 text-sm font-semibold !text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+            className="mt-4 inline-flex items-center justify-center rounded-lg bg-[var(--brand-primary)] px-5 py-2 text-sm font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
           >
             Go to Project Settings
           </Link>

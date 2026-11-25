@@ -164,7 +164,8 @@
 
   /* ── Motion & Animation Tokens (Emil Kowalski / Jakub Krehel Standard) ── */
   --ease-out-quad: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
   --motion-instant: 100ms;
   --motion-fast: 150ms;
   --motion-base: 200ms;
@@ -358,6 +359,28 @@
   }
 }
 
+@keyframes drawerSlideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes drawerSlideOutRight {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
 @keyframes tp-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -375,8 +398,40 @@
   animation: modalBackdropFadeIn var(--motion-fast) var(--ease-out-quad) both;
 }
 
+.animate-modal-backdrop-exit {
+  animation: modalBackdropFadeOut var(--motion-fast) var(--ease-out-quad) both;
+}
+
 .animate-modal-scale {
   animation: modalScaleIn var(--motion-enter) var(--ease-out-quad) both;
+}
+
+.animate-modal-scale-exit {
+  animation: modalScaleOut var(--motion-fast) var(--ease-out-quad) both;
+}
+
+.animate-drawer-slide-in {
+  animation: drawerSlideInRight var(--motion-enter) var(--ease-drawer) both;
+}
+
+.animate-drawer-slide-out {
+  animation: drawerSlideOutRight var(--motion-base) var(--ease-drawer) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-enter,
+  .animate-modal-scale,
+  .animate-modal-scale-exit,
+  .animate-drawer-slide-in,
+  .animate-drawer-slide-out {
+    animation-name: modalBackdropFadeIn;
+    animation-duration: var(--motion-fast);
+  }
+
+  .animate-modal-scale-exit,
+  .animate-drawer-slide-out {
+    animation-name: modalBackdropFadeOut;
+  }
 }
 
 .animate-tp-pulse {
@@ -447,6 +502,24 @@ button[class*="bg-[var(--error)]"],
 button[class*="bg-[var(--success)]"],
 button[class*="bg-[var(--ai-primary)]"] {
   color: #fff !important;
+}
+
+/* In dark mode, --cta-primary, --brand-primary, --ai-primary, and --denim resolve to #fafafa (white),
+   so buttons/links/badges using those backgrounds must use dark ink (#09090b) instead of white text. */
+.dark a[class*="bg-[var(--cta-primary)]"],
+.dark a[class*="bg-[var(--cta-hover)]"],
+.dark a[class*="bg-[var(--brand-primary)]"],
+.dark a[class*="bg-[var(--brand-hover)]"],
+.dark a[class*="bg-[var(--ai-primary)]"],
+.dark a[class*="bg-[var(--denim)]"],
+.dark button[class*="bg-[var(--cta-primary)]"],
+.dark button[class*="bg-[var(--cta-hover)]"],
+.dark button[class*="bg-[var(--brand-primary)]"],
+.dark button[class*="bg-[var(--brand-hover)]"],
+.dark button[class*="bg-[var(--ai-primary)]"],
+.dark button[class*="bg-[var(--denim)]"],
+.dark span[class*="bg-[var(--brand-primary)]"] {
+  color: #09090b !important;
 }
 
 a[class*="bg-[var(--surface)]"],
@@ -601,10 +674,10 @@ button[class*="bg-[var(--surface-tertiary)]"] {
   padding: 0;
 }
 
-/* Custom Tags settings page: fill exactly the space under the 3.5rem top bar, so <main> never
+/* Custom Tags settings page: fill exactly the space under the 4rem top bar, so <main> never
    overflows and its scrollbar stays put — the tag list inside scrolls instead. */
 .testpilot-page:has(> .ct-fixed-page) {
-  height: calc(100vh - 3.5rem);
+  height: calc(100vh - 4rem);
 }
 
 .testpilot-section {

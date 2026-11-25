@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { IconX } from "@tabler/icons-react";
 import { cx } from "@/components/ui/cx";
@@ -17,6 +17,24 @@ type DrawerProps = {
 };
 
 export default function Drawer({ open, onClose, title, headerExtra, children, className }: DrawerProps) {
+  const [rendered, setRendered] = useState(open);
+  const [closing, setClosing] = useState(false);
+
+  useEffect(() => {
+    if (open) {
+      setRendered(true);
+      setClosing(false);
+      return;
+    }
+    if (!rendered) return;
+    setClosing(true);
+    const timer = window.setTimeout(() => {
+      setRendered(false);
+      setClosing(false);
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [open, rendered]);
+
   useEffect(() => {
     if (!open) return;
     function onKeyDown(e: KeyboardEvent) {
@@ -26,18 +44,22 @@ export default function Drawer({ open, onClose, title, headerExtra, children, cl
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [open, onClose]);
 
-  if (!open || typeof document === "undefined") return null;
+  if (!rendered || typeof document === "undefined") return null;
 
   return createPortal(
     <div
       role="presentation"
-      className="fixed inset-0 z-50 flex justify-end bg-[var(--overlay-backdrop)] backdrop-blur-sm"
+      className={cx(
+        "fixed inset-0 z-50 flex justify-end bg-[var(--overlay-backdrop)] backdrop-blur-sm",
+        closing ? "animate-modal-backdrop-exit" : "animate-modal-backdrop",
+      )}
       onClick={onClose}
     >
       <div
         role="presentation"
         className={cx(
           "flex h-full w-full flex-col border-l border-[var(--border)] bg-[var(--surface-overlay)] shadow-[var(--shadow-elevated)]",
+          closing ? "animate-drawer-slide-out" : "animate-drawer-slide-in",
           className === undefined ? "max-w-[480px]" : className,
         )}
         onClick={(event) => event.stopPropagation()}

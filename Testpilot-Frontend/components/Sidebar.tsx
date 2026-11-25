@@ -186,7 +186,11 @@ function SidebarContent() {
 
   const isInSettings = Boolean(pathname?.startsWith("/settings"));
 
-  const isOnProjectRoot = projectId != null && pathname === `/projects/${projectId}`;
+  const isOnProjectRoot =
+    projectId != null &&
+    (pathname === `/projects/${projectId}` ||
+      pathname === `/projects/${projectId}/dashboard` ||
+      Boolean(pathname?.startsWith(`/projects/${projectId}/dashboard/`)));
   const isPathActive = (href: string) => {
     if (!pathname) return false;
     const [cleanHref, queryStr] = href.split("?");
@@ -207,44 +211,56 @@ function SidebarContent() {
 
   return (
     <aside
-      className={`testpilot-sidebar sticky top-0 shrink-0 flex h-screen flex-col border-r transition-[width] duration-200 ${
+      className={`testpilot-sidebar sticky top-0 shrink-0 flex h-screen flex-col border-r ${
         isCollapsed ? "w-[60px]" : "w-[260px]"
       }`}
     >
       {/*
-        Header. The collapsed rail is far too narrow to fit the brand mark and the
-        toggle side by side, so they stack. Keeping them on one row overflowed the
-        rail and pushed the toggle underneath the sticky TopBar (z-20), which left
-        the sidebar collapsed with no reachable way to expand it again.
+        Header. When expanded, the brand lockup sits on the left and the collapse button on the
+        right inside the 64px bar. When collapsed to the 60px icon rail, the header holds only
+        the centered product mark so it keeps clean breathing room, while the expand toggle sits
+        in the rail below aligned with the nav icons.
       */}
       <div
         className={`flex h-16 items-center border-b border-[var(--glass-border)] ${
-          isCollapsed ? "flex-col justify-center gap-1 px-2" : "justify-between gap-2 px-3"
+          isCollapsed ? "justify-center px-2" : "justify-between gap-2 px-3"
         }`}
       >
         <Link href="/projects" className="flex shrink-0 items-center justify-center" aria-label="TestPilot Test Manager">
           {isCollapsed ? (
-            <BrandLogo decorative className="w-10" />
+            <BrandLogo decorative className="w-7" />
           ) : (
             <BrandLogo className="h-8" />
           )}
         </Link>
-        <button
-          type="button"
-          onClick={() => setIsCollapsed((prev) => !prev)}
-          className={`shrink-0 rounded-xl border border-transparent text-[var(--muted-soft)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)] ${
-            isCollapsed ? "p-1" : "p-1.5"
-          }`}
-          aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-        >
-          <MenuIcon name={isCollapsed ? "chevronRight" : "chevronLeft"} className="h-[16px] w-[16px]" />
-        </button>
+        {!isCollapsed && (
+          <button
+            type="button"
+            onClick={() => setIsCollapsed(true)}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[6px] border border-transparent text-[var(--muted-soft)] transition-colors hover:border-[var(--glass-border)] hover:bg-[var(--glass-surface-muted)] hover:text-[var(--foreground)]"
+            title="Collapse sidebar"
+            aria-label="Collapse sidebar"
+          >
+            <MenuIcon name="chevronLeft" className="h-[16px] w-[16px]" />
+          </button>
+        )}
       </div>
 
       <WorkspaceSwitcher isCollapsed={isCollapsed} />
 
       {/* Navigation */}
       <nav className="flex-1 space-y-3 overflow-y-auto px-2.5 pb-3 pt-3">
+        {isCollapsed && (
+          <button
+            type="button"
+            onClick={() => setIsCollapsed(false)}
+            className="testpilot-nav-item testpilot-nav-item-idle flex w-full items-center justify-center rounded-[6px] px-2 py-2 text-[var(--muted)] transition-colors duration-150 hover:text-[var(--foreground)]"
+            title="Expand sidebar"
+            aria-label="Expand sidebar"
+          >
+            <MenuIcon name="chevronRight" className="h-[18px] w-[18px] shrink-0" />
+          </button>
+        )}
 
         {/* Settings mode */}
         {showSettingsNav && (
@@ -290,7 +306,7 @@ function SidebarContent() {
                 <div className="space-y-0.5">
                   {items.map(({ href, label, icon, children }) => {
                     const fullHref = href ? `${projectPathPrefix}/${href}` : projectPathPrefix;
-                    const active = isPathActive(fullHref) || (href === "" && isOnProjectRoot);
+                    const active = href === "" ? isOnProjectRoot : isPathActive(fullHref);
                     const isParentOpen = Boolean(children && active);
 
                     return (

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { IconBell, IconLogout, IconSearch, IconUserCircle, IconX } from "@tabler/icons-react";
+import { IconBell, IconLogout, IconSearch, IconSparkles, IconUserCircle, IconX } from "@tabler/icons-react";
 import type { AppNotification, ProjectSummary } from "@/lib/api";
 import { listNotifications, markAllNotificationsRead, markNotificationRead } from "@/lib/api";
 import { useTopBarSlots } from "@/components/TopBarSlots";
@@ -11,6 +11,7 @@ import { useLogout } from "@/lib/useLogout";
 import { formatDateTime } from "@/lib/date";
 import ThemeToggle from "@/components/ThemeToggle";
 import { ConfirmModal } from "@/components/ui";
+import { ZyraCopilotDrawer } from "@/components/agents/ZyraCopilotDrawer";
 
 const MAX_RESULTS = 8;
 
@@ -113,6 +114,7 @@ export default function TopBar() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const [notifOpen, setNotifOpen] = useState(false);
+  const [copilotOpen, setCopilotOpen] = useState(false);
   const [notifItems, setNotifItems] = useState<AppNotification[]>([]);
   const [notifLoading, setNotifLoading] = useState(false);
   const [notifError, setNotifError] = useState<string | null>(null);
@@ -256,7 +258,7 @@ export default function TopBar() {
     setNotifOpen(false);
     if (!n.read_at) {
       setNotifItems((prev) => prev.map((item) => (item.id === n.id ? { ...item, read_at: new Date().toISOString() } : item)));
-      void markNotificationRead(n.id).catch(() => {});
+      void markNotificationRead(n.id).catch(() => { });
     }
     router.push(href);
   }
@@ -310,294 +312,312 @@ export default function TopBar() {
   const avatarSeed = user?.userId || user?.email || user?.name || "";
 
   return (
-    <header className="sticky top-0 z-20 h-14 shrink-0 border-b border-[var(--border-subtle)] bg-[var(--surface)]">
+    <>
+    <header className="sticky top-0 z-20 h-16 shrink-0 border-b border-[var(--glass-border)] bg-[var(--surface)]">
       <div className="testpilot-topbar-inset flex h-full items-center gap-4">
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        {/* Page-provided start slot (e.g. breadcrumb). Fills via a portal from the page. */}
-        <div ref={bindStart} className="flex min-w-0 items-center" />
-        {/* Default global search — only when no page has taken over the top bar. */}
-        {!filled && (
-          <label
-            ref={searchBoxRef}
-            title={isMac ? "Search (⌘K)" : "Search (Ctrl+K)"}
-            className="relative flex h-8 w-[260px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]"
-          >
-            <IconSearch size={14} stroke={1.75} className="shrink-0" />
-            <input
-              ref={inputRef}
-              type="text"
-              value={query}
-              onChange={(e) => {
-                setQuery(e.target.value);
-                setOpen(true);
-              }}
-              onFocus={() => setOpen(true)}
-              onKeyDown={handleKeyDown}
-              placeholder="Search projects…"
-              className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
-            />
-            {/*
+        <div className="flex min-w-0 flex-1 items-center gap-3">
+          {/* Page-provided start slot (e.g. breadcrumb). Fills via a portal from the page. */}
+          <div ref={bindStart} className="flex min-w-0 items-center" />
+          {/* Default global search — only when no page has taken over the top bar. */}
+          {!filled && (
+            <label
+              ref={searchBoxRef}
+              title={isMac ? "Search (⌘K)" : "Search (Ctrl+K)"}
+              className="relative flex h-8 w-[260px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[13px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]"
+            >
+              <IconSearch size={14} stroke={1.75} className="shrink-0" />
+              <input
+                ref={inputRef}
+                type="text"
+                value={query}
+                onChange={(e) => {
+                  setQuery(e.target.value);
+                  setOpen(true);
+                }}
+                onFocus={() => setOpen(true)}
+                onKeyDown={handleKeyDown}
+                placeholder="Search projects…"
+                className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
+              />
+              {/*
              * Only the clear (X) affordance is a real button — clicking anywhere in the label
              * already focuses the input, so a second magnifying-glass icon-button here just to
              * refocus was a redundant twin of the decorative one on the left with nothing of its
              * own to do. The keyboard-shortcut hint that used to live in its title now lives on
              * the label itself, so it's not lost.
              */}
-            {query && (
-              <button
-                type="button"
-                aria-label="Clear search"
-                title="Clear search"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={clearQuery}
-                className="flex shrink-0 items-center justify-center rounded-[3px] p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-              >
-                <IconX size={14} stroke={1.75} />
-              </button>
-            )}
+              {query && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  title="Clear search"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={clearQuery}
+                  className="flex shrink-0 items-center justify-center rounded-[3px] p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconX size={14} stroke={1.75} />
+                </button>
+              )}
 
-            {open && query.trim() && (
-              <div className="absolute left-0 top-full z-40 mt-1 w-full max-w-[360px] rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
-                {results.length === 0 ? (
-                  <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No projects found</p>
-                ) : (
-                  results.map((p, idx) => (
+              {open && query.trim() && (
+                <div className="absolute left-0 top-full z-40 mt-1 w-full max-w-[360px] rounded-xl border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-elevated)]">
+                  {results.length === 0 ? (
+                    <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No projects found</p>
+                  ) : (
+                    results.map((p, idx) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          goToProject(p);
+                        }}
+                        onMouseEnter={() => setActiveIndex(idx)}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[13px] transition-colors ${idx === activeIndex ? "bg-[var(--surface-secondary)]" : ""
+                          }`}
+                      >
+                        <span className="truncate text-[var(--foreground)]">{p.name}</span>
+                        <span className="shrink-0 font-mono text-[11px] uppercase text-[var(--muted-soft)]">{p.key}</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </label>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {/* Page-provided end slot (e.g. page actions). Fills via a portal from the page. */}
+          <div ref={bindEnd} className="flex items-center gap-2 empty:hidden" />
+          <ThemeToggle />
+          <button
+            type="button"
+            aria-label="Open Zyra Copilot"
+            title="Zyra Copilot"
+            aria-expanded={copilotOpen}
+            onClick={() => {
+              setNotifOpen(false);
+              setUserMenuOpen(false);
+              setCopilotOpen((v) => !v);
+            }}
+            className={`flex h-8 w-8 items-center justify-center rounded-[6px] border transition-colors ${
+              copilotOpen
+                ? "border-[var(--brand-primary)] bg-[var(--surface-secondary)] text-[var(--foreground)]"
+                : "border-[var(--border)] text-[var(--muted-soft)] hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+            }`}
+          >
+            <IconSparkles size={16} stroke={1.75} />
+          </button>
+          <div ref={notifBoxRef} className="relative">
+            <button
+              type="button"
+              aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
+              aria-haspopup="true"
+              aria-expanded={notifOpen}
+              onClick={toggleNotifications}
+              className="relative flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+            >
+              <IconBell size={16} stroke={1.75} />
+              {unreadCount > 0 && (
+                <span
+                  data-testid="notification-badge"
+                  className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none bg-[var(--brand-highlight)] text-[var(--brand-highlight-foreground)]"
+                >
+                  {unreadCount > 9 ? "9+" : unreadCount}
+                </span>
+              )}
+            </button>
+
+            {notifOpen && (
+              <div
+                role="menu"
+                aria-label="Notifications"
+                // max-h + overflow: up to 50 notifications can come back, far more than fit on screen. Without
+                // a height limit the panel grew past the viewport with nothing to scroll.
+                // No top padding (pb-1, not py-1): a sticky child sticks BELOW its scroller's padding, so a
+                // top padding left a strip above the pinned header that scrolled text showed through.
+                className="absolute right-0 top-full z-40 mt-1 max-h-[min(70vh,520px)] w-[320px] max-w-[calc(100vw-2rem)] overflow-y-auto overscroll-contain rounded-xl border border-[var(--border)] bg-[var(--surface)] pb-1 shadow-[var(--shadow-elevated)]"
+              >
+                {notifLoading ? (
+                  <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">Loading…</p>
+                ) : notifError ? (
+                  <div className="px-3 py-2">
+                    <p className="text-[13px] text-[var(--error-foreground)]">{notifError}</p>
                     <button
-                      key={p.id}
                       type="button"
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        goToProject(p);
-                      }}
-                      onMouseEnter={() => setActiveIndex(idx)}
-                      className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-[13px] transition-colors ${
-                        idx === activeIndex ? "bg-[var(--surface-secondary)]" : ""
-                      }`}
+                      onClick={() => void loadNotifications()}
+                      className="mt-1 text-[13px] font-medium text-[var(--brand-primary)] hover:underline"
                     >
-                      <span className="truncate text-[var(--foreground)]">{p.name}</span>
-                      <span className="shrink-0 font-mono text-[11px] uppercase text-[var(--muted-soft)]">{p.key}</span>
+                      Try again
                     </button>
-                  ))
+                  </div>
+                ) : notifItems.length === 0 ? (
+                  <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
+                ) : (
+                  <>
+                    {/* Always present once there is a list, and pinned so it stays in reach however far
+                      the list is scrolled. Greyed out (not removed) when nothing is unread: a control
+                      that vanishes reads as a missing feature. */}
+                    <div className="sticky top-0 z-10 flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3 pb-1.5 pt-1">
+                      <span className="text-[12px] text-[var(--muted-soft)]">{unreadCount > 0 ? `${unreadCount} unread` : "All caught up"}</span>
+                      <button
+                        type="button"
+                        onClick={handleMarkAllRead}
+                        disabled={unreadCount === 0}
+                        className="text-[12px] font-medium text-[var(--brand-primary)] hover:underline disabled:cursor-default disabled:text-[var(--muted-soft)] disabled:no-underline disabled:opacity-60"
+                      >
+                        Mark all as read
+                      </button>
+                    </div>
+                    {notifItems.map((n) => {
+                      const href = resolveNotificationHref(n);
+                      // Which project it came from, so two projects raising similar notifications can be
+                      // told apart. A project the user can no longer see simply shows no label.
+                      const notifProjectId = notificationProjectId(n);
+                      const notifProject = notifProjectId ? projects.find((p) => p.id === notifProjectId) : undefined;
+                      const body = (
+                        <>
+                          <p className="font-medium text-[var(--foreground)]">{n.title}</p>
+                          {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
+                          {/* When it happened — through lib/date like every other timestamp in the app. */}
+                          <p className="mt-1 flex items-center gap-1.5 text-[11px] text-[var(--muted-soft)]">
+                            <time dateTime={n.created_at}>{formatDateTime(n.created_at)}</time>
+                            {notifProject && (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span
+                                  data-testid="notification-project"
+                                  title={notifProject.name}
+                                  className="max-w-[120px] truncate rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-medium text-[var(--muted)]"
+                                >
+                                  {notifProject.key}
+                                </span>
+                              </>
+                            )}
+                          </p>
+                        </>
+                      );
+                      // No resolvable link (an unrecognized type, or an older/malformed row missing
+                      // its link id) — plain, non-interactive text, same as before this change.
+                      if (!href) {
+                        return (
+                          <div key={n.id} role="menuitem" className="px-3 py-2 text-left text-[13px]">
+                            {body}
+                          </div>
+                        );
+                      }
+                      return (
+                        <button
+                          key={n.id}
+                          type="button"
+                          role="menuitem"
+                          onClick={() => handleNotificationClick(n, href)}
+                          className="flex w-full items-start gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-[var(--surface-secondary)]"
+                        >
+                          {!n.read_at && (
+                            <span
+                              aria-hidden="true"
+                              className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                              style={{ background: "var(--brand-primary)" }}
+                            />
+                          )}
+                          <span className="min-w-0 flex-1">{body}</span>
+                        </button>
+                      );
+                    })}
+                  </>
                 )}
               </div>
             )}
-          </label>
-        )}
-      </div>
-      <div className="flex items-center gap-2">
-        {/* Page-provided end slot (e.g. page actions). Fills via a portal from the page. */}
-        <div ref={bindEnd} className="flex items-center gap-2 empty:hidden" />
-        <ThemeToggle />
-        <div ref={notifBoxRef} className="relative">
-          <button
-            type="button"
-            aria-label={unreadCount > 0 ? `Notifications, ${unreadCount} unread` : "Notifications"}
-            aria-haspopup="true"
-            aria-expanded={notifOpen}
-            onClick={toggleNotifications}
-            className="relative flex h-8 w-8 items-center justify-center rounded-[6px] border border-[var(--border)] text-[var(--muted-soft)] transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-          >
-            <IconBell size={16} stroke={1.75} />
-            {unreadCount > 0 && (
-              <span
-                data-testid="notification-badge"
-                className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none bg-[var(--brand-highlight)] text-[var(--brand-highlight-foreground)]"
-              >
-                {unreadCount > 9 ? "9+" : unreadCount}
-              </span>
-            )}
-          </button>
-
-          {notifOpen && (
-            <div
-              role="menu"
-              aria-label="Notifications"
-              // max-h + overflow: up to 50 notifications can come back, far more than fit on screen. Without
-              // a height limit the panel grew past the viewport with nothing to scroll.
-              // No top padding (pb-1, not py-1): a sticky child sticks BELOW its scroller's padding, so a
-              // top padding left a strip above the pinned header that scrolled text showed through.
-              className="absolute right-0 top-full z-40 mt-1 max-h-[min(70vh,520px)] w-[320px] max-w-[calc(100vw-2rem)] overflow-y-auto overscroll-contain rounded-xl border border-[var(--border)] bg-[var(--surface)] pb-1 shadow-[var(--shadow-elevated)]"
-            >
-              {notifLoading ? (
-                <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">Loading…</p>
-              ) : notifError ? (
-                <div className="px-3 py-2">
-                  <p className="text-[13px] text-[var(--error-foreground)]">{notifError}</p>
-                  <button
-                    type="button"
-                    onClick={() => void loadNotifications()}
-                    className="mt-1 text-[13px] font-medium text-[var(--brand-primary)] hover:underline"
-                  >
-                    Try again
-                  </button>
-                </div>
-              ) : notifItems.length === 0 ? (
-                <p className="px-3 py-2 text-[13px] text-[var(--muted-soft)]">No notifications</p>
-              ) : (
-                <>
-                  {/* Always present once there is a list, and pinned so it stays in reach however far
-                      the list is scrolled. Greyed out (not removed) when nothing is unread: a control
-                      that vanishes reads as a missing feature. */}
-                  <div className="sticky top-0 z-10 flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3 pb-1.5 pt-1">
-                    <span className="text-[12px] text-[var(--muted-soft)]">{unreadCount > 0 ? `${unreadCount} unread` : "All caught up"}</span>
-                    <button
-                      type="button"
-                      onClick={handleMarkAllRead}
-                      disabled={unreadCount === 0}
-                      className="text-[12px] font-medium text-[var(--brand-primary)] hover:underline disabled:cursor-default disabled:text-[var(--muted-soft)] disabled:no-underline disabled:opacity-60"
-                    >
-                      Mark all as read
-                    </button>
-                  </div>
-                {notifItems.map((n) => {
-                  const href = resolveNotificationHref(n);
-                  // Which project it came from, so two projects raising similar notifications can be
-                  // told apart. A project the user can no longer see simply shows no label.
-                  const notifProjectId = notificationProjectId(n);
-                  const notifProject = notifProjectId ? projects.find((p) => p.id === notifProjectId) : undefined;
-                  const body = (
-                    <>
-                      <p className="font-medium text-[var(--foreground)]">{n.title}</p>
-                      {n.body && <p className="mt-0.5 text-[var(--muted-soft)]">{n.body}</p>}
-                      {/* When it happened — through lib/date like every other timestamp in the app. */}
-                      <p className="mt-1 flex items-center gap-1.5 text-[11px] text-[var(--muted-soft)]">
-                        <time dateTime={n.created_at}>{formatDateTime(n.created_at)}</time>
-                        {notifProject && (
-                          <>
-                            <span aria-hidden="true">·</span>
-                            <span
-                              data-testid="notification-project"
-                              title={notifProject.name}
-                              className="max-w-[120px] truncate rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-medium text-[var(--muted)]"
-                            >
-                              {notifProject.key}
-                            </span>
-                          </>
-                        )}
-                      </p>
-                    </>
-                  );
-                  // No resolvable link (an unrecognized type, or an older/malformed row missing
-                  // its link id) — plain, non-interactive text, same as before this change.
-                  if (!href) {
-                    return (
-                      <div key={n.id} role="menuitem" className="px-3 py-2 text-left text-[13px]">
-                        {body}
-                      </div>
-                    );
-                  }
-                  return (
-                    <button
-                      key={n.id}
-                      type="button"
-                      role="menuitem"
-                      onClick={() => handleNotificationClick(n, href)}
-                      className="flex w-full items-start gap-2 px-3 py-2 text-left text-[13px] transition-colors hover:bg-[var(--surface-secondary)]"
-                    >
-                      {!n.read_at && (
-                        <span
-                          aria-hidden="true"
-                          className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
-                          style={{ background: "var(--brand-primary)" }}
-                        />
-                      )}
-                      <span className="min-w-0 flex-1">{body}</span>
-                    </button>
-                  );
-                })}
-                </>
-              )}
-            </div>
-          )}
-        </div>
-        <div ref={userMenuRef} className="relative">
-          <button
-            type="button"
-            onClick={() => setUserMenuOpen((o) => !o)}
-            title={displayName || undefined}
-            aria-label="User menu"
-            aria-haspopup="true"
-            aria-expanded={userMenuOpen}
-            className="shrink-0 rounded-full"
-          >
-            <span
-              /*
-               * Seeded from the identity, not a flat brand fill.
-               *
-               * Basecamp 10198836413 — "Display picture initials show different colours across the
-               * website". One person's initials were painted five different ways: the seeded palette on
-               * cycles and plan cards, a flat --cta-primary here and in the workspace switcher, a flat
-               * --brand-soft in knowledge base comments, and a flat --surface-tertiary in Manage Admins.
-               * avatarColor() is the single source, and every swatch in it clears 4.5:1 under white text.
-               */
-              className="grid h-[30px] w-[30px] place-items-center rounded-full text-[11px] font-semibold text-white"
-              style={{ backgroundColor: avatarColor(avatarSeed || "?") }}
-            >
-              {displayName ? getInitials(displayName) : ""}
-            </span>
-          </button>
-
-          {userMenuOpen && (
-            <div
-              role="menu"
+          </div>
+          <div ref={userMenuRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setUserMenuOpen((o) => !o)}
+              title={displayName || undefined}
               aria-label="User menu"
-              /*
-               * p-1 (not py-1 + item-level px-3): every item's hover/focus highlight is now inset by
-               * exactly this padding on all four sides, so it reads as a clean rounded chip with no
-               * sliver of uncovered background left between it and the menu's own edge or the divider
-               * above/below — the gap the previous py-1-only version left uncovered on hover.
-               */
-              /*
-               * fade-in (globals.css) is the app's existing subtle-entrance utility, already used by
-               * the reports tabs — reused here rather than a new animation, so opening the menu isn't
-               * an instant hard cut. No exit animation: the menu unmounts immediately on close so
-               * Playwright's/AT's visibility checks (and every e2e assertion keyed on that) still see
-               * a true, instant hide rather than a lingering fading-out element.
-               */
-              className="fade-in absolute right-0 top-full z-40 mt-1.5 w-60 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-elevated)]"
+              aria-haspopup="true"
+              aria-expanded={userMenuOpen}
+              className="shrink-0 rounded-full"
             >
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  setUserMenuOpen(false);
-                  router.push("/account");
-                }}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
-              >
-                <IconUserCircle size={16} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
-                My Account
-              </button>
-
-              <div role="none" className="my-1 border-t border-[var(--border-subtle)]" />
-
-              <button
-                type="button"
-                role="menuitem"
+              <span
                 /*
-                 * Opens the logout confirmation rather than logging out directly — the menu closes so
-                 * the dialog stands alone; a failed logout is reported inside that dialog, which stays
-                 * open with Logout enabled to retry.
+                 * Seeded from the identity, not a flat brand fill.
                  *
-                 * Styled as a destructive action throughout — red label at rest (text-[var(--error-
-                 * foreground)]) AND a red-tinted hover (bg-[var(--error-soft)] instead of the neutral
-                 * hover every other item uses) — the same convention as Button's own "danger" variant,
-                 * so Logout reads unmistakably differently from "My Account" in every state.
+                 * Basecamp 10198836413 — "Display picture initials show different colours across the
+                 * website". One person's initials were painted five different ways: the seeded palette on
+                 * cycles and plan cards, a flat --cta-primary here and in the workspace switcher, a flat
+                 * --brand-soft in knowledge base comments, and a flat --surface-tertiary in Manage Admins.
+                 * avatarColor() is the single source, and every swatch in it clears 4.5:1 under white text.
                  */
-                onClick={() => {
-                  setUserMenuOpen(false);
-                  resetLogoutError();
-                  setLogoutConfirmOpen(true);
-                }}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)]"
+                className="grid h-[30px] w-[30px] place-items-center rounded-full text-[11px] font-semibold text-white"
+                style={{ backgroundColor: avatarColor(avatarSeed || "?") }}
               >
-                <IconLogout size={16} stroke={1.75} className="shrink-0" />
-                Logout
-              </button>
-            </div>
-          )}
+                {displayName ? getInitials(displayName) : ""}
+              </span>
+            </button>
+
+            {userMenuOpen && (
+              <div
+                role="menu"
+                aria-label="User menu"
+                /*
+                 * p-1 (not py-1 + item-level px-3): every item's hover/focus highlight is now inset by
+                 * exactly this padding on all four sides, so it reads as a clean rounded chip with no
+                 * sliver of uncovered background left between it and the menu's own edge or the divider
+                 * above/below — the gap the previous py-1-only version left uncovered on hover.
+                 */
+                /*
+                 * fade-in (globals.css) is the app's existing subtle-entrance utility, already used by
+                 * the reports tabs — reused here rather than a new animation, so opening the menu isn't
+                 * an instant hard cut. No exit animation: the menu unmounts immediately on close so
+                 * Playwright's/AT's visibility checks (and every e2e assertion keyed on that) still see
+                 * a true, instant hide rather than a lingering fading-out element.
+                 */
+                className="fade-in absolute right-0 top-full z-40 mt-1.5 w-60 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1 shadow-[var(--shadow-elevated)]"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setUserMenuOpen(false);
+                    router.push("/account");
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)]"
+                >
+                  <IconUserCircle size={16} stroke={1.75} className="shrink-0 text-[var(--muted-soft)]" />
+                  My Account
+                </button>
+
+                <div role="none" className="my-1 border-t border-[var(--border-subtle)]" />
+
+                <button
+                  type="button"
+                  role="menuitem"
+                  /*
+                   * Opens the logout confirmation rather than logging out directly — the menu closes so
+                   * the dialog stands alone; a failed logout is reported inside that dialog, which stays
+                   * open with Logout enabled to retry.
+                   *
+                   * Styled as a destructive action throughout — red label at rest (text-[var(--error-
+                   * foreground)]) AND a red-tinted hover (bg-[var(--error-soft)] instead of the neutral
+                   * hover every other item uses) — the same convention as Button's own "danger" variant,
+                   * so Logout reads unmistakably differently from "My Account" in every state.
+                   */
+                  onClick={() => {
+                    setUserMenuOpen(false);
+                    resetLogoutError();
+                    setLogoutConfirmOpen(true);
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13px] text-[var(--error-foreground)] transition-colors hover:bg-[var(--error-soft)]"
+                >
+                  <IconLogout size={16} stroke={1.75} className="shrink-0" />
+                  Logout
+                </button>
+              </div>
+            )}
+          </div>
         </div>
-      </div>
       </div>
       <ConfirmModal
         open={logoutConfirmOpen}
@@ -613,5 +633,7 @@ export default function TopBar() {
         onCancel={closeLogoutConfirm}
       />
     </header>
+    <ZyraCopilotDrawer open={copilotOpen} onClose={() => setCopilotOpen(false)} />
+    </>
   );
 }

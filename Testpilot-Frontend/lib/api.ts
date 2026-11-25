@@ -4608,3 +4608,64 @@ export async function uploadExecutionEvidence(
   }
   return res.json() as Promise<{ list: ExecutionEvidence[]; total: number }>;
 }
+
+// ── Telegram (project-scoped notification integration) ──
+
+export interface TelegramEventsConfig {
+  bugs: boolean;
+  testRuns: boolean;
+  comments: boolean;
+  zyra: boolean;
+  other: boolean;
+}
+
+export interface TelegramIntegrationStatus {
+  connected: boolean;
+  enabled: boolean;
+  chatId: string | null;
+  threadId: number | null;
+  hasBotToken: boolean;
+  maskedBotToken: string | null;
+  events: TelegramEventsConfig;
+  updatedAt: string | null;
+}
+
+export async function getTelegramIntegration(projectId: string): Promise<TelegramIntegrationStatus> {
+  return api<TelegramIntegrationStatus>(`/api/projects/${projectId}/integrations/telegram`);
+}
+
+export async function saveTelegramIntegration(
+  projectId: string,
+  data: {
+    botToken?: string;
+    chatId: string;
+    threadId?: number | null;
+    enabled?: boolean;
+    events?: Partial<TelegramEventsConfig>;
+  }
+): Promise<TelegramIntegrationStatus> {
+  return api<TelegramIntegrationStatus>(`/api/projects/${projectId}/integrations/telegram`, {
+    method: "PUT",
+    body: data,
+  });
+}
+
+export async function testTelegramIntegration(
+  projectId: string,
+  data?: {
+    botToken?: string;
+    chatId?: string;
+    threadId?: number | null;
+  }
+): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/api/projects/${projectId}/integrations/telegram/test`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function disconnectTelegramIntegration(projectId: string): Promise<{ ok: boolean }> {
+  return api<{ ok: boolean }>(`/api/projects/${projectId}/integrations/telegram`, {
+    method: "DELETE",
+  });
+}

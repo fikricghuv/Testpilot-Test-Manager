@@ -1381,7 +1381,7 @@ function KnowledgeBasePageInner() {
     // Full-bleed, full-height IDE-style workspace, same convention as the Test Case
     // repository / Plan Details / Project Settings screens (`tc-fullbleed` makes the
     // wrapping .testpilot-page drop its centered 1280px cap + padding).
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(

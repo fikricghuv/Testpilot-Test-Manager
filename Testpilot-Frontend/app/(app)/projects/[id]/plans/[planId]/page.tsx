@@ -97,7 +97,7 @@ function SegmentedBar({ passed, failed, blocked, skipped, untested, total }: { p
   return (
     <div className="flex h-2 w-full overflow-hidden rounded-full bg-[var(--surface-tertiary)]">
       {segments.map(({ value, color }, i) =>
-        value > 0 ? <div key={i} className="h-full transition-all duration-500" style={{ width: `${(value / total) * 100}%`, background: color }} /> : null
+        value > 0 ? <div key={i} className="h-full transition-[width] duration-300 ease-[var(--ease-out-quad)]" style={{ width: `${(value / total) * 100}%`, background: color }} /> : null
       )}
     </div>
   );
@@ -335,7 +335,7 @@ export default function PlanDetailPage() {
     // Full-bleed, full-height workspace: `tc-fullbleed` drops the wrapping .testpilot-page's
     // centered 1280px cap so this fills the content region below the 3.5rem TopBar,
     // matching the Test Cases workspace pattern.
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&

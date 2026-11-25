@@ -1103,7 +1103,7 @@ export default function TestRunDetailPage() {
     // Full-bleed, full-height workspace: `tc-fullbleed` drops the wrapping .testpilot-page's
     // centered 1280px cap so this fills the content region below the 3.5rem TopBar,
     // matching the Test Plan detail workspace pattern.
-    <main className="tc-fullbleed flex flex-col p-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col p-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {/* TopBar takeover: breadcrumb (start) + actions (end) */}
         {topBarStartEl &&

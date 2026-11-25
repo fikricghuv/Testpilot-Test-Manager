@@ -105,7 +105,7 @@ function WorkspaceSettingsContent() {
   }
 
   return (
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(

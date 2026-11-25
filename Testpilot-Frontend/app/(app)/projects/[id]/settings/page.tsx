@@ -5,7 +5,7 @@ import { useParams } from "@/lib/routeParams";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { createPortal } from "react-dom";
-import { IconKey, IconSettings, IconStack2, IconTag, IconTrash } from "@tabler/icons-react";
+import { IconBrandTelegram, IconKey, IconSettings, IconStack2, IconTag, IconTrash } from "@tabler/icons-react";
 import {
   updateProject,
   deleteProject as deleteProjectRequest,
@@ -13,6 +13,7 @@ import {
   getBillingInfo,
   getLinearStatus,
   getNotionStatus,
+  getTelegramIntegration,
   listWorkspaceMembers,
   addProjectMember,
   removeProjectMember,
@@ -22,6 +23,7 @@ import {
   type JiraConnection,
   type LinearConnection,
   type NotionConnection,
+  type TelegramIntegrationStatus,
   type ProjectIcon,
   type TestEnvironmentSetting,
 } from "@/lib/api";
@@ -137,6 +139,7 @@ export default function ProjectSettingsPage() {
   const [linearStatus, setLinearStatus] = useState<LinearConnection | null>(null);
   // Notion is on every plan, so unlike Linear there is no Pro lock state to track here.
   const [notionStatus, setNotionStatus] = useState<NotionConnection | null>(null);
+  const [telegramStatus, setTelegramStatus] = useState<TelegramIntegrationStatus | null>(null);
   /*
    * Basecamp 10191178824 — "Linear is restricted behind a Pro upgrade in Workspace Settings, but the
    * same integration is available in Project Settings → Integrations".
@@ -270,6 +273,7 @@ export default function ProjectSettingsPage() {
     getJiraStatus(projectId).then(setJiraStatus).catch(() => {});
     getLinearStatus(projectId).then(setLinearStatus).catch(() => {});
     getNotionStatus(projectId).then(setNotionStatus).catch(() => {});
+    getTelegramIntegration(projectId).then(setTelegramStatus).catch(() => {});
     getBillingInfo()
       .then((billing) => setLinearIsPro(billing.enabled === false || billing.plan === "pro"))
       .catch(() => setLinearIsPro(null));
@@ -492,7 +496,7 @@ export default function ProjectSettingsPage() {
   ) : null;
 
   return (
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {topBarStartEl &&
           createPortal(
@@ -919,7 +923,7 @@ export default function ProjectSettingsPage() {
           </div>
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <IconKey className="w-5 h-5 text-white" stroke={1.75} />
+              <IconKey className="w-5 h-5 text-white dark:text-[#09090b]" stroke={1.75} />
             </div>
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-semibold text-[var(--foreground)]">TestPilot API tokens</h3>
@@ -934,7 +938,7 @@ export default function ProjectSettingsPage() {
             <div className="shrink-0">
               <Link
                 href={`/projects/${projectId}/settings/api-tokens`}
-                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
               >
                 Manage API tokens
               </Link>
@@ -952,7 +956,7 @@ export default function ProjectSettingsPage() {
           </div>
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <IconStack2 className="w-5 h-5 text-white" stroke={1.75} />
+              <IconStack2 className="w-5 h-5 text-white dark:text-[#09090b]" stroke={1.75} />
             </div>
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-semibold text-[var(--foreground)]">Test case custom fields</h3>
@@ -967,7 +971,7 @@ export default function ProjectSettingsPage() {
             <div className="shrink-0">
               <Link
                 href={`/projects/${projectId}/settings/custom-fields`}
-                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
               >
                 Manage custom fields
               </Link>
@@ -989,7 +993,7 @@ export default function ProjectSettingsPage() {
           {/* Jira Card */}
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="currentColor">
+              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white dark:text-[#09090b]" fill="currentColor">
                 <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.94 4.34 4.34 4.35V2.84a.84.84 0 0 0-.84-.84H11.53ZM6.77 6.8a4.362 4.362 0 0 0 4.34 4.34h1.8v1.72a4.362 4.362 0 0 0 4.34 4.34V7.63a.84.84 0 0 0-.84-.84H6.77ZM2 11.6c0 2.4 1.95 4.34 4.35 4.35h1.78v1.71c0 2.4 1.95 4.35 4.35 4.35V12.44a.84.84 0 0 0-.84-.84H2Z" />
               </svg>
             </div>
@@ -1039,7 +1043,7 @@ export default function ProjectSettingsPage() {
               ) : (
                 <Link
                   href="/settings/integrations/jira"
-                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                 >
                   Connect in Workspace Settings
                 </Link>
@@ -1050,7 +1054,7 @@ export default function ProjectSettingsPage() {
           {/* Linear Card */}
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="currentColor">
+              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white dark:text-[#09090b]" fill="currentColor">
                 <path d="M2.28 15.36 8.64 21.7c-3.14-.55-5.79-3.2-6.36-6.34Zm-.27-2.06L14.7 22c.34.02.68.02 1.02 0L1.99 8.98c-.02.34-.02.68.02 1.02Zm.5-3.14L15.84 21.5a10.9 10.9 0 0 0 1.87-1.1L3.6 6.29a10.9 10.9 0 0 0-1.09 1.87Zm1.9-2.98L18.82 18.5a11 11 0 0 0 1.28-1.55L5.06 5.9a11 11 0 0 0-1.55 1.28Zm2.71-2.2L21.02 15.87A11 11 0 0 0 22 1.98L8.12 1a11 11 0 0 0-1.9 1.98Z" />
               </svg>
             </div>
@@ -1109,7 +1113,7 @@ export default function ProjectSettingsPage() {
                   className={
                     linearLocked
                       ? "inline-flex h-9 items-center justify-center rounded-[10px] border border-[var(--border)] px-3.5 text-[13px] font-semibold text-[var(--muted)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
-                      : "inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                      : "inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                   }
                 >
                   {linearLocked ? "Upgrade to Pro" : "Connect in Workspace Settings"}
@@ -1121,7 +1125,7 @@ export default function ProjectSettingsPage() {
           {/* Notion Card (every plan, so no Pro lock) */}
           <div data-testid="notion-project-card" className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
+              <svg viewBox="0 0 24 24" className="w-6 h-6 text-white dark:text-[#09090b]" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round">
                 <rect x="4" y="3.5" width="16" height="17" rx="2.5" />
                 <path d="M9 16.5v-9l6 9v-9" />
               </svg>
@@ -1174,9 +1178,58 @@ export default function ProjectSettingsPage() {
                 <Link
                   href="/settings/integrations/notion"
                   data-testid="notion-project-cta"
-                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
                 >
                   Connect in Workspace Settings
+                </Link>
+              )}
+            </div>
+          </div>
+
+          {/* Telegram Integration */}
+          <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
+            <div className="shrink-0 w-10 h-10 rounded-lg bg-[#229ED9] flex items-center justify-center">
+              <IconBrandTelegram className="w-5 h-5 text-white" stroke={1.75} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-semibold text-[var(--foreground)]">Telegram</h3>
+                {telegramStatus?.connected && (
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                      telegramStatus.enabled
+                        ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                        : "bg-[var(--surface-tertiary)] text-[var(--muted)]"
+                    }`}
+                  >
+                    {telegramStatus.enabled ? "Connected" : "Paused"}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-[var(--muted)] mt-0.5">
+                {telegramStatus?.connected
+                  ? `Forwarding project notifications to chat ${telegramStatus.chatId}.`
+                  : "Send project notifications (bugs, test runs, comments, and Zyra updates) to a Telegram chat or group."}
+              </p>
+            </div>
+            <div className="shrink-0">
+              {telegramStatus?.connected ? (
+                <Link
+                  href={`/projects/${projectId}/settings/integrations/telegram`}
+                  data-testid="telegram-project-settings-link"
+                  aria-label="Telegram integration settings"
+                  title="Telegram integration settings"
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-[var(--border)] text-[var(--muted)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                >
+                  <IconSettings size={17} stroke={1.75} />
+                </Link>
+              ) : (
+                <Link
+                  href={`/projects/${projectId}/settings/integrations/telegram`}
+                  data-testid="telegram-project-cta"
+                  className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                >
+                  Configure
                 </Link>
               )}
             </div>
@@ -1207,7 +1260,7 @@ export default function ProjectSettingsPage() {
           </div>
           <div className="rounded-lg border border-[var(--border)] p-4 flex items-start gap-4">
             <div className="shrink-0 w-10 h-10 rounded-lg bg-[var(--brand-primary)] flex items-center justify-center">
-              <IconTag className="w-5 h-5 text-white" stroke={1.75} />
+              <IconTag className="w-5 h-5 text-white dark:text-[#09090b]" stroke={1.75} />
             </div>
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-semibold text-[var(--foreground)]">Test case custom tags</h3>
@@ -1222,7 +1275,7 @@ export default function ProjectSettingsPage() {
             <div className="shrink-0">
               <Link
                 href={`/projects/${projectId}/settings/custom-tags`}
-                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
+                className="inline-flex h-9 items-center justify-center rounded-[10px] border border-transparent bg-[var(--brand-primary)] px-3.5 text-[13px] font-semibold text-white dark:text-[#09090b] shadow-sm transition-colors hover:bg-[var(--brand-hover)]"
               >
                 Manage custom tags
               </Link>

@@ -408,11 +408,10 @@ function ZyraChatOptionList({
             onClick={() => onChoose(choice)}
             disabled={!open}
             aria-pressed={chosen}
-            className={`flex w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors ${
-              chosen
+            className={`flex w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors ${chosen
                 ? "border-[var(--brand-primary)] bg-[var(--brand-primary)]/10"
                 : "border-[var(--border)] bg-[var(--surface)]"
-            } ${open ? "hover:border-[var(--brand-primary)] hover:bg-[var(--brand-primary)]/5" : "cursor-default opacity-70"}`}
+              } ${open ? "hover:border-[var(--brand-primary)] hover:bg-[var(--brand-primary)]/5" : "cursor-default opacity-70"}`}
           >
             <span className="mt-px font-mono text-[12px] text-[var(--muted)]">{index + 1}</span>
             <span className="min-w-0 flex-1">
@@ -1695,322 +1694,321 @@ export default function ZyraChatPage() {
     // Every Zyra component below (review panel, citations, drawer, editor) reads the session's
     // language from this context — including the portaled top-bar actions and the modals.
     <ZyraLanguageContext.Provider value={lang}>
-    {/* Full-bleed, full-height IDE-style workspace — same pattern as the Test Cases / Plan
+      {/* Full-bleed, full-height IDE-style workspace — same pattern as the Test Cases / Plan
         Details screens. `tc-fullbleed` makes the wrapping .testpilot-page drop its centered
         1280px cap + padding, so this fills the whole content region below the 3.5rem TopBar. */}
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
-      <div className="flex min-h-0 flex-1 flex-col">
-        {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
-        {topBarStartEl &&
-          createPortal(
-            <Breadcrumbs
-              items={[
-                { label: "Projects", href: "/projects" },
-                { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
-                { label: "Zyra" },
-              ]}
-            />,
-            topBarStartEl,
-          )}
-        {topBarEndEl &&
-          createPortal(
-            <div className="flex flex-wrap items-center gap-2">
-              {agent && (
-                <StatusChip tone={agent.agent.active ? "success" : "warning"} dot>
-                  {agent.agent.active ? t("top.aiConnected") : t("top.noAiKey")}
-                </StatusChip>
-              )}
-              <Link href={`/projects/${projectId}/agents/tasks`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
-                <IconClipboardCheck size={15} stroke={1.9} />
-                {t("top.taskBoard")}
-              </Link>
-              <Link href={`/projects/${projectId}/agents/zyra/settings`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
-                <IconSettings size={15} stroke={1.9} />
-                {t("top.settings")}
-              </Link>
-            </div>,
-            topBarEndEl,
-          )}
-
-        {/* Title + subtitle row */}
-        <div className="mb-3 flex shrink-0 items-center gap-2.5 pl-4">
-          <ZyraMark size={28} />
-          <div>
-            <h1 className="text-[20px] font-semibold leading-tight tracking-[-0.02em] text-[var(--foreground)]">Zyra</h1>
-            <p className="mt-[1px] text-[13px] text-[var(--muted-soft)]">
-              {t("page.subtitle")}
-            </p>
-          </div>
-        </div>
-
-        {/* Error banner */}
-        {error && (
-          <div className="ml-4 mb-3 shrink-0 rounded-xl border border-[var(--error)]/40 bg-[var(--error-soft)] px-4 py-3 text-sm text-[var(--error-foreground)] flex items-start justify-between gap-3">
-            <span>{error}</span>
-            <button type="button" onClick={() => setError(null)} className="shrink-0 text-[var(--error-foreground)]/60 hover:text-[var(--error-foreground)]">✕</button>
-          </div>
-        )}
-
-        {loading ? (
-          <PageLoader
-            variant="inline"
-            label={t("page.loading")}
-            className="min-h-0 flex-1 rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]"
-          />
-        ) : (
-          <div className="flex min-h-0 flex-1 overflow-hidden rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]">
-
-            {/* ── Session sidebar ─────────────────────────────────────────── */}
-            <aside className="flex w-[260px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] overflow-hidden">
-              {/* Sidebar header */}
-              <div className="shrink-0 flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
-                <div>
-                  <p className="text-sm font-semibold text-[var(--foreground)]">{t("side.conversations")}</p>
-                  <p className="text-[11px] text-[var(--muted)]">
-                    {t("side.sessions", { n: visibleSessions.length })}
-                  </p>
-                </div>
-                <Button size="sm" variant="secondary" disabled={creatingSession} onClick={() => void createSession()}>
-                  <IconPlus size={13} stroke={2} />
-                  {t("side.new")}
-                </Button>
-              </div>
-
-              {/* Session list — scrollable */}
-              <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
-                {visibleSessions.length === 0 && (
-                  <p className="px-3 py-8 text-center text-xs text-[var(--muted)]">{t("side.empty")}</p>
+      <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
+        <div className="flex min-h-0 flex-1 flex-col">
+          {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
+          {topBarStartEl &&
+            createPortal(
+              <Breadcrumbs
+                items={[
+                  { label: "Projects", href: "/projects" },
+                  { label: projectName || "Project", href: `/projects/${projectId}/dashboard` },
+                  { label: "Zyra" },
+                ]}
+              />,
+              topBarStartEl,
+            )}
+          {topBarEndEl &&
+            createPortal(
+              <div className="flex flex-wrap items-center gap-2">
+                {agent && (
+                  <StatusChip tone={agent.agent.active ? "success" : "warning"} dot>
+                    {agent.agent.active ? t("top.aiConnected") : t("top.noAiKey")}
+                  </StatusChip>
                 )}
-                {visibleSessions.map((session) => {
-                  const isActive = activeSession?.id === session.id;
-                  return (
-                    <div
-                      key={session.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => void openSession(session.id)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          void openSession(session.id);
-                        }
-                      }}
-                      className={`group flex w-full cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                        isActive
-                          ? "border-[var(--brand-border)] bg-[var(--surface-secondary)]"
-                          : "border-transparent hover:bg-[var(--surface-secondary)]"
-                      }`}
-                    >
-                      <div className="min-w-0 flex-1">
-                        <span className={`block truncate text-[12px] font-medium ${isActive ? "text-[var(--foreground)]" : "text-[var(--muted)]"}`}>
-                          {session.title}
-                        </span>
-                        <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted-soft)]">
-                          {formatTime(session.updatedAt, t.locale)}
-                        </span>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                        <button
-                          type="button"
-                          title={t("rename.title")}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setRenameTarget(session);
-                          }}
-                          className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--accent-light)]"
-                        >
-                          <IconPencil size={12} stroke={1.75} />
-                        </button>
-                        <button
-                          type="button"
-                          title={t("delete.title")}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setDeleteTarget(session);
-                          }}
-                          className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--error-foreground)]"
-                        >
-                          <IconTrash size={12} stroke={1.75} />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </aside>
+                <Link href={`/projects/${projectId}/agents/tasks`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
+                  <IconClipboardCheck size={15} stroke={1.9} />
+                  {t("top.taskBoard")}
+                </Link>
+                <Link href={`/projects/${projectId}/agents/zyra/settings`} className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--surface-secondary)]">
+                  <IconSettings size={15} stroke={1.9} />
+                  {t("top.settings")}
+                </Link>
+              </div>,
+              topBarEndEl,
+            )}
 
-            {/* ── Chat area ───────────────────────────────────────────────── */}
-            <section className="flex flex-1 min-w-0 flex-col bg-[var(--surface-secondary)] overflow-hidden">
-              {/* Chat header — fixed */}
-              <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-3">
-                <p className="text-sm font-semibold text-[var(--foreground)]">{activeSession?.title || "Zyra"}</p>
-                <p className="mt-0.5 flex items-center gap-1.5">
-                  {agent?.aiKey ? (
-                    <>
-                      <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">{agent.aiKey.provider}</span>
-                      <span className="text-[var(--border)]">·</span>
-                      <span className="font-mono text-[11px] text-[var(--muted)]">{agent.aiKey.defaultModel || t("chat.defaultModel")}</span>
-                    </>
-                  ) : (
-                    <span className="text-xs text-[var(--muted)]">{t("chat.noKey")}</span>
+          {/* Title + subtitle row */}
+          <div className="mb-3 flex shrink-0 items-center gap-2.5 pl-4">
+            <ZyraMark size={28} />
+            <div>
+              <h1 className="text-[20px] font-semibold leading-tight tracking-[-0.02em] text-[var(--foreground)]">Zyra</h1>
+              <p className="mt-[1px] text-[13px] text-[var(--muted-soft)]">
+                {t("page.subtitle")}
+              </p>
+            </div>
+          </div>
+
+          {/* Error banner */}
+          {error && (
+            <div className="ml-4 mb-3 shrink-0 rounded-xl border border-[var(--error)]/40 bg-[var(--error-soft)] px-4 py-3 text-sm text-[var(--error-foreground)] flex items-start justify-between gap-3">
+              <span>{error}</span>
+              <button type="button" onClick={() => setError(null)} className="shrink-0 text-[var(--error-foreground)]/60 hover:text-[var(--error-foreground)]">✕</button>
+            </div>
+          )}
+
+          {loading ? (
+            <PageLoader
+              variant="inline"
+              label={t("page.loading")}
+              className="min-h-0 flex-1 rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]"
+            />
+          ) : (
+            <div className="flex min-h-0 flex-1 overflow-hidden rounded-r-xl border border-l-0 border-[var(--border)] bg-[var(--surface)]">
+
+              {/* ── Session sidebar ─────────────────────────────────────────── */}
+              <aside className="flex w-[260px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] overflow-hidden">
+                {/* Sidebar header */}
+                <div className="shrink-0 flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
+                  <div>
+                    <p className="text-sm font-semibold text-[var(--foreground)]">{t("side.conversations")}</p>
+                    <p className="text-[11px] text-[var(--muted)]">
+                      {t("side.sessions", { n: visibleSessions.length })}
+                    </p>
+                  </div>
+                  <Button size="sm" variant="secondary" disabled={creatingSession} onClick={() => void createSession()}>
+                    <IconPlus size={13} stroke={2} />
+                    {t("side.new")}
+                  </Button>
+                </div>
+
+                {/* Session list — scrollable */}
+                <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+                  {visibleSessions.length === 0 && (
+                    <p className="px-3 py-8 text-center text-xs text-[var(--muted)]">{t("side.empty")}</p>
                   )}
-                </p>
-              </div>
-
-              {/* Messages — scrollable, with an absolutely-positioned catch-up affordance that
-                  floats over it rather than scrolling with it */}
-              <div className="relative min-h-0 flex-1">
-                <div ref={messagesContainerRef} onScroll={handleMessagesScroll} className="h-full overflow-y-auto px-5 py-5 space-y-5">
-                  {!messages.length && (
-                    <div className="flex h-full flex-col items-center justify-center gap-6 py-8">
-                      {!agent?.agent.active ? (
-                        <NoKeyBanner projectId={projectId} />
-                      ) : (
-                        <>
-                          <div className="text-center max-w-md">
-                            <div className="mx-auto mb-3 h-12 w-12 rounded-2xl border border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-center text-xl font-bold text-[var(--foreground)] shadow-xs">Z</div>
-                            <h3 className="text-base font-semibold text-[var(--foreground)]">{t("empty.title")}</h3>
-                            <p className="mt-1 text-sm text-[var(--muted)]">
-                              {t("empty.body")}
-                            </p>
-                          </div>
-                          <div className="w-full max-w-2xl">
-                            <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">{t("empty.quickActions")}</p>
-                            <div className="flex flex-wrap gap-2">
-                              {QUICK_ACTIONS.map((action) => (
-                                <button
-                                  key={action}
-                                  type="button"
-                                  onClick={() => onQuickAction(t(`quick.${action}.prompt` as const))}
-                                  className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-all hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
-                                >
-                                  {t(`quick.${action}.label` as const)}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )}
-
-                  {messages.map((msg, i) => {
-                    const next = messages[i + 1];
-                    // Only the newest reply's question can be answered, and only while nothing is sending.
-                    const optionsOpen = !sending && msg.id === latestAssistantId && Boolean(msg.options) && !msg.options?.answeredId;
-                    // A request that failed before any reply was written: its trace has nowhere
-                    // else to show, so it goes under the request itself.
-                    const unanswered = msg.role === "user" && msg.status === ZYRA_MESSAGE_FAILED && next?.role !== "assistant";
+                  {visibleSessions.map((session) => {
+                    const isActive = activeSession?.id === session.id;
                     return (
-                      <Fragment key={msg.id}>
-                        <MessageBubble
-                          message={msg}
-                          projectId={projectId}
-                          backlogSteps={resumeTurnIds[msg.id] ? turnBacklogs[resumeTurnIds[msg.id]] : undefined}
-                          finishedBacklog={msg.role === "assistant" ? zyraTraceForMessage(msg, messages[i - 1]) : undefined}
-                          onContinue={handleContinue}
-                          optionsOpen={optionsOpen}
-                          onChoose={(answered, choice) => void submitMessage(choice.message || choice.label, { messageId: answered.id, optionId: choice.id })}
-                        />
-                        {unanswered && (() => {
-                          const finished = zyraFinishedFromTrace(msg.trace, true);
-                          return finished ? <div className="flex justify-end"><ZyraTraceDisclosure finished={finished} /></div> : null;
-                        })()}
-                      </Fragment>
+                      <div
+                        key={session.id}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => void openSession(session.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            void openSession(session.id);
+                          }
+                        }}
+                        className={`group flex w-full cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-2.5 text-left transition-colors ${isActive
+                            ? "border-[var(--brand-border)] bg-[var(--surface-secondary)]"
+                            : "border-transparent hover:bg-[var(--surface-secondary)]"
+                          }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <span className={`block truncate text-[12px] font-medium ${isActive ? "text-[var(--foreground)]" : "text-[var(--muted)]"}`}>
+                            {session.title}
+                          </span>
+                          <span className="mt-0.5 block font-mono text-[11px] text-[var(--muted-soft)]">
+                            {formatTime(session.updatedAt, t.locale)}
+                          </span>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                          <button
+                            type="button"
+                            title={t("rename.title")}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setRenameTarget(session);
+                            }}
+                            className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--accent-light)]"
+                          >
+                            <IconPencil size={12} stroke={1.75} />
+                          </button>
+                          <button
+                            type="button"
+                            title={t("delete.title")}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDeleteTarget(session);
+                            }}
+                            className="flex h-6 w-6 items-center justify-center rounded-[6px] text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--error-foreground)]"
+                          >
+                            <IconTrash size={12} stroke={1.75} />
+                          </button>
+                        </div>
+                      </div>
                     );
                   })}
-                  {sending && <ZyraBacklog steps={liveSendSteps} />}
-                  {sending && runningTurnReviewId && (
-                    <ZyraChatReviewPanel projectId={projectId} reviewRequestId={runningTurnReviewId} initialRows={[]} generating />
-                  )}
-                  {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
-                  <div ref={endRef} />
                 </div>
-                {catchUpVisible && (
-                  <button
-                    type="button"
-                    onClick={handleCatchUp}
-                    className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--foreground)] shadow-md transition-all hover:border-[var(--brand-primary)] hover:text-[var(--brand-primary)]"
-                  >
-                    {sending && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--brand-primary)]" />}
-                    {t("chat.catchUp")}
-                    <IconArrowDown size={12} stroke={2} />
-                  </button>
-                )}
-              </div>
+              </aside>
 
-              {/* Input — fixed at bottom */}
-              <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-                {activeSession?.activePlan?.status === "paused" && (
-                  <div className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
-                    <span>
-                      {t("plan.paused", { covered: activeSession.activePlan.coveredCount ?? activeSession.activePlan.doneCount, total: activeSession.activePlan.totalCount })}
-                    </span>
-                    <Button type="button" size="sm" variant="secondary" onClick={handleResumePlan} disabled={stoppingPlan}>
-                      {stoppingPlan ? t("plan.resuming") : t("plan.resume")}
-                    </Button>
+              {/* ── Chat area ───────────────────────────────────────────────── */}
+              <section className="flex flex-1 min-w-0 flex-col bg-[var(--surface-secondary)] overflow-hidden">
+                {/* Chat header — fixed */}
+                <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-3">
+                  <p className="text-sm font-semibold text-[var(--foreground)]">{activeSession?.title || "Zyra"}</p>
+                  <p className="mt-0.5 flex items-center gap-1.5">
+                    {agent?.aiKey ? (
+                      <>
+                        <span className="text-[10px] font-semibold uppercase tracking-wider text-[var(--muted)]">{agent.aiKey.provider}</span>
+                        <span className="text-[var(--border)]">·</span>
+                        <span className="font-mono text-[11px] text-[var(--muted)]">{agent.aiKey.defaultModel || t("chat.defaultModel")}</span>
+                      </>
+                    ) : (
+                      <span className="text-xs text-[var(--muted)]">{t("chat.noKey")}</span>
+                    )}
+                  </p>
+                </div>
+
+                {/* Messages — scrollable, with an absolutely-positioned catch-up affordance that
+                  floats over it rather than scrolling with it */}
+                <div className="relative min-h-0 flex-1">
+                  <div ref={messagesContainerRef} onScroll={handleMessagesScroll} className="h-full overflow-y-auto px-5 py-5 space-y-5">
+                    {!messages.length && (
+                      <div className="flex h-full flex-col items-center justify-center gap-6 py-8">
+                        {!agent?.agent.active ? (
+                          <NoKeyBanner projectId={projectId} />
+                        ) : (
+                          <>
+                            <div className="text-center max-w-md">
+                              <div className="mx-auto mb-3 h-12 w-12 rounded-2xl border border-[var(--border)] bg-[var(--surface-2)] flex items-center justify-center text-xl font-bold text-[var(--foreground)] shadow-xs">Z</div>
+                              <h3 className="text-base font-semibold text-[var(--foreground)]">{t("empty.title")}</h3>
+                              <p className="mt-1 text-sm text-[var(--muted)]">
+                                {t("empty.body")}
+                              </p>
+                            </div>
+                            <div className="w-full max-w-2xl">
+                              <p className="mb-2.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--muted)]">{t("empty.quickActions")}</p>
+                              <div className="flex flex-wrap gap-2">
+                                {QUICK_ACTIONS.map((action) => (
+                                  <button
+                                    key={action}
+                                    type="button"
+                                    onClick={() => onQuickAction(t(`quick.${action}.prompt` as const))}
+                                    className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-3.5 py-1.5 text-xs font-medium text-[var(--foreground)] transition-[border-color,box-shadow,transform] duration-150 ease-[var(--ease-out-quad)] hover:border-[var(--brand-primary)] hover:shadow-sm active:scale-95"
+                                  >
+                                    {t(`quick.${action}.label` as const)}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {messages.map((msg, i) => {
+                      const next = messages[i + 1];
+                      // Only the newest reply's question can be answered, and only while nothing is sending.
+                      const optionsOpen = !sending && msg.id === latestAssistantId && Boolean(msg.options) && !msg.options?.answeredId;
+                      // A request that failed before any reply was written: its trace has nowhere
+                      // else to show, so it goes under the request itself.
+                      const unanswered = msg.role === "user" && msg.status === ZYRA_MESSAGE_FAILED && next?.role !== "assistant";
+                      return (
+                        <Fragment key={msg.id}>
+                          <MessageBubble
+                            message={msg}
+                            projectId={projectId}
+                            backlogSteps={resumeTurnIds[msg.id] ? turnBacklogs[resumeTurnIds[msg.id]] : undefined}
+                            finishedBacklog={msg.role === "assistant" ? zyraTraceForMessage(msg, messages[i - 1]) : undefined}
+                            onContinue={handleContinue}
+                            optionsOpen={optionsOpen}
+                            onChoose={(answered, choice) => void submitMessage(choice.message || choice.label, { messageId: answered.id, optionId: choice.id })}
+                          />
+                          {unanswered && (() => {
+                            const finished = zyraFinishedFromTrace(msg.trace, true);
+                            return finished ? <div className="flex justify-end"><ZyraTraceDisclosure finished={finished} /></div> : null;
+                          })()}
+                        </Fragment>
+                      );
+                    })}
+                    {sending && <ZyraBacklog steps={liveSendSteps} />}
+                    {sending && runningTurnReviewId && (
+                      <ZyraChatReviewPanel projectId={projectId} reviewRequestId={runningTurnReviewId} initialRows={[]} generating />
+                    )}
+                    {!sending && isPlanRunning && activeSession?.activePlan && <PlanProgressBubble plan={activeSession.activePlan} />}
+                    <div ref={endRef} />
                   </div>
-                )}
-                <form onSubmit={onSubmit}>
-                  <Textarea
-                    ref={textareaRef}
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={onKeyDown}
-                    rows={3}
-                    placeholder={
-                      agent?.agent.active
-                        ? t("composer.placeholder")
-                        : t("composer.placeholderNoKey")
-                    }
-                    disabled={sending || !agent?.agent.active}
-                    className="resize-none"
-                  />
-                  <div className="mt-2.5 flex items-center justify-between gap-3">
-                    <p className="text-[11px] text-[var(--muted)]">
-                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{t("composer.sendHint")}
-                      {" · "}
-                      <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{t("composer.newLineHint")}
-                    </p>
-                    <div className="flex items-center gap-2">
-                      {isPlanRunning && (
-                        <Button type="button" size="sm" variant="secondary" onClick={handleStopPlan} disabled={stoppingPlan}>
-                          {stoppingPlan ? t("plan.stopping") : t("plan.stop")}
-                        </Button>
-                      )}
-                      <Button type="submit" size="sm" disabled={!input.trim() || sending || !agent?.agent.active}>
-                        {sending ? t("composer.thinking") : t("composer.send")}
+                  {catchUpVisible && (
+                    <button
+                      type="button"
+                      onClick={handleCatchUp}
+                      className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono text-[11px] text-[var(--foreground)] shadow-md transition-[border-color,color,transform] duration-150 ease-[var(--ease-out-quad)] hover:border-[var(--brand-primary)] hover:text-[var(--brand-primary)] active:scale-95"
+                    >
+                      {sending && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--brand-primary)]" />}
+                      {t("chat.catchUp")}
+                      <IconArrowDown size={12} stroke={2} />
+                    </button>
+                  )}
+                </div>
+
+                {/* Input — fixed at bottom */}
+                <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-4 py-3">
+                  {activeSession?.activePlan?.status === "paused" && (
+                    <div className="mb-2.5 flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                      <span>
+                        {t("plan.paused", { covered: activeSession.activePlan.coveredCount ?? activeSession.activePlan.doneCount, total: activeSession.activePlan.totalCount })}
+                      </span>
+                      <Button type="button" size="sm" variant="secondary" onClick={handleResumePlan} disabled={stoppingPlan}>
+                        {stoppingPlan ? t("plan.resuming") : t("plan.resume")}
                       </Button>
                     </div>
-                  </div>
-                </form>
-              </div>
-            </section>
-          </div>
-        )}
-      </div>
+                  )}
+                  <form onSubmit={onSubmit}>
+                    <Textarea
+                      ref={textareaRef}
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      onKeyDown={onKeyDown}
+                      rows={3}
+                      placeholder={
+                        agent?.agent.active
+                          ? t("composer.placeholder")
+                          : t("composer.placeholderNoKey")
+                      }
+                      disabled={sending || !agent?.agent.active}
+                      className="resize-none"
+                    />
+                    <div className="mt-2.5 flex items-center justify-between gap-3">
+                      <p className="text-[11px] text-[var(--muted)]">
+                        <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{t("composer.sendHint")}
+                        {" · "}
+                        <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{t("composer.newLineHint")}
+                      </p>
+                      <div className="flex items-center gap-2">
+                        {isPlanRunning && (
+                          <Button type="button" size="sm" variant="secondary" onClick={handleStopPlan} disabled={stoppingPlan}>
+                            {stoppingPlan ? t("plan.stopping") : t("plan.stop")}
+                          </Button>
+                        )}
+                        <Button type="submit" size="sm" disabled={!input.trim() || sending || !agent?.agent.active}>
+                          {sending ? t("composer.thinking") : t("composer.send")}
+                        </Button>
+                      </div>
+                    </div>
+                  </form>
+                </div>
+              </section>
+            </div>
+          )}
+        </div>
 
-      <RenameSessionModal
-        open={!!renameTarget}
-        initialTitle={renameTarget?.title || ""}
-        saving={renaming}
-        onClose={() => setRenameTarget(null)}
-        onSave={handleRenameSave}
-      />
+        <RenameSessionModal
+          open={!!renameTarget}
+          initialTitle={renameTarget?.title || ""}
+          saving={renaming}
+          onClose={() => setRenameTarget(null)}
+          onSave={handleRenameSave}
+        />
 
-      <ConfirmModal
-        open={!!deleteTarget}
-        title={t("delete.title")}
-        message={t("delete.message", { title: deleteTarget?.title || t("delete.thisConversation") })}
-        confirmLabel={t("delete.confirm")}
-        confirmVariant="destructive"
-        loading={deleting}
-        onConfirm={() => void handleConfirmDelete()}
-        onCancel={() => setDeleteTarget(null)}
-      />
+        <ConfirmModal
+          open={!!deleteTarget}
+          title={t("delete.title")}
+          message={t("delete.message", { title: deleteTarget?.title || t("delete.thisConversation") })}
+          confirmLabel={t("delete.confirm")}
+          confirmVariant="destructive"
+          loading={deleting}
+          onConfirm={() => void handleConfirmDelete()}
+          onCancel={() => setDeleteTarget(null)}
+        />
 
-      {/* Inline styles for markdown prose */}
-      <style>{`
+        {/* Inline styles for markdown prose */}
+        <style>{`
         .zyra-prose strong { font-weight: 600; }
         .zyra-prose em { font-style: italic; }
         .zyra-prose .inline-code {
@@ -2028,7 +2026,7 @@ export default function ZyraChatPage() {
         }
         .zyra-prose li { margin: 0.2rem 0; }
       `}</style>
-    </main>
+      </main>
     </ZyraLanguageContext.Provider>
   );
 }

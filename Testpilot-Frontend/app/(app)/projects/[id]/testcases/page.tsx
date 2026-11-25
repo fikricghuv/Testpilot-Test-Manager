@@ -1565,7 +1565,7 @@ export default function TestCasesPage() {
     // Full-bleed, full-height IDE-style workspace. `tc-fullbleed` makes the wrapping
     // .testpilot-page drop its centered 1280px cap + padding, so this fills the whole
     // content region below the 3.5rem TopBar and the table scrolls internally.
-    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 3.5rem)" }}>
+    <main className="tc-fullbleed flex flex-col pb-4 pr-4 pt-4" style={{ height: "calc(100vh - 4rem)" }}>
       <div className="flex min-h-0 flex-1 flex-col">
         {/* This page takes over the shared TopBar: breadcrumb (start slot) + actions (end slot). */}
         {topBarStartEl &&

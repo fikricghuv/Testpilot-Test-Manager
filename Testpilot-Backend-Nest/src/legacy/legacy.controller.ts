@@ -2387,4 +2387,26 @@ export class LegacyController {
     await this.legacy.requireProjectAccess(req.userId, projectId);
     return { keepTrace: true, traceRetentionDays: 14, ingestionApiKey: "", alertsEnabled: false, shareByDefault: false };
   }
+
+  // ── Project-scoped Telegram notification integration ──
+
+  @Get("/api/projects/:projectId/integrations/telegram")
+  getTelegramIntegration(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.getProjectTelegramIntegration(projectId, req.userId);
+  }
+
+  @Put("/api/projects/:projectId/integrations/telegram")
+  upsertTelegramIntegration(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.upsertProjectTelegramIntegration(projectId, req.userId, body);
+  }
+
+  @Post("/api/projects/:projectId/integrations/telegram/test")
+  testTelegramIntegration(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string, @Body() body: Record<string, any>) {
+    return this.legacy.testProjectTelegramIntegration(projectId, req.userId, body);
+  }
+
+  @Delete("/api/projects/:projectId/integrations/telegram")
+  deleteTelegramIntegration(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
+    return this.legacy.deleteProjectTelegramIntegration(projectId, req.userId);
+  }
 }

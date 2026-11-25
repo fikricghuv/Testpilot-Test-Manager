@@ -21,6 +21,13 @@ import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
 import { writeNotifications } from "./notification-writer";
+import {
+  DEFAULT_TELEGRAM_EVENTS,
+  dispatchProjectTelegramNotification,
+  maskTelegramToken,
+  normalizeTelegramEvents,
+  sendTelegramMessage,
+} from "./telegram-notifier";
 import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, assertStartNotInPast, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
@@ -21866,6 +21873,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
        RETURNING id`,
       [projectId, opts.type, opts.title, opts.body || null, opts.linkEntityType || null, opts.linkEntityId || null, opts.dedupeKey || null]
     );
+    if (res.rows.length > 0) {
+      void dispatchProjectTelegramNotification(this.db, projectId, opts, this.logger);
+    }
     return res.rows.length;
   }
 
@@ -21899,7 +21909,11 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       memberOf?: { organizationId?: string; projectId?: string };
     }
   ): Promise<number> {
-    return writeNotifications(this.db, recipientIds, opts, this.logger);
+    const written = await writeNotifications(this.db, recipientIds, opts, this.logger);
+    if (written > 0 && opts.memberOf?.projectId) {
+      void dispatchProjectTelegramNotification(this.db, opts.memberOf.projectId, opts, this.logger);
+    }
+    return written;
   }
 
   private async displayNameOf(userId: string): Promise<string> {
@@ -25734,5 +25748,157 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       [projectId]
     );
     return res.rows.map((r) => ({ name: r.name, count: Number(r.count) }));
+  }
+
+  // ── Project-scoped Telegram notification integration ──
+
+  async getProjectTelegramIntegration(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(userId, projectId);
+    const res = await this.db.query<{
+      bot_token_encrypted: string;
+      chat_id: string;
+      thread_id: number | null;
+      enabled: boolean;
+      events: unknown;
+      updated_at: string;
+    }>(
+      `SELECT bot_token_encrypted, chat_id, thread_id, enabled, events, updated_at
+       FROM project_telegram_integrations
+       WHERE project_id = $1`,
+      [projectId]
+    );
+    const row = res.rows[0];
+    if (!row) {
+      return {
+        connected: false,
+        enabled: true,
+        chatId: null,
+        threadId: null,
+        hasBotToken: false,
+        maskedBotToken: null,
+        events: DEFAULT_TELEGRAM_EVENTS,
+        updatedAt: null,
+      };
+    }
+    let maskedBotToken: string | null = null;
+    try {
+      maskedBotToken = maskTelegramToken(decryptSecret(row.bot_token_encrypted));
+    } catch {
+      maskedBotToken = "••••";
+    }
+    return {
+      connected: true,
+      enabled: row.enabled,
+      chatId: row.chat_id,
+      threadId: row.thread_id,
+      hasBotToken: true,
+      maskedBotToken,
+      events: normalizeTelegramEvents(row.events),
+      updatedAt: row.updated_at,
+    };
+  }
+
+  async upsertProjectTelegramIntegration(projectId: string, userId: string | null | undefined, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+
+    const chatId = String(body.chatId ?? "").trim();
+    if (!chatId) {
+      throw new BadRequestException({ error: "Telegram Chat ID is required." });
+    }
+
+    const rawThreadId = body.threadId;
+    let threadId: number | null = null;
+    if (rawThreadId !== undefined && rawThreadId !== null && String(rawThreadId).trim() !== "") {
+      const parsed = Number(rawThreadId);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new BadRequestException({ error: "Topic / Thread ID must be a positive integer." });
+      }
+      threadId = parsed;
+    }
+
+    const existing = await this.db.query<{ bot_token_encrypted: string; events: unknown }>(
+      "SELECT bot_token_encrypted, events FROM project_telegram_integrations WHERE project_id = $1",
+      [projectId]
+    );
+
+    const rawToken = typeof body.botToken === "string" ? body.botToken.trim() : "";
+    let encryptedToken = existing.rows[0]?.bot_token_encrypted ?? "";
+    if (rawToken) {
+      if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(rawToken)) {
+        throw new BadRequestException({ error: "Invalid Telegram Bot Token format." });
+      }
+      encryptedToken = encryptSecret(rawToken);
+    } else if (!encryptedToken) {
+      throw new BadRequestException({ error: "Telegram Bot Token is required." });
+    }
+
+    const enabled = body.enabled !== false;
+    const events = normalizeTelegramEvents(body.events ?? existing.rows[0]?.events);
+
+    await this.db.query(
+      `INSERT INTO project_telegram_integrations (project_id, bot_token_encrypted, chat_id, thread_id, enabled, events, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       ON CONFLICT (project_id) DO UPDATE SET
+         bot_token_encrypted = EXCLUDED.bot_token_encrypted,
+         chat_id = EXCLUDED.chat_id,
+         thread_id = EXCLUDED.thread_id,
+         enabled = EXCLUDED.enabled,
+         events = EXCLUDED.events,
+         updated_at = NOW()`,
+      [projectId, encryptedToken, chatId, threadId, enabled, JSON.stringify(events), uid]
+    );
+
+    return this.getProjectTelegramIntegration(projectId, uid);
+  }
+
+  async testProjectTelegramIntegration(projectId: string, userId: string | null | undefined, body: Body) {
+    const project = (await this.requireProjectAccess(userId, projectId)) as { name?: string };
+    const existing = await this.db.query<{ bot_token_encrypted: string; chat_id: string; thread_id: number | null }>(
+      "SELECT bot_token_encrypted, chat_id, thread_id FROM project_telegram_integrations WHERE project_id = $1",
+      [projectId]
+    );
+
+    const rawToken = typeof body.botToken === "string" ? body.botToken.trim() : "";
+    const botToken = rawToken || (existing.rows[0] ? decryptSecret(existing.rows[0].bot_token_encrypted) : "");
+    const chatId = String(body.chatId ?? existing.rows[0]?.chat_id ?? "").trim();
+
+    if (!botToken) {
+      throw new BadRequestException({ error: "Enter or save a Telegram Bot Token first." });
+    }
+    if (!chatId) {
+      throw new BadRequestException({ error: "Enter or save a Telegram Chat ID first." });
+    }
+
+    let threadId: number | null = existing.rows[0]?.thread_id ?? null;
+    if (body.threadId !== undefined) {
+      if (body.threadId === null || String(body.threadId).trim() === "") {
+        threadId = null;
+      } else {
+        const parsed = Number(body.threadId);
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+          throw new BadRequestException({ error: "Topic / Thread ID must be a positive integer." });
+        }
+        threadId = parsed;
+      }
+    }
+
+    const projectName = String(project.name || "Project").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const result = await sendTelegramMessage(
+      botToken,
+      chatId,
+      `✅ <b>TestPilot Telegram Integration Connected</b>\nNotifications for project <b>${projectName}</b> will be delivered to this chat.`,
+      threadId
+    );
+    if (!result.ok) {
+      throw new BadRequestException({ error: result.error || "Failed to send test message to Telegram." });
+    }
+    return { ok: true };
+  }
+
+  async deleteProjectTelegramIntegration(projectId: string, userId: string | null | undefined) {
+    await this.requireProjectAccess(userId, projectId);
+    await this.db.query("DELETE FROM project_telegram_integrations WHERE project_id = $1", [projectId]);
+    return { ok: true };
   }
 }
