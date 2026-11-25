@@ -4671,3 +4671,119 @@ export async function disconnectTelegramIntegration(projectId: string): Promise<
     method: "DELETE",
   });
 }
+
+// ─── Test Case Automation Scripts (Playwright) ───────────────────────────────
+export type TestScriptFramework = "playwright-ts";
+export type TestScriptStatus = "draft" | "verified" | "archived";
+export type TestScriptSource = "manual" | "zyra" | "healer";
+export type TestScriptRunStatus = "queued" | "running" | "passed" | "failed" | "error" | "cancelled";
+
+export interface TestScriptRecord {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  framework: TestScriptFramework;
+  targetUrl: string | null;
+  status: TestScriptStatus;
+  activeVersionId: string | null;
+  activeVersion: number | null;
+  scriptContent: string | null;
+  source: TestScriptSource | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TestScriptVersionRecord {
+  id: string;
+  scriptId: string;
+  version: number;
+  scriptContent: string;
+  source: TestScriptSource;
+  notes: string | null;
+  verifiedLocators: Record<string, string>;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export interface TestScriptRunRecord {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  scriptId: string;
+  versionId: string | null;
+  cycleId: string | null;
+  executionId: string | null;
+  status: TestScriptRunStatus;
+  targetUrl: string | null;
+  durationMs: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  errorMessage: string | null;
+  triggeredBy: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  createdAt: string;
+}
+
+export interface TestScriptStateResponse {
+  script: TestScriptRecord | null;
+  versions: TestScriptVersionRecord[];
+  recentRuns: TestScriptRunRecord[];
+}
+
+export async function getTestCaseScript(projectId: string, testcaseId: string): Promise<TestScriptStateResponse> {
+  return api<TestScriptStateResponse>(`/api/projects/${projectId}/testcases/${testcaseId}/script`);
+}
+
+export async function saveTestCaseScript(
+  projectId: string,
+  testcaseId: string,
+  data: {
+    scriptContent: string;
+    framework?: TestScriptFramework;
+    targetUrl?: string | null;
+    status?: TestScriptStatus;
+    notes?: string | null;
+  }
+): Promise<TestScriptStateResponse> {
+  return api<TestScriptStateResponse>(`/api/projects/${projectId}/testcases/${testcaseId}/script`, {
+    method: "PUT",
+    body: data,
+  });
+}
+
+export async function activateTestCaseScriptVersion(
+  projectId: string,
+  testcaseId: string,
+  versionId: string
+): Promise<TestScriptStateResponse> {
+  return api<TestScriptStateResponse>(
+    `/api/projects/${projectId}/testcases/${testcaseId}/script/versions/${versionId}/activate`,
+    { method: "POST", body: {} }
+  );
+}
+
+export async function deleteTestCaseScript(projectId: string, testcaseId: string): Promise<{ deleted: boolean }> {
+  return api<{ deleted: boolean }>(`/api/projects/${projectId}/testcases/${testcaseId}/script`, {
+    method: "DELETE",
+  });
+}
+
+export async function runTestCaseScript(
+  projectId: string,
+  testcaseId: string,
+  data?: { targetUrl?: string | null }
+): Promise<{ run: TestScriptRunRecord }> {
+  return api<{ run: TestScriptRunRecord }>(`/api/projects/${projectId}/testcases/${testcaseId}/script/run`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function getTestCaseScriptRun(
+  projectId: string,
+  testcaseId: string,
+  runId: string
+): Promise<{ run: TestScriptRunRecord }> {
+  return api<{ run: TestScriptRunRecord }>(`/api/projects/${projectId}/testcases/${testcaseId}/script/runs/${runId}`);
+}

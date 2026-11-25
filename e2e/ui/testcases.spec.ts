@@ -1458,3 +1458,51 @@ test.describe("Add suite opens the newly created suite", () => {
     }
   });
 });
+
+test.describe("automation script tab", () => {
+  test("a user can author, save, run, and delete a Playwright script on a test case", async ({ page }) => {
+    const title = `UI Script TC ${Date.now()}`;
+    const api = await pwRequest.newContext({ baseURL: env.apiBaseUrl, storageState: STATE_PATH });
+    let tcId = "";
+    let cycleId: string | null = null;
+
+    try {
+      const created = await (await api.post(`/api/projects/${ctx.projectId}/testcases`, { data: { title } })).json();
+      tcId = created.id;
+
+      await page.goto(`/projects/${ctx.projectId}/testcases`);
+      await page.getByRole("button", { name: title }).click();
+
+      const panel = page.locator("aside");
+      await panel.getByRole("button", { name: "Script", exact: true }).click();
+
+      const script = [
+        `import { test, expect } from "@playwright/test";`,
+        `test("ui script", async ({ page }) => {`,
+        `  await page.setContent("<h1>Saved from UI</h1>");`,
+        `  await expect(page.locator("h1")).toHaveText("Saved from UI");`,
+        `});`,
+      ].join("\n");
+
+      await panel.locator("textarea").fill(script);
+      await panel.getByRole("button", { name: "Save Script" }).click();
+      await expect(panel.getByText("Saved version v1.")).toBeVisible();
+      await expect(panel.getByText("v1", { exact: true }).first()).toBeVisible();
+
+      await panel.getByRole("button", { name: "Run Playwright" }).click();
+      await expect(panel.getByText("passed", { exact: true })).toBeVisible({ timeout: 60_000 });
+      await expect(panel.getByRole("link", { name: "View in Test Runs →" })).toBeVisible();
+      await expect(panel.getByAltText("screenshot.png")).toBeVisible({ timeout: 15_000 });
+
+      const scriptState = await (await api.get(`/api/projects/${ctx.projectId}/testcases/${tcId}/script`)).json();
+      cycleId = scriptState.recentRuns?.[0]?.cycleId ?? null;
+
+      await panel.getByRole("button", { name: "Delete Script" }).click();
+      await expect(panel.getByText("Automation script removed.")).toBeVisible();
+    } finally {
+      if (cycleId) await api.delete(`/api/projects/${ctx.projectId}/cycles/${cycleId}`, { failOnStatusCode: false });
+      if (tcId) await api.delete(`/api/projects/${ctx.projectId}/testcases/${tcId}`, { failOnStatusCode: false });
+      await api.dispose();
+    }
+  });
+});

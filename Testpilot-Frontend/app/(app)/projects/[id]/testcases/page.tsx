@@ -57,6 +57,7 @@ import {
   notionPageKey,
 } from "@/lib/api";
 import { ZyraContextDrawer } from "@/components/agents/ZyraContextDrawer";
+import { TestCaseScriptTab } from "@/components/testcases/TestCaseScriptTab";
 
 // Same 5-entry map as ZyraCitationsList/ZyraCitationsBadge — kept local rather than importing from
 // either, which don't export it (each of those components already keeps its own local copy too).
@@ -139,7 +140,7 @@ const TESTCASE_SEVERITIES = ["Critical", "High", "Medium", "Low"];
 
 type Step = { stepNumber?: number; action?: string; expectedResult?: string };
 type PanelMode = "closed" | "edit" | "create";
-type PanelTab = "overview" | "steps" | "customFields" | "bugs" | "context";
+type PanelTab = "overview" | "steps" | "customFields" | "bugs" | "context" | "script";
 type BulkAction = "" | "delete" | "update" | "archive" | "move";
 
 const EMPTY_STEP: Step = { stepNumber: 1, action: "", expectedResult: "" };
@@ -2407,7 +2408,7 @@ export default function TestCasesPage() {
             {/* Tabs (only for edit mode) */}
             {panelMode === "edit" && (
               <div className="flex shrink-0 gap-0 border-b border-[var(--border)] px-6">
-                {(["overview", "steps", "customFields", "bugs", "context"] as PanelTab[]).map((tab) => (
+                {(["overview", "steps", "customFields", "bugs", "context", "script"] as PanelTab[]).map((tab) => (
                   <button
                     key={tab}
                     type="button"
@@ -2426,6 +2427,8 @@ export default function TestCasesPage() {
                       ? `Custom Fields${panelCustomFields.length > 0 ? ` (${panelCustomFields.length})` : ""}`
                       : tab === "bugs"
                       ? `Bugs${panelBugs.length > 0 ? ` (${panelBugs.length})` : ""}`
+                      : tab === "script"
+                      ? "Script"
                       : `Context${panelSourceRefs.length > 0 ? ` (${panelSourceRefs.length})` : ""}`}
                   </button>
                 ))}
@@ -2458,6 +2461,7 @@ export default function TestCasesPage() {
                   </div>
                 </div>
               ) : (
+                <>
                 <form onSubmit={handlePanelSubmit} id="panel-form-global">
                   {/* CREATE MODE */}
                   {panelMode === "create" && (
@@ -2846,6 +2850,14 @@ export default function TestCasesPage() {
                     </>
                   )}
                 </form>
+                {panelMode === "edit" && panelTab === "script" && panelTestcaseId && (
+                  <TestCaseScriptTab
+                    projectId={projectId}
+                    testcaseId={panelTestcaseId}
+                    testcaseTitle={title}
+                  />
+                )}
+              </>
               )}
             </div>
 
@@ -2854,9 +2866,11 @@ export default function TestCasesPage() {
               <div className="shrink-0 border-t border-[var(--border)] bg-[var(--surface)] px-6 py-4">
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
-                    <Button type="submit" form="panel-form-global" variant="primary" onClick={() => setSubmitAction("create")} disabled={panelSaving}>
-                      {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save changes"}
-                    </Button>
+                    {panelTab !== "script" && (
+                      <Button type="submit" form="panel-form-global" variant="primary" onClick={() => setSubmitAction("create")} disabled={panelSaving}>
+                        {panelSaving ? "Saving..." : panelMode === "create" ? "Create" : "Save changes"}
+                      </Button>
+                    )}
                     {panelMode === "create" && (
                       <Button type="submit" form="panel-form-global" variant="secondary" onClick={() => setSubmitAction("create-next")} disabled={panelSaving} className="border-[var(--brand-primary)] text-[var(--accent-light)]">
                         {panelSaving ? "Saving..." : "Create & Add Next"}

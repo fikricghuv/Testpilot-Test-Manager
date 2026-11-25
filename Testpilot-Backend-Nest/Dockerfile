@@ -23,6 +23,9 @@ RUN npm install --no-save @tesseract.js-data/eng@1.0.0 \
     && cp node_modules/@tesseract.js-data/eng/4.0.0/eng.traineddata.gz /app/tessdata/eng.traineddata.gz \
     && rm -rf node_modules/@tesseract.js-data
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
+RUN npx playwright install --with-deps chromium
+
 COPY --from=builder /build/dist ./dist
 COPY migrations ./migrations
 

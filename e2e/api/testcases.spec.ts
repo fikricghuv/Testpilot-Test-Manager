@@ -2330,3 +2330,139 @@ test.describe("repository paging", () => {
     }
   });
 });
+
+test.describe("automation script CRUD, versioning, and runner", () => {
+  test("supports get empty -> save v1/v2 -> activate v1 -> run pass/fail -> delete", async ({ request }) => {
+    const tc = await createCase(request, { title: `E2E Script TC ${Date.now()}` });
+    const base = `/api/projects/${ctx.projectId}/testcases/${tc.id}/script`;
+    const createdCycleIds: string[] = [];
+
+    try {
+      const emptyRes = await request.get(base);
+      expect(emptyRes.ok()).toBeTruthy();
+      expect(await emptyRes.json()).toEqual({ script: null, versions: [], recentRuns: [] });
+
+      const v1Script = [
+        `import { test, expect } from "@playwright/test";`,
+        `test("e2e pass", async ({ page }) => {`,
+        `  await page.setContent("<h1>TestPilot OK</h1>");`,
+        `  await expect(page.locator("h1")).toHaveText("TestPilot OK");`,
+        `});`,
+      ].join("\n");
+
+      const save1Res = await request.put(base, {
+        data: { scriptContent: v1Script, targetUrl: "https://example.com", status: "draft", notes: "Initial v1" },
+      });
+      expect(save1Res.ok()).toBeTruthy();
+      const save1 = await save1Res.json();
+      expect(save1.script.activeVersion).toBe(1);
+      expect(save1.versions).toHaveLength(1);
+      const v1Id = save1.versions[0].id;
+
+      const v2Script = [
+        `import { test, expect } from "@playwright/test";`,
+        `test("e2e fail", async () => {`,
+        `  expect(1).toBe(2);`,
+        `});`,
+      ].join("\n");
+
+      const save2Res = await request.put(base, {
+        data: { scriptContent: v2Script, status: "verified", notes: "Failing v2" },
+      });
+      expect(save2Res.ok()).toBeTruthy();
+      const save2 = await save2Res.json();
+      expect(save2.script.activeVersion).toBe(2);
+      expect(save2.versions).toHaveLength(2);
+
+      // Run v2 (failing spec) and poll until terminal state
+      const runFailRes = await request.post(`${base}/run`, { data: {} });
+      expect(runFailRes.ok()).toBeTruthy();
+      let failRun = (await runFailRes.json()).run;
+      if (failRun.cycleId) createdCycleIds.push(failRun.cycleId);
+
+      await expect
+        .poll(
+          async () => {
+            const r = await request.get(`${base}/runs/${failRun.id}`);
+            failRun = (await r.json()).run;
+            return failRun.status;
+          },
+          { timeout: 60_000, intervals: [500, 1000, 1500] }
+        )
+        .toBe("failed");
+
+      // Restore v1 (passing spec) and run
+      const actRes = await request.post(`${base}/versions/${v1Id}/activate`, { data: {} });
+      expect(actRes.ok()).toBeTruthy();
+      expect((await actRes.json()).script.activeVersion).toBe(1);
+
+      const runPassRes = await request.post(`${base}/run`, { data: {} });
+      expect(runPassRes.ok()).toBeTruthy();
+      let passRun = (await runPassRes.json()).run;
+      if (passRun.cycleId) createdCycleIds.push(passRun.cycleId);
+
+      await expect
+        .poll(
+          async () => {
+            const r = await request.get(`${base}/runs/${passRun.id}`);
+            passRun = (await r.json()).run;
+            return passRun.status;
+          },
+          { timeout: 60_000, intervals: [500, 1000, 1500] }
+        )
+        .toBe("passed");
+      expect(passRun.durationMs).toBeGreaterThanOrEqual(0);
+
+      // Verify screenshot evidence was captured and attached to the execution
+      const evRes = await request.get(`/api/cycles/${passRun.cycleId}/executions/${passRun.executionId}/attachments`);
+      expect(evRes.ok()).toBeTruthy();
+      const evBody = await evRes.json();
+      expect(evBody.list.length).toBeGreaterThanOrEqual(1);
+      expect(evBody.list.some((item: { evidenceKind?: string; contentType?: string }) => item.evidenceKind === "screenshot" && item.contentType === "image/png")).toBeTruthy();
+
+      // Delete script
+      const delRes = await request.delete(base);
+      expect(delRes.ok()).toBeTruthy();
+      expect((await delRes.json()).deleted).toBe(true);
+      expect(await (await request.get(base)).json()).toEqual({ script: null, versions: [], recentRuns: [] });
+    } finally {
+      for (const cycleId of createdCycleIds) {
+        await request.delete(`/api/projects/${ctx.projectId}/cycles/${cycleId}`, { failOnStatusCode: false });
+      }
+      await deleteCase(request, tc.id);
+    }
+  });
+
+  test("rejects invalid payloads, run without script, unauthenticated, and cross-tenant access", async ({ request }) => {
+    const tc = await createCase(request, { title: `E2E Script Validation ${Date.now()}` });
+    const base = `/api/projects/${ctx.projectId}/testcases/${tc.id}/script`;
+    const asB = await newRequestContext.newContext({
+      baseURL: env.apiBaseUrl,
+      storageState: path.join(__dirname, "../.auth/state-b.json"),
+    });
+    const anon = await newRequestContext.newContext({ baseURL: env.apiBaseUrl, storageState: { cookies: [], origins: [] } });
+
+    try {
+      const emptyPut = await request.put(base, { data: { scriptContent: "   " }, failOnStatusCode: false });
+      expect(emptyPut.status()).toBe(400);
+
+      const badUrlPut = await request.put(base, {
+        data: { scriptContent: "test('x', async () => {});", targetUrl: "ftp://bad.local" },
+        failOnStatusCode: false,
+      });
+      expect(badUrlPut.status()).toBe(400);
+
+      const runNoScript = await request.post(`${base}/run`, { data: {}, failOnStatusCode: false });
+      expect(runNoScript.status()).toBe(400);
+
+      for (const [who, ctxReq] of [["another tenant", asB], ["no session", anon]] as const) {
+        const res = await ctxReq.get(base, { failOnStatusCode: false });
+        expect([400, 401, 403, 404], `${who} got ${res.status()}`).toContain(res.status());
+      }
+    } finally {
+      await asB.dispose();
+      await anon.dispose();
+      await deleteCase(request, tc.id);
+    }
+  });
+});
