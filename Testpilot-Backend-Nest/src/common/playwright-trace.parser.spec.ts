@@ -62,6 +62,18 @@ describe("parsePlaywrightTraceArchive", () => {
       }
     });
 
+    const testRunnerTrace = [
+      JSON.stringify({
+        type: "before",
+        callId: "runner@1",
+        apiName: "Navigate to https://example.com/login",
+        startTime: 1000,
+        stack: [{ line: 4 }]
+      }),
+      JSON.stringify({ type: "after", callId: "runner@1", endTime: 1250 })
+    ].join("\n");
+
+    archive.append(testRunnerTrace, { name: "test.trace" });
     archive.append(traceLines, { name: "0-trace.trace" });
     archive.append(networkLine, { name: "0-trace.network" });
     archive.append(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]), { name: "screencast/page1-1255.jpeg" });

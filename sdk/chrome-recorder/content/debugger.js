@@ -215,73 +215,114 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  function executeStep(step) {
+  function normalizeUrl(url) {
+    try {
+      const u = new URL(url, window.location.origin);
+      return `${u.origin}${u.pathname.replace(/\/+$/, "")}${u.search}`;
+    } catch {
+      return String(url || "").replace(/\/+$/, "");
+    }
+  }
+
+  async function executeStep(step, timeoutMs = 6000) {
     if (!step) return { ok: false, error: "No step to execute." };
-    if (step.kind === "GOTO") {
-      if (window.location.href !== step.url) {
-        window.location.href = step.url;
-      }
+    if (step.kind === "WAIT") {
+      await new Promise((r) => setTimeout(r, 300));
       return { ok: true };
     }
 
-    const matches = resolveLocatorMatches(step.locatorExpr);
-    if (matches.length === 0) {
-      return { ok: false, error: `Locator not found: ${step.locatorExpr}` };
-    }
-    if (matches.length > 1) {
-      return {
-        ok: false,
-        error: `Strict mode violation: ${step.locatorExpr} resolved to ${matches.length} elements.`
-      };
-    }
+    const deadline = Date.now() + timeoutMs;
 
-    const el = matches[0];
-    el.scrollIntoView({ block: "center" });
-
-    if (step.kind === "CLICK") {
-      el.click();
-      return { ok: true };
-    }
-    if (step.kind === "FILL") {
-      el.focus();
-      setInputValue(el, step.value ?? "");
-      return { ok: true };
-    }
-    if (step.kind === "SELECT") {
-      el.value = step.value ?? "";
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true };
-    }
-    if (step.kind === "CHECK") {
-      el.checked = Boolean(step.checked);
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true };
-    }
-    if (step.kind === "PRESS") {
-      el.dispatchEvent(new KeyboardEvent("keydown", { key: step.key || "Enter", bubbles: true }));
-      el.dispatchEvent(new KeyboardEvent("keyup", { key: step.key || "Enter", bubbles: true }));
-      if ((step.key || "Enter") === "Enter" && el.form) {
-        el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
-      }
-      return { ok: true };
-    }
-    if (step.kind === "ASSERT") {
-      if (!isVisible(el)) {
-        return { ok: false, error: `Expected element to be visible: ${step.locatorExpr}` };
-      }
-      if (step.expected != null) {
-        const actual = cleanText(el.innerText || el.textContent);
-        if (!actual.includes(step.expected)) {
-          return {
-            ok: false,
-            error: `Expected "${step.expected}", got "${actual.slice(0, 80)}"`
-          };
+    if (step.kind === "PAGE_ASSERT") {
+      while (Date.now() < deadline) {
+        if (step.assertType === "toHaveURL" && window.location.href.includes(step.expected || "")) {
+          return { ok: true };
         }
+        if (step.assertType === "toHaveTitle" && document.title.includes(step.expected || "")) {
+          return { ok: true };
+        }
+        await new Promise((r) => setTimeout(r, 120));
       }
-      return { ok: true };
+      if (step.assertType === "toHaveURL") {
+        return { ok: false, error: `Expected URL to contain "${step.expected}", got "${window.location.href}"` };
+      }
+      return { ok: false, error: `Expected title to contain "${step.expected}", got "${document.title}"` };
     }
 
-    return { ok: false, error: `Unsupported debug step kind: ${step.kind}` };
+    if (step.kind === "GOTO") {
+      if (normalizeUrl(window.location.href) !== normalizeUrl(step.url)) {
+        window.location.href = step.url;
+        return { ok: true, navigated: true };
+      }
+      return { ok: true, navigated: false };
+    }
+
+    // Smart auto-wait: poll until target element is present, unique, visible (and matches assertion if ASSERT).
+    let lastError = `Locator not found: ${step.locatorExpr}`;
+    while (Date.now() < deadline) {
+      const matches = resolveLocatorMatches(step.locatorExpr);
+      if (matches.length > 1) {
+        return {
+          ok: false,
+          error: `Strict mode violation: ${step.locatorExpr} resolved to ${matches.length} elements.`
+        };
+      }
+      if (matches.length === 1) {
+        const el = matches[0];
+        if (!isVisible(el)) {
+          lastError = `Element found but not visible: ${step.locatorExpr}`;
+        } else if (step.kind === "ASSERT") {
+          if (step.expected == null) {
+            return { ok: true };
+          }
+          const actual =
+            step.assertType === "toHaveValue"
+              ? String(el.value ?? "")
+              : cleanText(el.innerText || el.textContent);
+          const matched =
+            step.assertType === "toHaveValue" || step.assertType === "toHaveText"
+              ? actual === step.expected || actual.includes(step.expected)
+              : actual.includes(step.expected);
+          if (matched) return { ok: true };
+          lastError = `Expected "${step.expected}", got "${actual.slice(0, 80)}"`;
+        } else {
+          el.scrollIntoView({ block: "center" });
+          if (step.kind === "CLICK") {
+            el.click();
+            return { ok: true };
+          }
+          if (step.kind === "FILL") {
+            el.focus();
+            setInputValue(el, step.value ?? "");
+            return { ok: true };
+          }
+          if (step.kind === "SELECT") {
+            el.value = step.value ?? "";
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return { ok: true };
+          }
+          if (step.kind === "CHECK") {
+            el.checked = Boolean(step.checked);
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            return { ok: true };
+          }
+          if (step.kind === "PRESS") {
+            el.dispatchEvent(new KeyboardEvent("keydown", { key: step.key || "Enter", bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent("keyup", { key: step.key || "Enter", bubbles: true }));
+            if ((step.key || "Enter") === "Enter" && el.form) {
+              el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
+            }
+            return { ok: true };
+          }
+          return { ok: false, error: `Unsupported debug step kind: ${step.kind}` };
+        }
+      } else {
+        lastError = `Locator not found: ${step.locatorExpr}`;
+      }
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    return { ok: false, error: lastError };
   }
 
   window.__testpilotDebugger = {

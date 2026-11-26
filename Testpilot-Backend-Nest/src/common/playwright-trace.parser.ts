@@ -159,8 +159,14 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
   const networkEntries: TraceNetworkEntry[] = [];
   const errors: TraceErrorEntry[] = [];
 
+  const hasBrowserTraceFile = Array.from(entries.keys()).some(
+    (name) => name.endsWith(".trace") && !name.endsWith("test.trace")
+  );
+
   for (const [name, buf] of entries.entries()) {
     if (name.endsWith(".trace")) {
+      const isTestRunnerTrace = name === "test.trace" || name.endsWith("/test.trace");
+      const skipCallsFromThisFile = isTestRunnerTrace && hasBrowserTraceFile;
       const lines = buf.toString("utf8").split(/\r?\n/);
       for (const line of lines) {
         if (!line.trim()) continue;
@@ -180,7 +186,8 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
               height: Number(evt.options.viewport.height)
             };
           }
-        } else if (evt.type === "before" && evt.callId) {
+        } else if (evt.type === "before" && evt.callId && !skipCallsFromThisFile) {
+          const callId = String(evt.callId);
           const apiName = String(evt.title || evt.apiName || (evt.class && evt.method ? `${evt.class}.${evt.method}` : "step"));
           const selector =
             typeof evt.params?.selector === "string"
@@ -199,8 +206,11 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
             }
           }
 
-          callsById.set(String(evt.callId), {
-            callId: String(evt.callId),
+          if (!callsById.has(callId)) {
+            orderedCallIds.push(callId);
+          }
+          callsById.set(callId, {
+            callId,
             apiName,
             selector,
             line: lineNum,
@@ -215,13 +225,12 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
             frameDataUrl: null,
             userFacing: isUserFacingTraceStep(evt, apiName)
           });
-          orderedCallIds.push(String(evt.callId));
-        } else if (evt.type === "input" && evt.callId) {
+        } else if (evt.type === "input" && evt.callId && !skipCallsFromThisFile) {
           const step = callsById.get(String(evt.callId));
           if (step && evt.point && typeof evt.point.x === "number" && typeof evt.point.y === "number") {
             step.point = { x: Math.round(evt.point.x), y: Math.round(evt.point.y) };
           }
-        } else if (evt.type === "after" && evt.callId) {
+        } else if (evt.type === "after" && evt.callId && !skipCallsFromThisFile) {
           const step = callsById.get(String(evt.callId));
           if (!step) continue;
           const endTime = typeof evt.endTime === "number" ? evt.endTime : step.startTime;

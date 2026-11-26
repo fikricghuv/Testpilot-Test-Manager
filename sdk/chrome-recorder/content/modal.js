@@ -8,6 +8,7 @@
   let currentSession = null;
   let activeTab = "steps";
   let statusMessage = "";
+  let autoRunActive = false;
 
   function ensureModal() {
     if (host) return;
@@ -182,10 +183,10 @@
       chrome.runtime.sendMessage({ type: "DEBUG_RESET" });
     };
 
-    const runSingleStep = () => {
+    const runSingleStep = async () => {
       if (!dbg || !currentStep) return { ok: false, done: true };
       const nextSteps = steps.map((s) => ({ ...s }));
-      const result = dbg.executeStep(currentStep);
+      const result = await dbg.executeStep(currentStep);
       if (!result.ok) {
         nextSteps[idx].status = "failed";
         chrome.runtime.sendMessage({
@@ -207,37 +208,74 @@
       return { ok: true, navigated: currentStep.kind === "GOTO" };
     };
 
-    shadow.getElementById("btn-step").onclick = () => {
-      runSingleStep();
-    };
+    const runAllRemaining = async () => {
+      if (autoRunActive) return;
+      autoRunActive = true;
+      try {
+        while (currentSession && currentSession.mode === "debug") {
+          const curIdx = currentSession.currentStepIndex || 0;
+          const allSteps = currentSession.debugSteps || [];
+          if (curIdx >= allSteps.length) break;
+          const cur = allSteps[curIdx];
+          if (!cur || !dbg) break;
 
-    shadow.getElementById("btn-run-all").onclick = async () => {
-      for (let i = idx; i < steps.length; i += 1) {
-        const cur = (currentSession.debugSteps || [])[i];
-        if (!cur || !dbg) break;
-        const res = dbg.executeStep(cur);
-        const updated = (currentSession.debugSteps || []).map((s) => ({ ...s }));
-        if (!res.ok) {
-          updated[i].status = "failed";
-          chrome.runtime.sendMessage({
-            type: "DEBUG_SET_STATE",
-            debugSteps: updated,
-            currentStepIndex: i,
-            lastDebugError: res.error
-          });
-          break;
+          const res = await dbg.executeStep(cur);
+          const updated = allSteps.map((s) => ({ ...s }));
+          if (!res.ok) {
+            updated[curIdx].status = "failed";
+            await new Promise((resolve) =>
+              chrome.runtime.sendMessage(
+                {
+                  type: "DEBUG_SET_STATE",
+                  debugSteps: updated,
+                  currentStepIndex: curIdx,
+                  autoRun: false,
+                  lastDebugError: res.error
+                },
+                resolve
+              )
+            );
+            break;
+          }
+
+          updated[curIdx].status = "passed";
+          const nextIdx = curIdx + 1;
+          await new Promise((resolve) =>
+            chrome.runtime.sendMessage(
+              {
+                type: "DEBUG_SET_STATE",
+                debugSteps: updated,
+                currentStepIndex: nextIdx,
+                autoRun: nextIdx < updated.length,
+                lastDebugError: null
+              },
+              resolve
+            )
+          );
+
+          if (res.navigated) break;
+          await new Promise((r) => setTimeout(r, 450));
         }
-        updated[i].status = "passed";
-        chrome.runtime.sendMessage({
-          type: "DEBUG_SET_STATE",
-          debugSteps: updated,
-          currentStepIndex: i + 1,
-          lastDebugError: null
-        });
-        if (cur.kind === "GOTO") break;
-        await new Promise((r) => setTimeout(r, 450));
+      } finally {
+        autoRunActive = false;
       }
     };
+
+    shadow.getElementById("btn-step").onclick = () => {
+      void runSingleStep();
+    };
+
+    shadow.getElementById("btn-run-all").onclick = () => {
+      void runAllRemaining();
+    };
+
+    if (currentSession.autoRun && idx < steps.length && !currentSession.lastDebugError && !autoRunActive) {
+      setTimeout(() => {
+        if (currentSession?.autoRun && !autoRunActive) {
+          void runAllRemaining();
+        }
+      }, 500);
+    }
   }
 
   function render() {

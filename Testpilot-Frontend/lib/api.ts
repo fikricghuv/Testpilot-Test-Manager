@@ -4864,3 +4864,131 @@ export async function createTestCaseRecorderSession(
     { method: "POST", body: {} }
   );
 }
+
+// ─── Playwright 3-Agent Automation (Planner -> Generator -> Healer) ───────────
+export type AgentJobMode = "single" | "heal" | "explore";
+export type AgentJobStage =
+  | "queued"
+  | "planning"
+  | "generating"
+  | "running"
+  | "healing"
+  | "completed"
+  | "failed";
+
+export interface DiscoveredScenario {
+  title: string;
+  description: string;
+  steps: string[];
+  expectedResult: string;
+  priority: "low" | "medium" | "high";
+}
+
+export interface TestAgentJobRecord {
+  id: string;
+  projectId: string;
+  testcaseId: string | null;
+  mode: AgentJobMode;
+  stage: AgentJobStage;
+  targetUrl: string;
+  instructions: string | null;
+  attempt: number;
+  maxAttempts: number;
+  planJson: Record<string, unknown>;
+  logs: Array<{ at: string; stage: AgentJobStage; message: string }>;
+  discoveredScenarios: DiscoveredScenario[];
+  resultScriptId: string | null;
+  resultVersionId: string | null;
+  resultRunId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AutomationAuthConfigSummary {
+  loginUrl: string | null;
+  username: string | null;
+  hasPassword: boolean;
+  hasStorageState: boolean;
+  updatedAt: string | null;
+}
+
+export async function startTestCaseAiGenerate(
+  projectId: string,
+  testcaseId: string,
+  data: { targetUrl: string; instructions?: string | null }
+): Promise<{ job: TestAgentJobRecord }> {
+  return api<{ job: TestAgentJobRecord }>(
+    `/api/projects/${projectId}/testcases/${testcaseId}/script/ai-generate`,
+    { method: "POST", body: data }
+  );
+}
+
+export async function startTestCaseAiHeal(
+  projectId: string,
+  testcaseId: string,
+  data?: { targetUrl?: string | null; instructions?: string | null }
+): Promise<{ job: TestAgentJobRecord }> {
+  return api<{ job: TestAgentJobRecord }>(
+    `/api/projects/${projectId}/testcases/${testcaseId}/script/ai-heal`,
+    { method: "POST", body: data ?? {} }
+  );
+}
+
+export async function startAutomationExplore(
+  projectId: string,
+  data: { targetUrl: string; instructions?: string | null }
+): Promise<{ job: TestAgentJobRecord }> {
+  return api<{ job: TestAgentJobRecord }>(
+    `/api/projects/${projectId}/automation-agents/explore`,
+    { method: "POST", body: data }
+  );
+}
+
+export async function getAutomationAgentJob(
+  projectId: string,
+  jobId: string
+): Promise<{ job: TestAgentJobRecord }> {
+  return api<{ job: TestAgentJobRecord }>(
+    `/api/projects/${projectId}/automation-agents/jobs/${jobId}`
+  );
+}
+
+export async function listAutomationAgentJobs(
+  projectId: string,
+  testcaseId?: string
+): Promise<{ list: TestAgentJobRecord[] }> {
+  const qs = testcaseId ? `?testcaseId=${encodeURIComponent(testcaseId)}` : "";
+  return api<{ list: TestAgentJobRecord[] }>(
+    `/api/projects/${projectId}/automation-agents/jobs${qs}`
+  );
+}
+
+export async function createTestCasesFromExplore(
+  projectId: string,
+  jobId: string,
+  indices: number[]
+): Promise<{ created: Array<{ testcaseId: string; title: string; jobId: string }> }> {
+  return api<{ created: Array<{ testcaseId: string; title: string; jobId: string }> }>(
+    `/api/projects/${projectId}/automation-agents/jobs/${jobId}/create-testcases`,
+    { method: "POST", body: { indices } }
+  );
+}
+
+export async function getAutomationAuthConfig(
+  projectId: string
+): Promise<AutomationAuthConfigSummary> {
+  return api<AutomationAuthConfigSummary>(
+    `/api/projects/${projectId}/automation-agents/auth`
+  );
+}
+
+export async function saveAutomationAuthConfig(
+  projectId: string,
+  data: { loginUrl?: string | null; username?: string | null; password?: string | null; storageStateJson?: string | null }
+): Promise<AutomationAuthConfigSummary> {
+  return api<AutomationAuthConfigSummary>(
+    `/api/projects/${projectId}/automation-agents/auth`,
+    { method: "PUT", body: data }
+  );
+}

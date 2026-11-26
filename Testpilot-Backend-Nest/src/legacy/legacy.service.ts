@@ -14693,6 +14693,66 @@ export class LegacyService implements OnModuleInit {
     };
   }
 
+  async runProjectAiPrompt(
+    projectId: string,
+    systemPrompt: string,
+    userPrompt: string,
+    maxTokens = 4096
+  ): Promise<{ text: string; provider: string; model: string }> {
+    const allocation = await this.zyraAiAllocation(projectId);
+    if (!allocation.key) {
+      throw new BadRequestException({ error: allocation.reason || "No AI key is configured for this project." });
+    }
+    const { key } = allocation;
+    const provider = String(key.provider || "openai").toLowerCase();
+    const model = normalizeProviderModel(provider, key.default_model);
+
+    if (providerWire(provider) === "anthropic") {
+      const headers = this.providerAuthHeaders(provider, key.api_key, key.auth_header_name, key.auth_scheme);
+      const res = await safeFetch(normalizeAnthropicMessagesUrlFor(provider, key.base_url), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: providerModelCandidates(provider, model)[0],
+          max_tokens: maxTokens,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userPrompt }]
+        })
+      });
+      const body = (await res.json().catch(() => ({}))) as Body;
+      if (!res.ok) {
+        const raw = String(body.error?.message || body.error || res.statusText);
+        throw new BadRequestException({ error: this.describeProviderError(provider, res.status, raw) || raw });
+      }
+      const text = Array.isArray(body.content)
+        ? body.content.map((c: Body) => (typeof c?.text === "string" ? c.text : "")).join("")
+        : "";
+      return { text, provider, model };
+    }
+
+    const authHeaders = this.providerAuthHeaders(provider, String(key.api_key || ""), key.auth_header_name, key.auth_scheme);
+    const res = await safeFetch(providerChatUrl(provider, key.base_url, model), {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({
+        model,
+        max_tokens: maxTokens,
+        temperature: 0.1,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ]
+      })
+    });
+    const body = (await res.json().catch(() => ({}))) as Body;
+    if (!res.ok) {
+      const raw = String(body.error?.message || body.error || res.statusText);
+      throw new BadRequestException({ error: this.describeProviderError(provider, res.status, raw) || raw });
+    }
+    const text = String(body.choices?.[0]?.message?.content || "");
+    return { text, provider, model };
+  }
+
   async testZyraAiConnection(projectId: string, userId: string | null | undefined): Promise<{ ok: boolean; provider: string; model: string; error?: string; latencyMs: number }> {
     await this.requireProjectAccess(this.requireUser(userId), projectId);
     const allocation = await this.zyraAiAllocation(projectId);

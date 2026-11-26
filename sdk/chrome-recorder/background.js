@@ -47,13 +47,47 @@ function unescapeQuotes(str) {
 }
 
 function parsePlaywrightSpecToDebugSteps(scriptContent, fallbackUrl) {
-  const lines = String(scriptContent || "").split(/\r?\n/);
+  const rawLines = String(scriptContent || "").split(/\r?\n/);
+
+  // Group multi-line `await ...;` statements while preserving their starting line number.
+  const statements = [];
+  let buffer = "";
+  let bufferStartLine = 1;
+  for (let i = 0; i < rawLines.length; i++) {
+    const lineNum = i + 1;
+    const trimmed = rawLines[i].trim();
+    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("import ") || trimmed.startsWith("test(") || trimmed === "});" || trimmed === "}") {
+      continue;
+    }
+    if (!buffer) bufferStartLine = lineNum;
+    buffer = buffer ? `${buffer} ${trimmed}` : trimmed;
+    if (trimmed.endsWith(";") || (!trimmed.endsWith(".") && !trimmed.endsWith("(") && !trimmed.endsWith(","))) {
+      statements.push({ line: bufferStartLine, text: buffer.replace(/;\s*$/, "") });
+      buffer = "";
+    }
+  }
+  if (buffer) {
+    statements.push({ line: bufferStartLine, text: buffer.replace(/;\s*$/, "") });
+  }
+
+  // Track simple `const foo = page.locator(...)` aliases so `await foo.click()` resolves accurately.
+  const aliases = new Map();
+  const resolveAliases = (expr) => {
+    const m = expr.match(/^([a-zA-Z_$][\w$]*)\.(.*)$/);
+    if (m && aliases.has(m[1])) {
+      return `${aliases.get(m[1])}.${m[2]}`;
+    }
+    return aliases.get(expr) || expr;
+  };
+
   const steps = [];
 
-  lines.forEach((raw, idx) => {
-    const lineNum = idx + 1;
-    const line = raw.trim();
-    if (!line || line.startsWith("//") || line.startsWith("import ") || line.startsWith("test(")) return;
+  for (const { line: lineNum, text: line } of statements) {
+    const aliasMatch = line.match(/^(?:const|let)\s+([a-zA-Z_$][\w$]*)\s*=\s*(page\..+)$/);
+    if (aliasMatch) {
+      aliases.set(aliasMatch[1], aliasMatch[2]);
+      continue;
+    }
 
     const gotoMatch = line.match(/^await\s+page\.goto\(\s*(['"`])((?:\\.|(?!\1).)*)\1/);
     if (gotoMatch) {
@@ -64,50 +98,121 @@ function parsePlaywrightSpecToDebugSteps(scriptContent, fallbackUrl) {
         } catch {}
       }
       steps.push({ kind: "GOTO", url, label: url, line: lineNum, status: "pending", code: line });
-      return;
+      continue;
     }
 
-    const clickMatch = line.match(/^await\s+(page\..+)\.click\(\s*\)/);
+    const body = line.replace(/^await\s+/, "");
+
+    const clickMatch = body.match(/^(.+?)\.click\([^)]*\)$/);
     if (clickMatch) {
-      steps.push({ kind: "CLICK", locatorExpr: clickMatch[1], label: clickMatch[1].replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(clickMatch[1].trim());
+      if (loc.startsWith("page.")) {
+        steps.push({ kind: "CLICK", locatorExpr: loc, label: loc.replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
+        continue;
+      }
     }
 
-    const fillMatch = line.match(/^await\s+(page\..+)\.fill\(\s*(['"`])((?:\\.|(?!\2).)*)\2\s*\)/);
+    const fillMatch = body.match(/^(.+?)\.(?:fill|type|pressSequentially)\(\s*(?:(['"`])((?:\\.|(?!\2).)*)\2|.+?\?\?\s*(['"`])((?:\\.|(?!\4).)*)\4)\s*(?:,[^)]*)?\)$/);
     if (fillMatch) {
-      steps.push({ kind: "FILL", locatorExpr: fillMatch[1], value: unescapeQuotes(fillMatch[3]), label: `${fillMatch[1].replace(/^page\./, "")} = "${unescapeQuotes(fillMatch[3])}"`, line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(fillMatch[1].trim());
+      const val = unescapeQuotes(fillMatch[3] ?? fillMatch[5] ?? "");
+      if (loc.startsWith("page.")) {
+        steps.push({ kind: "FILL", locatorExpr: loc, value: val, label: `${loc.replace(/^page\./, "")} = "${val}"`, line: lineNum, status: "pending", code: line });
+        continue;
+      }
     }
 
-    const selectMatch = line.match(/^await\s+(page\..+)\.selectOption\(\s*(['"`])((?:\\.|(?!\2).)*)\2\s*\)/);
+    const selectMatch = body.match(/^(.+?)\.selectOption\(\s*(['"`])((?:\\.|(?!\2).)*)\2\s*\)$/);
     if (selectMatch) {
-      steps.push({ kind: "SELECT", locatorExpr: selectMatch[1], value: unescapeQuotes(selectMatch[3]), label: selectMatch[1].replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(selectMatch[1].trim());
+      const val = unescapeQuotes(selectMatch[3]);
+      if (loc.startsWith("page.")) {
+        steps.push({ kind: "SELECT", locatorExpr: loc, value: val, label: loc.replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
+        continue;
+      }
     }
 
-    const checkMatch = line.match(/^await\s+(page\..+)\.(check|uncheck)\(\s*\)/);
+    const checkMatch = body.match(/^(.+?)\.(check|uncheck)\([^)]*\)$/);
     if (checkMatch) {
-      steps.push({ kind: "CHECK", locatorExpr: checkMatch[1], checked: checkMatch[2] === "check", label: checkMatch[1].replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(checkMatch[1].trim());
+      if (loc.startsWith("page.")) {
+        steps.push({ kind: "CHECK", locatorExpr: loc, checked: checkMatch[2] === "check", label: loc.replace(/^page\./, ""), line: lineNum, status: "pending", code: line });
+        continue;
+      }
     }
 
-    const pressMatch = line.match(/^await\s+(page\..+)\.press\(\s*(['"`])((?:\\.|(?!\2).)*)\2\s*\)/);
+    const pressMatch = body.match(/^(.+?)\.press\(\s*(['"`])((?:\\.|(?!\2).)*)\2\s*\)$/);
     if (pressMatch) {
-      steps.push({ kind: "PRESS", locatorExpr: pressMatch[1], key: unescapeQuotes(pressMatch[3]), label: `${pressMatch[1].replace(/^page\./, "")} [${unescapeQuotes(pressMatch[3])}]`, line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(pressMatch[1].trim());
+      const key = unescapeQuotes(pressMatch[3]);
+      if (loc.startsWith("page.")) {
+        steps.push({ kind: "PRESS", locatorExpr: loc, key, label: `${loc.replace(/^page\./, "")} [${key}]`, line: lineNum, status: "pending", code: line });
+        continue;
+      }
     }
 
-    const assertTextMatch = line.match(/^await\s+expect\(\s*(page\..+?)\s*\)\.(toContainText|toHaveText)\(\s*(['"`])((?:\\.|(?!\3).)*)\3\s*\)/);
+    const expectPageMatch = body.match(/^expect\(\s*page\s*\)\.(toHaveURL|toHaveTitle)\(\s*(?:(['"`])((?:\\.|(?!\2).)*)\2|\/([^/]+)\/[gimsuy]*)\s*\)$/);
+    if (expectPageMatch) {
+      const expected = unescapeQuotes(expectPageMatch[3] ?? expectPageMatch[4] ?? "");
+      steps.push({
+        kind: "PAGE_ASSERT",
+        assertType: expectPageMatch[1],
+        expected,
+        label: `page.${expectPageMatch[1]}("${expected}")`,
+        line: lineNum,
+        status: "pending",
+        code: line
+      });
+      continue;
+    }
+
+    const assertTextMatch = body.match(/^expect\(\s*(.+?)\s*\)\.(toContainText|toHaveText|toHaveValue)\(\s*(?:(['"`])((?:\\.|(?!\3).)*)\3|\/([^/]+)\/[gimsuy]*)\s*(?:,[^)]*)?\)$/);
     if (assertTextMatch) {
-      steps.push({ kind: "ASSERT", locatorExpr: assertTextMatch[1], expected: unescapeQuotes(assertTextMatch[4]), label: `${assertTextMatch[1].replace(/^page\./, "")} (${assertTextMatch[2]})`, line: lineNum, status: "pending", code: line });
-      return;
+      const loc = resolveAliases(assertTextMatch[1].trim());
+      const expected = unescapeQuotes(assertTextMatch[4] ?? assertTextMatch[5] ?? "");
+      if (loc.startsWith("page.")) {
+        steps.push({
+          kind: "ASSERT",
+          locatorExpr: loc,
+          assertType: assertTextMatch[2],
+          expected,
+          label: `${loc.replace(/^page\./, "")} (${assertTextMatch[2]})`,
+          line: lineNum,
+          status: "pending",
+          code: line
+        });
+        continue;
+      }
     }
 
-    const assertVisibleMatch = line.match(/^await\s+expect\(\s*(page\..+?)\s*\)\.toBeVisible\(\s*\)/);
+    const assertVisibleMatch = body.match(/^expect\(\s*(.+?)\s*\)\.(toBeVisible|toBeEnabled|toBeChecked)\([^)]*\)$/);
     if (assertVisibleMatch) {
-      steps.push({ kind: "ASSERT", locatorExpr: assertVisibleMatch[1], expected: null, label: `${assertVisibleMatch[1].replace(/^page\./, "")} (visible)`, line: lineNum, status: "pending", code: line });
+      const loc = resolveAliases(assertVisibleMatch[1].trim());
+      if (loc.startsWith("page.")) {
+        steps.push({
+          kind: "ASSERT",
+          locatorExpr: loc,
+          assertType: assertVisibleMatch[2],
+          expected: null,
+          label: `${loc.replace(/^page\./, "")} (${assertVisibleMatch[2]})`,
+          line: lineNum,
+          status: "pending",
+          code: line
+        });
+        continue;
+      }
     }
-  });
+
+    if (line.startsWith("await ")) {
+      steps.push({
+        kind: "WAIT",
+        label: body.slice(0, 60),
+        line: lineNum,
+        status: "pending",
+        code: line
+      });
+    }
+  }
 
   return steps;
 }
@@ -141,6 +246,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         targetUrl: openUrl,
         debugSteps,
         currentStepIndex: 0,
+        autoRun: Boolean(p.autoRun),
         lastDebugError: null
       };
       await setSessions(sessions);
@@ -277,6 +383,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "DEBUG_SET_STATE" && session.mode === "debug") {
       if (Array.isArray(msg.debugSteps)) session.debugSteps = msg.debugSteps;
       if (typeof msg.currentStepIndex === "number") session.currentStepIndex = msg.currentStepIndex;
+      if (typeof msg.autoRun === "boolean") session.autoRun = msg.autoRun;
       session.lastDebugError = msg.lastDebugError ?? null;
       await setSessions(sessions);
       await broadcastToTab(senderTabId, session);
@@ -287,6 +394,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "DEBUG_RESET" && session.mode === "debug") {
       session.debugSteps = (session.debugSteps || []).map((s) => ({ ...s, status: "pending" }));
       session.currentStepIndex = 0;
+      session.autoRun = false;
       session.lastDebugError = null;
       await setSessions(sessions);
       await broadcastToTab(senderTabId, session);

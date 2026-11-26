@@ -200,10 +200,10 @@ export default function AgentsPage() {
             <h2 id="active-agents-heading" className="text-xs font-semibold uppercase tracking-[0.06em] text-[var(--muted)]">
               Active in this project
             </h2>
-            <span className="font-mono text-xs text-[var(--muted-soft)]">2 available</span>
+            <span className="font-mono text-xs text-[var(--muted-soft)]">3 available</span>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {/* Zyra */}
             <button
               type="button"
@@ -307,6 +307,42 @@ export default function AgentsPage() {
               <div className="mt-5 flex items-center justify-between border-t border-[var(--border)] pt-3.5 text-xs text-[var(--muted-soft)]">
                 <span>Autonomous app walkthroughs</span>
                 <span className="font-medium text-[var(--foreground)]">Configure &amp; run</span>
+              </div>
+            </Link>
+
+            {/* Playwright 3-Agent */}
+            <Link
+              href={`/projects/${projectId}/agents/playwright`}
+              data-testid="agent-card-playwright-3agent"
+              className="group flex h-full flex-col justify-between rounded-[var(--radius-card)] border border-[var(--border)] bg-[var(--surface)] p-5 text-left transition-colors hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)]/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--brand-primary)]"
+            >
+              <div>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <IconPlayerPlay size={18} stroke={1.75} className="shrink-0 text-[var(--muted)]" />
+                      <h3 className="text-[15px] font-semibold text-[var(--foreground)]">Playwright 3-Agent</h3>
+                      <span className="inline-flex items-center gap-1.5 rounded-[4px] border border-[var(--border)] bg-[var(--surface-secondary)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--foreground)]">
+                        <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: "var(--status-pass-dot)" }} />
+                        Active
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-[var(--muted)]">Planner · Generator · Healer</p>
+                  </div>
+                  <span className="inline-flex min-h-[28px] shrink-0 items-center gap-1 text-xs font-medium text-[var(--muted)] transition-colors group-hover:text-[var(--foreground)]">
+                    Open
+                    <IconArrowRight size={14} stroke={1.75} />
+                  </span>
+                </div>
+
+                <p className="mt-3 text-[13px] leading-relaxed text-[var(--muted)]">
+                  Inspects live DOM &amp; ARIA snapshots, generates grounded Playwright TypeScript tests, and auto-heals failing selectors.
+                </p>
+              </div>
+
+              <div className="mt-5 flex items-center justify-between border-t border-[var(--border)] pt-3.5 text-xs text-[var(--muted-soft)]">
+                <span>Page explorer &amp; auth config</span>
+                <span className="font-medium text-[var(--foreground)]">Explore &amp; generate</span>
               </div>
             </Link>
           </div>

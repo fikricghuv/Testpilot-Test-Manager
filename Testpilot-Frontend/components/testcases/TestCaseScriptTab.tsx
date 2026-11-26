@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   IconBug,
+  IconCheck,
   IconCode,
   IconDeviceFloppy,
   IconDownload,
@@ -12,7 +13,10 @@ import {
   IconPlayerPlay,
   IconPlayerRecord,
   IconRefresh,
+  IconSparkles,
   IconTrash,
+  IconWand,
+  IconX,
 } from "@tabler/icons-react";
 import {
   API_BASE,
@@ -20,10 +24,14 @@ import {
   createTestCaseRecorderSession,
   deleteTestCaseScript,
   deleteTestCaseScriptVersion,
+  getAutomationAgentJob,
   getTestCaseScript,
   getTestCaseScriptRun,
   runTestCaseScript,
   saveTestCaseScript,
+  startTestCaseAiGenerate,
+  startTestCaseAiHeal,
+  type TestAgentJobRecord,
   type TestScriptRunRecord,
   type TestScriptStateResponse,
   type TestScriptStatus,
@@ -78,6 +86,7 @@ export function TestCaseScriptTab({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [runMode, setRunMode] = useState<"headless" | "headed">("headless");
   const [launchingRecorder, setLaunchingRecorder] = useState(false);
   const [extensionReady, setExtensionReady] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -91,6 +100,8 @@ export function TestCaseScriptTab({
   const [dirty, setDirty] = useState(false);
 
   const [activeRun, setActiveRun] = useState<TestScriptRunRecord | null>(null);
+  const [agentJob, setAgentJob] = useState<TestAgentJobRecord | null>(null);
+  const [startingAgent, setStartingAgent] = useState(false);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -205,6 +216,32 @@ export function TestCaseScriptTab({
     };
   }, [activeRun, projectId, testcaseId, stopPolling]);
 
+  useEffect(() => {
+    if (!agentJob || agentJob.stage === "completed" || agentJob.stage === "failed") return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await getAutomationAgentJob(projectId, agentJob.id);
+        if (cancelled) return;
+        setAgentJob(res.job);
+        if (res.job.stage === "completed" || res.job.stage === "failed") {
+          await loadScript();
+          if (res.job.stage === "completed") {
+            setSuccess("3-Agent pipeline verified and saved the Playwright script.");
+          } else if (res.job.errorMessage) {
+            setError(res.job.errorMessage);
+          }
+        }
+      } catch {
+        // Ignore transient poll error
+      }
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [agentJob, projectId, loadScript]);
+
   async function handleSave() {
     if (!scriptContent.trim()) {
       setError("Script content cannot be empty.");
@@ -231,6 +268,10 @@ export function TestCaseScriptTab({
   }
 
   async function handleRun() {
+    if (runMode === "headed") {
+      await handleDebugInExtension(true);
+      return;
+    }
     setError(null);
     setSuccess(null);
     setRunning(true);
@@ -297,6 +338,41 @@ export function TestCaseScriptTab({
       setError(err instanceof Error ? err.message : "Failed to delete script version.");
     } finally {
       setDeleting(false);
+    }
+  }
+
+  async function handleAiGenerate() {
+    const trimmedUrl = targetUrl.trim();
+    if (!trimmedUrl) {
+      setError("Enter a Target URL below before running the 3-Agent generator.");
+      return;
+    }
+    setStartingAgent(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const res = await startTestCaseAiGenerate(projectId, testcaseId, { targetUrl: trimmedUrl });
+      setAgentJob(res.job);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start 3-Agent pipeline.");
+    } finally {
+      setStartingAgent(false);
+    }
+  }
+
+  async function handleAiHeal() {
+    setStartingAgent(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const res = await startTestCaseAiHeal(projectId, testcaseId, {
+        targetUrl: targetUrl.trim() || null,
+      });
+      setAgentJob(res.job);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start Healer agent.");
+    } finally {
+      setStartingAgent(false);
     }
   }
 
@@ -369,7 +445,7 @@ export function TestCaseScriptTab({
     }
   }
 
-  async function handleDebugInExtension() {
+  async function handleDebugInExtension(autoRun = false) {
     if (!scriptContent.trim()) {
       setError("Write or record a Playwright spec before debugging.");
       return;
@@ -404,6 +480,7 @@ export function TestCaseScriptTab({
               testcaseExternalId,
               targetUrl: targetUrl.trim() || null,
               scriptContent,
+              autoRun,
             },
           },
           "*"
@@ -411,11 +488,15 @@ export function TestCaseScriptTab({
       });
 
       if (!ack.ok) {
-        setError(ack.error || "Failed to launch Step-by-Step Debugger.");
+        setError(ack.error || "Failed to launch Chrome Extension runner.");
         return;
       }
       setExtensionReady(true);
-      setSuccess("Step-by-Step Debugger opened in a new Chrome tab.");
+      setSuccess(
+        autoRun
+          ? "Playwright started in visible Chrome tab via Extension."
+          : "Step-by-Step Debugger opened in a new Chrome tab."
+      );
     } finally {
       setLaunchingRecorder(false);
     }
@@ -500,6 +581,34 @@ export function TestCaseScriptTab({
             type="button"
             variant="secondary"
             size="sm"
+            onClick={handleAiGenerate}
+            disabled={startingAgent || Boolean(agentJob && agentJob.stage !== "completed" && agentJob.stage !== "failed")}
+            title="Planner inspects live DOM/ARIA, Generator writes grounded spec, Healer verifies"
+          >
+            {startingAgent || (agentJob && agentJob.stage !== "completed" && agentJob.stage !== "failed") ? (
+              <IconLoader2 size={14} className="animate-spin" />
+            ) : (
+              <IconSparkles size={14} />
+            )}
+            Generate with AI (3-Agent)
+          </Button>
+          {activeRun && (activeRun.status === "failed" || activeRun.status === "error") && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              onClick={handleAiHeal}
+              disabled={startingAgent || Boolean(agentJob && agentJob.stage !== "completed" && agentJob.stage !== "failed")}
+              title="Analyze failure and auto-fix with Healer agent"
+            >
+              <IconWand size={14} />
+              Heal with AI
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
             onClick={handleLaunchRecorder}
             disabled={launchingRecorder}
             title={extensionReady ? "Chrome extension connected" : "Requires sdk/chrome-recorder Chrome extension"}
@@ -515,7 +624,7 @@ export function TestCaseScriptTab({
             type="button"
             variant="secondary"
             size="sm"
-            onClick={handleDebugInExtension}
+            onClick={() => handleDebugInExtension(false)}
             disabled={launchingRecorder || !scriptContent.trim()}
             title="Step through each Playwright line in Chrome"
           >
@@ -549,23 +658,132 @@ export function TestCaseScriptTab({
             variant="secondary"
             size="sm"
             onClick={handleSave}
-            disabled={saving || !scriptContent.trim()}
+            disabled={saving || !dirty || !scriptContent.trim()}
           >
             <IconDeviceFloppy size={14} />
             {saving ? "Saving..." : "Save Script"}
           </Button>
-          <Button
-            type="button"
-            variant="primary"
-            size="sm"
-            onClick={handleRun}
-            disabled={isRunning || !scriptContent.trim()}
-          >
-            {isRunning ? <IconLoader2 size={14} className="animate-spin" /> : <IconPlayerPlay size={14} />}
-            {isRunning ? "Running..." : "Run Playwright"}
-          </Button>
+          <div className="inline-flex items-center overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+            <select
+              value={runMode}
+              onChange={(e) => setRunMode(e.target.value as "headless" | "headed")}
+              aria-label="Playwright run mode"
+              className="h-8 bg-transparent px-2 text-xs font-medium text-[var(--foreground)] focus:outline-none"
+            >
+              <option value="headless">Headless (Server)</option>
+              <option value="headed">Headed (Extension)</option>
+            </select>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              onClick={handleRun}
+              disabled={(runMode === "headless" ? isRunning : launchingRecorder) || !scriptContent.trim()}
+              className="rounded-none border-l border-[var(--border)]"
+            >
+              {(runMode === "headless" ? isRunning : launchingRecorder) ? (
+                <IconLoader2 size={14} className="animate-spin" />
+              ) : (
+                <IconPlayerPlay size={14} />
+              )}
+              {runMode === "headless"
+                ? isRunning
+                  ? "Running..."
+                  : "Run Playwright"
+                : launchingRecorder
+                  ? "Launching..."
+                  : "Run in Chrome"}
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* Live 3-Agent Pipeline Stepper */}
+      {agentJob && (
+        <div className="space-y-3 rounded-xl border border-[var(--brand-primary)]/40 bg-[var(--background)] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <IconSparkles size={16} className="text-[var(--brand-primary)]" />
+              <span className="text-xs font-semibold uppercase tracking-wider">3-Agent Pipeline ({agentJob.mode})</span>
+              <StatusChip
+                tone={
+                  agentJob.stage === "completed"
+                    ? "success"
+                    : agentJob.stage === "failed"
+                      ? "error"
+                      : "warning"
+                }
+              >
+                {agentJob.stage}
+              </StatusChip>
+              {agentJob.attempt > 0 && (
+                <span className="text-xs text-[var(--muted)]">
+                  Attempt {agentJob.attempt}/{agentJob.maxAttempts}
+                </span>
+              )}
+            </div>
+            {(agentJob.stage === "completed" || agentJob.stage === "failed") && (
+              <button
+                type="button"
+                onClick={() => setAgentJob(null)}
+                className="text-xs text-[var(--muted)] hover:text-[var(--foreground)]"
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3 text-xs">
+            {[
+              { key: "planning", label: "1. Planner (ARIA Inspect)" },
+              { key: "generating", label: "2. Generator (Playwright TS)" },
+              { key: "healing", label: "3. Healer (Verify & Fix)" },
+            ].map((step, idx) => {
+              const stageOrder = ["queued", "planning", "generating", "running", "healing", "completed"];
+              const curIdx = stageOrder.indexOf(agentJob.stage);
+              const stepIdx = idx === 0 ? 1 : idx === 1 ? 2 : 3;
+              const isDone = agentJob.stage === "completed" || curIdx > stepIdx;
+              const isActive =
+                (idx === 0 && agentJob.stage === "planning") ||
+                (idx === 1 && agentJob.stage === "generating") ||
+                (idx === 2 && (agentJob.stage === "running" || agentJob.stage === "healing"));
+              return (
+                <div
+                  key={step.key}
+                  className={`flex items-center gap-2 rounded-lg border px-3 py-2 ${
+                    isActive
+                      ? "border-[var(--brand-primary)] bg-[var(--brand-primary)]/10"
+                      : isDone
+                        ? "border-[var(--success)]/40 bg-[var(--surface)]"
+                        : "border-[var(--border-subtle)] bg-[var(--surface)] opacity-70"
+                  }`}
+                >
+                  {isActive ? (
+                    <IconLoader2 size={14} className="shrink-0 animate-spin text-[var(--brand-primary)]" />
+                  ) : isDone ? (
+                    <IconCheck size={14} className="shrink-0 text-[var(--success)]" />
+                  ) : agentJob.stage === "failed" ? (
+                    <IconX size={14} className="shrink-0 text-[var(--error)]" />
+                  ) : (
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--muted)]" />
+                  )}
+                  <span className="font-medium">{step.label}</span>
+                </div>
+              );
+            })}
+          </div>
+
+          {agentJob.logs.length > 0 && (
+            <div className="max-h-28 overflow-y-auto rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] p-2.5 font-mono text-[11px] text-[var(--muted)] space-y-1">
+              {agentJob.logs.slice(-6).map((l, i) => (
+                <div key={i}>
+                  <span className="text-[var(--foreground)]">[{l.stage}]</span> {l.message}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Metadata fields */}
       <div className="grid gap-4 sm:grid-cols-3">
