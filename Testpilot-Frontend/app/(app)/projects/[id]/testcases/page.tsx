@@ -17,6 +17,7 @@ import {
   IconLayoutSidebarLeftExpand,
   IconLoader2,
   IconPencil,
+  IconPlayerPlay,
   IconPlus,
   IconSearch,
   IconTrash,
@@ -44,6 +45,7 @@ import {
   listBugs,
   listCustomTags,
   getTestCaseTags,
+  runSuiteScripts,
   UNASSIGNED_SUITE_ID,
   type TestCaseListItem,
   type SuiteNode,
@@ -294,6 +296,7 @@ export default function TestCasesPage() {
   const { currentUser } = useAppData();
   const projectId = params.id as string;
   const activeSuiteId = searchParams.get("suiteId");
+  const [runningSuite, setRunningSuite] = useState(false);
   /*
    * "?suiteId=none" is the "No suites" node — the cases that belong to no suite.
    *
@@ -2018,6 +2021,29 @@ export default function TestCasesPage() {
                       {/* The unfiled view has no suite row to take a name from, so it names itself. */}
                       {isUnfiledView ? "No suites" : selectedSuite?.name ?? "Suite"}
                     </span>
+                  )}
+                  {activeSuiteId && !isUnfiledView && (
+                    <button
+                      type="button"
+                      disabled={runningSuite}
+                      onClick={async () => {
+                        setRunningSuite(true);
+                        setSuiteCasesError(null);
+                        try {
+                          const res = await runSuiteScripts(projectId, activeSuiteId);
+                          router.push(`/projects/${projectId}/cycles/${res.cycleId}`);
+                        } catch (err) {
+                          setSuiteCasesError(err instanceof Error ? err.message : "Failed to run Playwright suite.");
+                        } finally {
+                          setRunningSuite(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-full border border-[var(--brand-primary)] bg-[var(--brand-primary)] px-2.5 py-0.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                      title="Run all Playwright scripts in this suite"
+                    >
+                      {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
+                      {runningSuite ? "Starting..." : "Run Suite (Playwright)"}
+                    </button>
                   )}
                   <div className="ml-auto flex flex-wrap items-center gap-1.5">
                     {archivedHidden && (

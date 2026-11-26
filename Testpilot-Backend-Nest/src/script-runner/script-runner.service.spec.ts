@@ -345,4 +345,113 @@ describe("ScriptRunnerService", () => {
       testcaseExternalId: "TC-1"
     });
   });
+
+  it("creates one cycle and queues all runnable scripts in a suite on triggerSuiteRun", async () => {
+    const { service, query, clientQuery, queue } = createMocks();
+    const SUITE_ID = "66666666-6666-4666-8666-666666666666";
+    const now = new Date("2026-11-26T15:00:00Z");
+
+    query
+      .mockResolvedValueOnce({ rows: [{ id: SUITE_ID, name: "Auth Suite" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            testcase_id: TESTCASE_ID,
+            title: "Login",
+            script_id: SCRIPT_ID,
+            active_version_id: VERSION_ID,
+            target_url: "https://example.com/"
+          }
+        ]
+      });
+
+    clientQuery
+      .mockResolvedValueOnce({ rows: [{ id: "cycle-suite-1" }] })
+      .mockResolvedValueOnce({ rows: [{ id: "ci-1" }] })
+      .mockResolvedValueOnce({ rows: [{ id: "exec-1" }] })
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: "run-suite-1",
+            project_id: PROJECT_ID,
+            testcase_id: TESTCASE_ID,
+            script_id: SCRIPT_ID,
+            version_id: VERSION_ID,
+            cycle_id: "cycle-suite-1",
+            execution_id: "exec-1",
+            status: "queued",
+            target_url: "https://example.com/",
+            duration_ms: null,
+            stdout: null,
+            stderr: null,
+            error_message: null,
+            triggered_by: USER_ID,
+            started_at: null,
+            finished_at: null,
+            created_at: now
+          }
+        ]
+      });
+
+    const res = await service.triggerSuiteRun(USER_ID, PROJECT_ID, SUITE_ID);
+    expect(res.cycleId).toBe("cycle-suite-1");
+    expect(res.queuedCount).toBe(1);
+    expect(queue.add).toHaveBeenCalledWith(
+      SCRIPT_RUNNER_JOB,
+      { runId: "run-suite-1" },
+      expect.any(Object)
+    );
+  });
+
+  it("exports HTML, JSON, and JUnit XML reports for a cycle", async () => {
+    const { service, query } = createMocks();
+    const CYCLE_ID = "77777777-7777-4777-8777-777777777777";
+    const cases = [
+      {
+        testcase_id: TESTCASE_ID,
+        external_id: "TC-1",
+        title: "Login works",
+        exec_status: "Passed",
+        duration_ms: 1200,
+        error_message: null,
+        executed_at: "2026-11-26T15:00:00Z",
+        stdout: "ok",
+        stderr: null,
+        target_url: "https://example.com"
+      },
+      {
+        testcase_id: "88888888-8888-4888-8888-888888888888",
+        external_id: "TC-2",
+        title: "Logout fails",
+        exec_status: "Failed",
+        duration_ms: 800,
+        error_message: "Button not found",
+        executed_at: "2026-11-26T15:00:02Z",
+        stdout: null,
+        stderr: "Timeout",
+        target_url: "https://example.com"
+      }
+    ];
+
+    query
+      .mockResolvedValueOnce({ rows: [{ id: CYCLE_ID, name: "Suite Run: Auth", status: "Completed", started_at: null, closed_at: null }] })
+      .mockResolvedValueOnce({ rows: cases })
+      .mockResolvedValueOnce({ rows: [{ id: CYCLE_ID, name: "Suite Run: Auth", status: "Completed", started_at: null, closed_at: null }] })
+      .mockResolvedValueOnce({ rows: cases })
+      .mockResolvedValueOnce({ rows: [{ id: CYCLE_ID, name: "Suite Run: Auth", status: "Completed", started_at: null, closed_at: null }] })
+      .mockResolvedValueOnce({ rows: cases });
+
+    const html = await service.exportCycleReport(USER_ID, PROJECT_ID, CYCLE_ID, "html");
+    expect(html.fileName).toBe("suite-run-auth.html");
+    expect(html.content).toContain("Suite Run: Auth");
+    expect(html.content).toContain("Button not found");
+
+    const json = await service.exportCycleReport(USER_ID, PROJECT_ID, CYCLE_ID, "json");
+    const parsed = JSON.parse(String(json.content));
+    expect(parsed.stats).toMatchObject({ total: 2, expected: 1, unexpected: 1 });
+
+    const junit = await service.exportCycleReport(USER_ID, PROJECT_ID, CYCLE_ID, "junit");
+    expect(junit.fileName).toBe("suite-run-auth.xml");
+    expect(junit.content).toContain('<failure message="Button not found">');
+  });
 });

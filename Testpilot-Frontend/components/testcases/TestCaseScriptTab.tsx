@@ -36,7 +36,7 @@ import {
   type TestScriptStateResponse,
   type TestScriptStatus,
 } from "@/lib/api";
-import { Button, CopyButton, Field, FieldLabel, Input, StatusChip } from "@/components/ui";
+import { Button, CopyButton, Field, FieldLabel, Input, Modal, StatusChip } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { formatDateTime } from "@/lib/date";
 
@@ -89,6 +89,8 @@ export function TestCaseScriptTab({
   const [runMode, setRunMode] = useState<"headless" | "headed">("headless");
   const [launchingRecorder, setLaunchingRecorder] = useState(false);
   const [extensionReady, setExtensionReady] = useState(false);
+  const [showInstallModal, setShowInstallModal] = useState(false);
+  const [checkingExtension, setCheckingExtension] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -267,7 +269,36 @@ export function TestCaseScriptTab({
     }
   }
 
+  const recheckExtension = useCallback(async (): Promise<boolean> => {
+    setCheckingExtension(true);
+    try {
+      const ok = await new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener("message", onPong);
+          resolve(false);
+        }, 600);
+        function onPong(event: MessageEvent) {
+          if (event.source !== window || event.data?.type !== "TESTPILOT_RECORDER_PONG") return;
+          clearTimeout(timeout);
+          window.removeEventListener("message", onPong);
+          resolve(true);
+        }
+        window.addEventListener("message", onPong);
+        window.postMessage({ type: "TESTPILOT_RECORDER_PING" }, "*");
+      });
+      setExtensionReady(ok);
+      if (ok) setShowInstallModal(false);
+      return ok;
+    } finally {
+      setCheckingExtension(false);
+    }
+  }, []);
+
   async function handleRun() {
+    if (!extensionReady && !(await recheckExtension())) {
+      setShowInstallModal(true);
+      return;
+    }
     if (runMode === "headed") {
       await handleDebugInExtension(true);
       return;
@@ -377,6 +408,10 @@ export function TestCaseScriptTab({
   }
 
   async function handleLaunchRecorder() {
+    if (!extensionReady && !(await recheckExtension())) {
+      setShowInstallModal(true);
+      return;
+    }
     const trimmedUrl = targetUrl.trim();
     if (!trimmedUrl) {
       setError("Enter a Target URL below before launching the Web Recorder.");
@@ -446,6 +481,10 @@ export function TestCaseScriptTab({
   }
 
   async function handleDebugInExtension(autoRun = false) {
+    if (!extensionReady && !(await recheckExtension())) {
+      setShowInstallModal(true);
+      return;
+    }
     if (!scriptContent.trim()) {
       setError("Write or record a Playwright spec before debugging.");
       return;
@@ -568,6 +607,18 @@ export function TestCaseScriptTab({
               )}
               {state?.script?.source && (
                 <StatusChip tone="neutral">{state.script.source}</StatusChip>
+              )}
+              {extensionReady ? (
+                <StatusChip tone="success">Extension Connected</StatusChip>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setShowInstallModal(true)}
+                  className="inline-flex items-center"
+                  title="Click to install TestPilot Chrome Extension"
+                >
+                  <StatusChip tone="warning">Extension Required</StatusChip>
+                </button>
               )}
             </div>
             <p className="text-xs text-[var(--muted)]">
@@ -968,6 +1019,53 @@ export function TestCaseScriptTab({
             })}
           </div>
         </div>
+      )}
+      {showInstallModal && (
+        <Modal
+          open={showInstallModal}
+          onClose={() => setShowInstallModal(false)}
+          title="TestPilot Chrome Extension Required"
+        >
+          <div className="space-y-4 text-sm text-[var(--foreground)]">
+            <p className="text-[var(--muted)]">
+              Untuk merekam, debug, atau menjalankan Playwright dari halaman ini, kamu wajib memasang ekstensi{" "}
+              <strong className="text-[var(--foreground)]">TestPilot Web Recorder</strong> di Chrome.
+            </p>
+            <ol className="list-decimal space-y-2 pl-5 text-xs leading-relaxed text-[var(--muted)]">
+              <li>
+                Klik <strong className="text-[var(--foreground)]">Download Extension (.zip)</strong> di bawah lalu ekstrak foldernya.
+              </li>
+              <li>
+                Buka <code className="rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono">chrome://extensions/</code> di Chrome dan aktifkan{" "}
+                <strong className="text-[var(--foreground)]">Developer mode</strong>.
+              </li>
+              <li>
+                Klik <strong className="text-[var(--foreground)]">Load unpacked</strong>, pilih folder hasil ekstrak, lalu klik{" "}
+                <strong className="text-[var(--foreground)]">Re-check Connection</strong> (atau refresh halaman ini).
+              </li>
+            </ol>
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
+              <a
+                href="/downloads/testpilot-web-recorder.zip"
+                download="testpilot-web-recorder.zip"
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-[var(--brand-primary)] px-3 text-xs font-medium text-white transition-opacity hover:opacity-90"
+              >
+                <IconDownload size={14} />
+                Download Extension (.zip)
+              </a>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => void recheckExtension()}
+                disabled={checkingExtension}
+              >
+                {checkingExtension ? <IconLoader2 size={14} className="animate-spin" /> : <IconRefresh size={14} />}
+                Re-check Connection
+              </Button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

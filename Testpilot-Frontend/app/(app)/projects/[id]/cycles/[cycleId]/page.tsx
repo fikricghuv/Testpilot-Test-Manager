@@ -25,6 +25,7 @@ import {
   IconDeviceDesktop,
   IconDownload,
   IconFilterOff,
+  IconLoader2,
   IconPlayerPlay,
   IconPlus,
   IconRefresh,
@@ -50,11 +51,15 @@ import {
   toggleTestRunShare,
   listBugs,
   removeBugLink,
+  getCycleScriptRuns,
+  downloadCycleReport,
+  type CycleReportFormat,
   type TestRunDetail,
   type ExecutionItem,
   type TestCaseListItem,
   type SuiteNode,
   type BugItem,
+  type TestScriptRunRecord,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
 import { formatDate } from "@/lib/date";
@@ -399,6 +404,9 @@ export default function TestRunDetailPage() {
 
   const [run, setRun] = useState<TestRunDetail | null>(null);
   const [executions, setExecutions] = useState<ExecutionItem[]>([]);
+  const [scriptRuns, setScriptRuns] = useState<TestScriptRunRecord[]>([]);
+  const [reportFormat, setReportFormat] = useState<CycleReportFormat>("pdf");
+  const [downloadingReport, setDownloadingReport] = useState(false);
   // Keyed by testcaseId because that is what the remove endpoints take.
   const [selectedRunCaseIds, setSelectedRunCaseIds] = useState<Set<string>>(new Set());
   const [bulkRemoveOpen, setBulkRemoveOpen] = useState(false);
@@ -487,16 +495,59 @@ export default function TestRunDetailPage() {
   const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
-    Promise.all([getTestRun(cycleId), listCycleExecutions(cycleId)])
-      .then(([r, e]) => {
+    Promise.all([
+      getTestRun(cycleId),
+      listCycleExecutions(cycleId),
+      getCycleScriptRuns(projectId, cycleId).catch(() => ({ runs: [] })),
+    ])
+      .then(([r, e, sr]) => {
         setRun(r);
         setExecutions(e);
+        setScriptRuns(sr.runs ?? []);
         setShareEnabled(r.shareEnabled ?? false);
         setShareToken(r.shareToken ?? null);
       })
       .catch(() => router.replace(`/projects/${projectId}/cycles`))
       .finally(() => setLoading(false));
   }, [cycleId, projectId, router]);
+
+  // Auto-poll while Playwright script runs in this cycle are queued or running.
+  const hasActiveScriptRuns = useMemo(
+    () => scriptRuns.some((r) => r.status === "queued" || r.status === "running"),
+    [scriptRuns]
+  );
+
+  useEffect(() => {
+    if (!cycleId || !projectId) return;
+    if (!hasActiveScriptRuns && !(run?.source === "automation" && run?.status === "In Progress")) return;
+    let cancelled = false;
+    const timer = setInterval(() => {
+      Promise.all([
+        getTestRun(cycleId),
+        listCycleExecutions(cycleId),
+        getCycleScriptRuns(projectId, cycleId).catch(() => ({ runs: [] })),
+      ])
+        .then(([r, e, sr]) => {
+          if (cancelled) return;
+          setRun(r);
+          setExecutions(e);
+          setScriptRuns(sr.runs ?? []);
+        })
+        .catch(() => undefined);
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [cycleId, projectId, hasActiveScriptRuns, run?.source, run?.status]);
+
+  const scriptRunByExecutionId = useMemo(() => {
+    const map = new Map<string, TestScriptRunRecord>();
+    for (const sr of scriptRuns) {
+      if (sr.executionId) map.set(sr.executionId, sr);
+    }
+    return map;
+  }, [scriptRuns]);
 
   const { dialog: bugDialog, openBugDialogFor } = useLogBugDialog({
     projectId,
@@ -1178,6 +1229,37 @@ export default function TestRunDetailPage() {
             <h1 className="text-[20px] font-semibold leading-tight tracking-[-0.02em] text-[var(--foreground)]">{run.name}</h1>
             <StatusChip tone={runStatusToTone(run.status)}>{run.status}</StatusChip>
             {ownerName && <MemberAvatar name={ownerName} seed={run.ownerId} size={24} />}
+            {executions.length > 0 && (
+              <div className="ml-auto inline-flex items-center overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)]">
+                <select
+                  value={reportFormat}
+                  onChange={(e) => setReportFormat(e.target.value as CycleReportFormat)}
+                  aria-label="Report format"
+                  className="h-8 bg-transparent px-2 text-xs font-medium text-[var(--foreground)] focus:outline-none"
+                >
+                  <option value="pdf">PDF Report (.pdf)</option>
+                  <option value="html">HTML Report (.html)</option>
+                  <option value="json">Playwright JSON (.json)</option>
+                  <option value="junit">JUnit XML (.xml)</option>
+                </select>
+                <button
+                  type="button"
+                  disabled={downloadingReport}
+                  onClick={async () => {
+                    setDownloadingReport(true);
+                    try {
+                      await downloadCycleReport(projectId, cycleId, reportFormat);
+                    } finally {
+                      setDownloadingReport(false);
+                    }
+                  }}
+                  className="inline-flex h-8 items-center gap-1.5 border-l border-[var(--border)] px-3 text-xs font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-secondary)] disabled:opacity-50"
+                >
+                  {downloadingReport ? <IconLoader2 size={13} className="animate-spin" /> : <IconDownload size={13} />}
+                  Download Report
+                </button>
+              </div>
+            )}
           </div>
           {run.description && <p className="mt-1 text-[13px] text-[var(--muted-soft)]">{run.description}</p>}
           {/*
@@ -1189,6 +1271,33 @@ export default function TestRunDetailPage() {
               <AutomationRunProvenance run={run} />
             </div>
           )}
+          {hasActiveScriptRuns && (() => {
+            const total = scriptRuns.length;
+            const completed = scriptRuns.filter((r) => r.status !== "queued" && r.status !== "running").length;
+            const runningList = scriptRuns.filter((r) => r.status === "running");
+            const activeExec = runningList.length > 0 ? executions.find((ex) => ex.id === runningList[0].executionId) : null;
+            const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+            return (
+              <div className="mt-3 rounded-xl border border-[var(--brand-primary)]/40 bg-[var(--surface)] px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 font-medium text-[var(--foreground)]">
+                    <IconLoader2 size={14} className="animate-spin text-[var(--brand-primary)]" />
+                    <span>
+                      Running Playwright Suite ({completed}/{total} completed)
+                      {activeExec ? ` · Running: ${activeExec.externalId ? `${activeExec.externalId} — ` : ""}${activeExec.title}` : " · Waiting for worker..."}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[11px] text-[var(--muted)]">{pct}% (auto-refreshing)</span>
+                </div>
+                <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[var(--surface-secondary)]">
+                  <div
+                    className="h-full rounded-full bg-[var(--brand-primary)] transition-all duration-300"
+                    style={{ width: `${Math.max(4, pct)}%` }}
+                  />
+                </div>
+              </div>
+            );
+          })()}
           <div className="mt-2">
             <DateRangeSummary startDate={run.startDate} dueDate={run.dueDate} dueState={run.dueState} />
           </div>
@@ -1537,6 +1646,26 @@ export default function TestRunDetailPage() {
                             ) : (
                               <StatusChip tone={statusToTone(e.status)}>{e.status}</StatusChip>
                             )}
+                            {(() => {
+                              const sr = scriptRunByExecutionId.get(e.id);
+                              if (!sr) return null;
+                              if (sr.status === "running") {
+                                return (
+                                  <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-[var(--brand-primary)]/15 px-2 py-0.5 text-[10.5px] font-medium text-[var(--brand-primary)]">
+                                    <IconLoader2 size={11} className="animate-spin" />
+                                    Running...
+                                  </span>
+                                );
+                              }
+                              if (sr.status === "queued") {
+                                return (
+                                  <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-[var(--surface-secondary)] px-2 py-0.5 text-[10.5px] text-[var(--muted)]">
+                                    Queued
+                                  </span>
+                                );
+                              }
+                              return null;
+                            })()}
                           </div>
                         </td>
                       </tr>

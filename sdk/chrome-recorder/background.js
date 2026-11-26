@@ -56,7 +56,16 @@ function parsePlaywrightSpecToDebugSteps(scriptContent, fallbackUrl) {
   for (let i = 0; i < rawLines.length; i++) {
     const lineNum = i + 1;
     const trimmed = rawLines[i].trim();
-    if (!trimmed || trimmed.startsWith("//") || trimmed.startsWith("import ") || trimmed.startsWith("test(") || trimmed === "});" || trimmed === "}") {
+    if (
+      !trimmed ||
+      trimmed.startsWith("//") ||
+      trimmed.startsWith("import ") ||
+      trimmed.startsWith("test(") ||
+      trimmed.startsWith("await test.step(") ||
+      trimmed.startsWith("test.step(") ||
+      trimmed === "});" ||
+      trimmed === "}"
+    ) {
       continue;
     }
     if (!buffer) bufferStartLine = lineNum;

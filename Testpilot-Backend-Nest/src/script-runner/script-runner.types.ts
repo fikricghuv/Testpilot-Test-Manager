@@ -81,6 +81,19 @@ export interface TriggerScriptRunInput {
   targetUrl?: string | null;
 }
 
+export interface TriggerSuiteRunInput {
+  onlyVerified?: boolean;
+  targetUrl?: string | null;
+}
+
+export interface SuiteRunResponse {
+  cycleId: string;
+  suiteId: string;
+  suiteName: string;
+  queuedCount: number;
+  runs: TestScriptRunRecord[];
+}
+
 export interface ScriptRunnerJobPayload {
   runId: string;
 }

@@ -4838,6 +4838,68 @@ export async function runTestCaseScript(
   });
 }
 
+export interface SuiteScriptRunResponse {
+  cycleId: string;
+  suiteId: string;
+  suiteName: string;
+  queuedCount: number;
+  runs: TestScriptRunRecord[];
+}
+
+export async function runSuiteScripts(
+  projectId: string,
+  suiteId: string,
+  data?: { onlyVerified?: boolean; targetUrl?: string | null }
+): Promise<SuiteScriptRunResponse> {
+  return api<SuiteScriptRunResponse>(`/api/projects/${projectId}/suites/${suiteId}/script/run`, {
+    method: "POST",
+    body: data ?? {},
+  });
+}
+
+export async function getCycleScriptRuns(
+  projectId: string,
+  cycleId: string
+): Promise<{ runs: TestScriptRunRecord[] }> {
+  return api<{ runs: TestScriptRunRecord[] }>(`/api/projects/${projectId}/cycles/${cycleId}/script-runs`);
+}
+
+export type CycleReportFormat = "pdf" | "html" | "json" | "junit";
+
+export async function downloadCycleReport(
+  projectId: string,
+  cycleId: string,
+  format: CycleReportFormat
+): Promise<void> {
+  const token = typeof window !== "undefined" ? readStoredValue("token") : null;
+  const res = await fetch(
+    `${API_BASE}/api/projects/${projectId}/cycles/${cycleId}/report?format=${encodeURIComponent(format)}`,
+    {
+      method: "GET",
+      credentials: "include",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+    }
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(errText || `Failed to download report (${res.status}).`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = disposition.match(/filename="([^"]+)"/i);
+  const ext = format === "junit" ? "xml" : format;
+  const fileName = match?.[1] || `testpilot-report.${ext}`;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 export async function getTestCaseScriptRun(
   projectId: string,
   testcaseId: string,

@@ -1,7 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Req } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, Req, Res } from "@nestjs/common";
+import type { Response } from "express";
 import type { AuthenticatedRequest } from "../common/request.types";
 import { ScriptRunnerService } from "./script-runner.service";
-import type { TriggerScriptRunInput, UpsertTestScriptInput } from "./script-runner.types";
+import type { TriggerScriptRunInput, TriggerSuiteRunInput, UpsertTestScriptInput } from "./script-runner.types";
 
 @Controller()
 export class ScriptRunnerController {
@@ -72,6 +73,39 @@ export class ScriptRunnerController {
     @Body() body: TriggerScriptRunInput
   ) {
     return this.scriptRunner.triggerRun(req.userId, projectId, testcaseId, body || {});
+  }
+
+  @Post("/api/projects/:projectId/suites/:suiteId/script/run")
+  triggerSuiteRun(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("suiteId") suiteId: string,
+    @Body() body: TriggerSuiteRunInput
+  ) {
+    return this.scriptRunner.triggerSuiteRun(req.userId, projectId, suiteId, body || {});
+  }
+
+  @Get("/api/projects/:projectId/cycles/:cycleId/script-runs")
+  getCycleScriptRuns(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("cycleId") cycleId: string
+  ) {
+    return this.scriptRunner.getCycleScriptRuns(req.userId, projectId, cycleId);
+  }
+
+  @Get("/api/projects/:projectId/cycles/:cycleId/report")
+  async downloadCycleReport(
+    @Req() req: AuthenticatedRequest,
+    @Res() res: Response,
+    @Param("projectId") projectId: string,
+    @Param("cycleId") cycleId: string,
+    @Query("format") format?: string
+  ) {
+    const report = await this.scriptRunner.exportCycleReport(req.userId, projectId, cycleId, format);
+    res.setHeader("Content-Type", report.contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${report.fileName}"`);
+    return res.send(report.content);
   }
 
   @Get("/api/projects/:projectId/testcases/:testcaseId/script/runs/:runId")

@@ -647,13 +647,14 @@ export class AutomationAgentsService {
     const testTitle = tc.external_id ? `[${tc.external_id}] ${tc.title}` : String(tc.title || "Generated test");
     const systemPrompt = [
       "You are the TestPilot Playwright Generator Agent.",
-      "Write a complete, runnable `@playwright/test` TypeScript spec file.",
-      "STRICT RULES:",
+      "Write a complete, runnable `@playwright/test` TypeScript spec file following official Playwright best practices (playwright.dev/docs/best-practices):",
       "1. Output ONLY valid TypeScript code (no markdown explanation).",
       "2. Import `{ test, expect } from \"@playwright/test\";`.",
-      "3. ONLY use locators verified in the Planner output or `interactiveElements`. Do NOT invent `data-testid` or CSS IDs.",
-      "4. Avoid strict mode violations: if `getByText` could match multiple elements, prefer `getByRole`, `locator('#id')`, or `.first()`.",
-      "5. Include explicit `expect(...)` assertions matching the expected result."
+      "3. GROUNDING: ONLY use locators verified in the Planner output or `interactiveElements`. Never invent `data-testid` or CSS IDs.",
+      "4. USER-FACING LOCATORS & STRICT MODE: Prefer `getByRole`, `getByLabel`, `getByPlaceholder`, `getByTestId`; use `.filter({ hasText })` or chaining for repeated items; avoid strict mode violations (`.first()` only if truly ambiguous).",
+      "5. WEB-FIRST ASSERTIONS ONLY: Always use auto-retrying assertions like `await expect(locator).toBeVisible()`, `toContainText()`, `toHaveValue()`, `toHaveURL()`. NEVER use `expect(await locator.textContent()).toBe(...)` or `page.$()` / `elementHandle()`.",
+      "6. NO HARD SLEEPS: NEVER use `page.waitForTimeout(...)`. Rely on Playwright auto-waiting and web-first assertions.",
+      "7. STRUCTURE: Group logical test phases with `await test.step('...', async () => { ... });` for clear trace reporting."
     ].join("\n");
 
     const userPrompt = [
@@ -677,11 +678,11 @@ export class AutomationAgentsService {
   ): Promise<string> {
     const systemPrompt = [
       "You are the TestPilot Playwright Healer Agent.",
-      "Fix the failing Playwright TypeScript test using the actual failure error and live page ARIA snapshot.",
-      "STRICT RULES:",
+      "Fix the failing Playwright TypeScript test using the actual failure error and live page ARIA snapshot while strictly following Playwright best practices:",
       "1. Output ONLY the full corrected TypeScript spec (no prose).",
-      "2. Fix strict mode violations, wrong locators, or timing/navigation waits using ONLY elements present in the ARIA snapshot or verified elements.",
-      "3. Keep the test intent faithful to the test case."
+      "2. Fix strict mode violations, wrong locators, or timing issues using ONLY elements present in the ARIA snapshot or verified elements.",
+      "3. NEVER insert `page.waitForTimeout(...)`, `page.$()`, or non-retrying `expect(await ...)` assertions — use web-first `await expect(locator)...` and `.filter({ hasText })`.",
+      "4. Keep `await test.step(...)` structure and stay faithful to the test case intent."
     ].join("\n");
 
     const userPrompt = [
