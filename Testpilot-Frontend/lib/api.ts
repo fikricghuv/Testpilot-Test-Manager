@@ -4571,6 +4571,53 @@ export async function getExecutionApiEvidence(
   );
 }
 
+export interface TraceStepSummary {
+  callId: string;
+  apiName: string;
+  selector: string | null;
+  line: number | null;
+  startTime: number;
+  endTime: number | null;
+  durationMs: number | null;
+  status: "passed" | "failed";
+  error: string | null;
+  point: { x: number; y: number } | null;
+  params: Record<string, unknown> | null;
+  beforeFrameDataUrl: string | null;
+  frameDataUrl: string | null;
+}
+
+export interface TraceFilmstripFrame {
+  timestamp: number;
+  offsetMs: number;
+  frameDataUrl: string;
+}
+
+export interface ExecutionTraceSummary {
+  fileName: string;
+  metadata: {
+    browserName: string | null;
+    baseUrl: string | null;
+    viewport: { width: number; height: number } | null;
+    totalDurationMs: number | null;
+  };
+  filmstrip: TraceFilmstripFrame[];
+  steps: TraceStepSummary[];
+  console: Array<{ level: string; text: string; time: number | null }>;
+  network: Array<{ method: string; url: string; status: number | null; statusText: string | null; durationMs: number | null }>;
+  errors: Array<{ message: string; stack: string | null }>;
+}
+
+export async function getExecutionTraceSummary(
+  cycleId: string,
+  executionId: string,
+  attachmentId: string
+): Promise<ExecutionTraceSummary> {
+  return api<ExecutionTraceSummary>(
+    `/api/cycles/${cycleId}/executions/${executionId}/attachments/${attachmentId}/trace-summary`
+  );
+}
+
 /** The URL the viewer fetches: our API, redeeming the signed token, with CORS for that one origin. */
 export function publicTraceUrl(token: string): string {
   return `${API_BASE}/api/public/trace/${token}`;
@@ -4675,7 +4722,7 @@ export async function disconnectTelegramIntegration(projectId: string): Promise<
 // ─── Test Case Automation Scripts (Playwright) ───────────────────────────────
 export type TestScriptFramework = "playwright-ts";
 export type TestScriptStatus = "draft" | "verified" | "archived";
-export type TestScriptSource = "manual" | "zyra" | "healer";
+export type TestScriptSource = "manual" | "zyra" | "healer" | "recorder";
 export type TestScriptRunStatus = "queued" | "running" | "passed" | "failed" | "error" | "cancelled";
 
 export interface TestScriptRecord {
@@ -4797,4 +4844,23 @@ export async function getTestCaseScriptRun(
   runId: string
 ): Promise<{ run: TestScriptRunRecord }> {
   return api<{ run: TestScriptRunRecord }>(`/api/projects/${projectId}/testcases/${testcaseId}/script/runs/${runId}`);
+}
+
+export interface RecorderSessionResponse {
+  token: string;
+  expiresAt: string | null;
+  projectId: string;
+  testcaseId: string;
+  testcaseTitle: string;
+  testcaseExternalId: string | null;
+}
+
+export async function createTestCaseRecorderSession(
+  projectId: string,
+  testcaseId: string
+): Promise<RecorderSessionResponse> {
+  return api<RecorderSessionResponse>(
+    `/api/projects/${projectId}/testcases/${testcaseId}/script/recorder-session`,
+    { method: "POST", body: {} }
+  );
 }

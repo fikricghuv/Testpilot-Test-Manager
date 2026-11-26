@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "TestPilot Web Recorder",
+  "version": "1.0.0",
+  "description": "Record precise Playwright TypeScript tests directly from Chrome into TestPilot Test Manager.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TestPilot Web Recorder"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/bridge.js"],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/locator.js", "content/recorder.js", "content/debugger.js", "content/modal.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

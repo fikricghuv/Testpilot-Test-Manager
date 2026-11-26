@@ -55,6 +55,15 @@ export class ScriptRunnerController {
     return this.scriptRunner.deleteScript(req.userId, projectId, testcaseId);
   }
 
+  @Post("/api/projects/:projectId/testcases/:testcaseId/script/recorder-session")
+  createRecorderSession(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string
+  ) {
+    return this.scriptRunner.issueRecorderSession(req.userId, projectId, testcaseId);
+  }
+
   @Post("/api/projects/:projectId/testcases/:testcaseId/script/run")
   triggerRun(
     @Req() req: AuthenticatedRequest,

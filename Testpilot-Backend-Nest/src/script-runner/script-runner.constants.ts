@@ -3,7 +3,7 @@ export const SCRIPT_RUNNER_JOB = "run-playwright-script";
 
 export const SCRIPT_FRAMEWORKS = ["playwright-ts"] as const;
 export const SCRIPT_STATUSES = ["draft", "verified", "archived"] as const;
-export const SCRIPT_SOURCES = ["manual", "zyra", "healer"] as const;
+export const SCRIPT_SOURCES = ["manual", "zyra", "healer", "recorder"] as const;
 export const SCRIPT_RUN_STATUSES = ["queued", "running", "passed", "failed", "error", "cancelled"] as const;
 
 export const MAX_SCRIPT_CONTENT_LENGTH = 200_000;

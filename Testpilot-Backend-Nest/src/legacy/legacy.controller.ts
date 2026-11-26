@@ -4,8 +4,10 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
   MessageEvent,
   NotImplementedException,
+  Options,
   Param,
   Patch,
   Post,
@@ -782,6 +784,16 @@ export class LegacyController {
     return this.legacy.createExecutionTraceLink(cycleId, req.userId, executionId, attachmentId);
   }
 
+  @Get("/api/cycles/:cycleId/executions/:executionId/attachments/:attachmentId/trace-summary")
+  getExecutionTraceSummary(
+    @Req() req: AuthenticatedRequest,
+    @Param("cycleId") cycleId: string,
+    @Param("executionId") executionId: string,
+    @Param("attachmentId") attachmentId: string
+  ) {
+    return this.legacy.getExecutionTraceSummary(cycleId, req.userId, executionId, attachmentId);
+  }
+
   /**
    * Serves one trace archive to a holder of a valid link. Unauthenticated by design — see
    * createExecutionTraceLink in the service for why, and for what keeps the grant narrow.
@@ -791,12 +803,24 @@ export class LegacyController {
    * has none. Evidence is capped at MAX_EVIDENCE_FILE_SIZE (25 MB by default), so buffering one
    * trace is bounded.
    */
+  @Options("/api/public/trace/:token")
+  @HttpCode(204)
+  publicTracePreflight(@Res() res: Response) {
+    res.setHeader("Access-Control-Allow-Origin", "https://trace.playwright.dev");
+    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
+    res.setHeader("Vary", "Origin, Access-Control-Request-Private-Network");
+    return res.send();
+  }
+
   @Get("/api/public/trace/:token")
   async publicTrace(@Res() res: Response, @Param("token") token: string) {
     const trace = await this.legacy.getPublicTraceContent(token);
     // The viewer is a fixed, known origin, so it is named rather than wildcarded. No credentials
     // are involved either way — the token is the authorization.
     res.setHeader("Access-Control-Allow-Origin", "https://trace.playwright.dev");
+    res.setHeader("Access-Control-Allow-Private-Network", "true");
     res.setHeader("Vary", "Origin");
     res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     res.setHeader("Content-Type", "application/zip");

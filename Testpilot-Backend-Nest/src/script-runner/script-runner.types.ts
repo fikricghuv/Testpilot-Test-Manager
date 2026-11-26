@@ -65,6 +65,16 @@ export interface UpsertTestScriptInput {
   status?: ScriptStatus;
   source?: ScriptSource;
   notes?: string | null;
+  verifiedLocators?: Record<string, string>;
+}
+
+export interface RecorderSessionResponse {
+  token: string;
+  expiresAt: string | null;
+  projectId: string;
+  testcaseId: string;
+  testcaseTitle: string;
+  testcaseExternalId: string | null;
 }
 
 export interface TriggerScriptRunInput {

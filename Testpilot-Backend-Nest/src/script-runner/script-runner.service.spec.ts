@@ -32,9 +32,21 @@ function createMocks() {
   const storage = {
     put: jest.fn().mockResolvedValue(undefined)
   };
+  const apiTokens = {
+    issueToken: jest.fn().mockResolvedValue({
+      id: "tok-1",
+      name: "recorder:TC-1",
+      scopes: ["read", "write"],
+      tokenPrefix: "tsbo_…123456",
+      lastUsedAt: null,
+      createdAt: "2026-11-26T10:00:00Z",
+      expiresAt: "2026-11-27T10:00:00Z",
+      token: "tsbo_recorder_secret"
+    })
+  };
 
-  const service = new ScriptRunnerService(db as any, legacy as any, storage as any, queue as any);
-  return { service, db, query, clientQuery, legacy, storage, queue };
+  const service = new ScriptRunnerService(db as any, legacy as any, storage as any, queue as any, apiTokens as any);
+  return { service, db, query, clientQuery, legacy, storage, queue, apiTokens };
 }
 
 describe("ScriptRunnerService", () => {
@@ -302,6 +314,35 @@ describe("ScriptRunnerService", () => {
       durationMs: 12,
       request: { headers: [], body: null },
       response: { headers: [], body: '{"ok":true}' }
+    });
+  });
+
+  it("issues a scoped recorder session token after reclaiming prior recorder tokens", async () => {
+    const { service, query, apiTokens } = createMocks();
+    query
+      .mockResolvedValueOnce({ rows: [{ id: TESTCASE_ID, title: "Login", external_id: "TC-1" }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const res = await service.issueRecorderSession(USER_ID, PROJECT_ID, TESTCASE_ID);
+
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("DELETE FROM api_tokens"),
+      [PROJECT_ID, USER_ID]
+    );
+    expect(apiTokens.issueToken).toHaveBeenCalledWith(
+      USER_ID,
+      PROJECT_ID,
+      "recorder:TC-1",
+      ["read", "write"],
+      1
+    );
+    expect(res).toEqual({
+      token: "tsbo_recorder_secret",
+      expiresAt: "2026-11-27T10:00:00Z",
+      projectId: PROJECT_ID,
+      testcaseId: TESTCASE_ID,
+      testcaseTitle: "Login",
+      testcaseExternalId: "TC-1"
     });
   });
 });

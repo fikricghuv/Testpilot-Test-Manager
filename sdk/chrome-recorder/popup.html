@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body {
+      width: 320px;
+      margin: 0;
+      padding: 14px;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+      font-size: 12px;
+    }
+    h1 { font-size: 14px; margin: 0 0 4px; }
+    p { margin: 0 0 12px; color: #9ca3af; font-size: 11px; line-height: 1.4; }
+    label { display: block; margin-bottom: 4px; color: #d1d5db; font-weight: 500; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      margin-bottom: 10px;
+      border-radius: 6px;
+      border: 1px solid #374151;
+      background: #1f2937;
+      color: #f9fafb;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      background: #6366f1;
+      color: #ffffff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #4f46e5; }
+    #status { margin-top: 8px; font-size: 11px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <h1>TestPilot Web Recorder</h1>
+  <p>Gunakan tombol <strong>Record with Extension</strong> di TestPilot, atau isi manual di bawah untuk merekam tab aktif.</p>
+  <label>API Base URL</label>
+  <input id="apiBaseUrl" placeholder="http://localhost:3001" />
+  <label>Project ID (UUID)</label>
+  <input id="projectId" placeholder="41dba2a2-..." />
+  <label>Test Case ID (UUID)</label>
+  <input id="testcaseId" placeholder="22222222-..." />
+  <label>Project API Token (tsbo_...)</label>
+  <input id="token" type="password" placeholder="tsbo_..." />
+  <button id="startBtn">Start Recording on Current Tab</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

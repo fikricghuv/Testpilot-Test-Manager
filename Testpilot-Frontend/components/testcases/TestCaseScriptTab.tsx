@@ -3,17 +3,21 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  IconBug,
   IconCode,
   IconDeviceFloppy,
   IconDownload,
   IconHistory,
   IconLoader2,
   IconPlayerPlay,
+  IconPlayerRecord,
   IconRefresh,
   IconTrash,
 } from "@tabler/icons-react";
 import {
+  API_BASE,
   activateTestCaseScriptVersion,
+  createTestCaseRecorderSession,
   deleteTestCaseScript,
   deleteTestCaseScriptVersion,
   getTestCaseScript,
@@ -56,6 +60,14 @@ function runStatusTone(status: TestScriptRunRecord["status"]) {
   return "neutral" as const;
 }
 
+function parsePlaywrightErrorLine(errorMessage?: string | null): number | null {
+  if (!errorMessage) return null;
+  const match = errorMessage.match(/test\.spec\.ts:(\d+):\d+/);
+  if (!match) return null;
+  const line = Number(match[1]);
+  return Number.isInteger(line) && line > 0 ? line : null;
+}
+
 export function TestCaseScriptTab({
   projectId,
   testcaseId,
@@ -66,6 +78,8 @@ export function TestCaseScriptTab({
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [launchingRecorder, setLaunchingRecorder] = useState(false);
+  const [extensionReady, setExtensionReady] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -78,6 +92,7 @@ export function TestCaseScriptTab({
 
   const [activeRun, setActiveRun] = useState<TestScriptRunRecord | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -129,6 +144,35 @@ export function TestCaseScriptTab({
       stopPolling();
     };
   }, [projectId, testcaseId, applyLoadedState, stopPolling]);
+
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (event.source !== window || !event.data || typeof event.data !== "object") return;
+      if (event.data.type === "TESTPILOT_RECORDER_PONG") {
+        setExtensionReady(true);
+      } else if (
+        event.data.type === "TESTPILOT_RECORDER_SAVED" &&
+        event.data.projectId === projectId &&
+        event.data.testcaseId === testcaseId
+      ) {
+        void loadScript();
+      }
+    }
+    function onFocusOrVisible() {
+      if (document.visibilityState === "visible" && !dirty) {
+        void loadScript();
+      }
+    }
+    window.addEventListener("message", onMessage);
+    window.addEventListener("focus", onFocusOrVisible);
+    document.addEventListener("visibilitychange", onFocusOrVisible);
+    window.postMessage({ type: "TESTPILOT_RECORDER_PING" }, "*");
+    return () => {
+      window.removeEventListener("message", onMessage);
+      window.removeEventListener("focus", onFocusOrVisible);
+      document.removeEventListener("visibilitychange", onFocusOrVisible);
+    };
+  }, [projectId, testcaseId, dirty, loadScript]);
 
   useEffect(() => {
     if (!activeRun || (activeRun.status !== "queued" && activeRun.status !== "running")) {
@@ -256,6 +300,141 @@ export function TestCaseScriptTab({
     }
   }
 
+  async function handleLaunchRecorder() {
+    const trimmedUrl = targetUrl.trim();
+    if (!trimmedUrl) {
+      setError("Enter a Target URL below before launching the Web Recorder.");
+      return;
+    }
+    try {
+      const parsed = new URL(trimmedUrl);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        setError("Target URL must use http:// or https://.");
+        return;
+      }
+    } catch {
+      setError("Target URL must be a valid URL (e.g. https://staging.example.com).");
+      return;
+    }
+
+    setLaunchingRecorder(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const session = await createTestCaseRecorderSession(projectId, testcaseId);
+      const ack = await new Promise<{ ok: boolean; error?: string | null }>((resolve) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener("message", handleAck);
+          resolve({
+            ok: false,
+            error: "TestPilot Web Recorder extension not detected. Load sdk/chrome-recorder in chrome://extensions and reload this page.",
+          });
+        }, 1200);
+
+        function handleAck(event: MessageEvent) {
+          if (event.source !== window || event.data?.type !== "TESTPILOT_START_RECORDING_ACK") return;
+          clearTimeout(timeout);
+          window.removeEventListener("message", handleAck);
+          resolve({ ok: Boolean(event.data.ok), error: event.data.error });
+        }
+
+        window.addEventListener("message", handleAck);
+        window.postMessage(
+          {
+            type: "TESTPILOT_START_RECORDING",
+            payload: {
+              apiBaseUrl: API_BASE,
+              token: session.token,
+              projectId: session.projectId,
+              testcaseId: session.testcaseId,
+              testcaseTitle: session.testcaseTitle,
+              testcaseExternalId: session.testcaseExternalId,
+              targetUrl: trimmedUrl,
+            },
+          },
+          "*"
+        );
+      });
+
+      if (!ack.ok) {
+        setError(ack.error || "Failed to launch Web Recorder.");
+        return;
+      }
+      setExtensionReady(true);
+      setSuccess("Web Recorder opened in a new tab. Click Save & Run in the floating modal when done.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start Web Recorder session.");
+    } finally {
+      setLaunchingRecorder(false);
+    }
+  }
+
+  async function handleDebugInExtension() {
+    if (!scriptContent.trim()) {
+      setError("Write or record a Playwright spec before debugging.");
+      return;
+    }
+    setLaunchingRecorder(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const ack = await new Promise<{ ok: boolean; error?: string | null }>((resolve) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener("message", handleAck);
+          resolve({
+            ok: false,
+            error: "TestPilot Chrome extension not detected. Load sdk/chrome-recorder in chrome://extensions and reload this page.",
+          });
+        }, 1200);
+
+        function handleAck(event: MessageEvent) {
+          if (event.source !== window || event.data?.type !== "TESTPILOT_START_DEBUG_ACK") return;
+          clearTimeout(timeout);
+          window.removeEventListener("message", handleAck);
+          resolve({ ok: Boolean(event.data.ok), error: event.data.error });
+        }
+
+        window.addEventListener("message", handleAck);
+        window.postMessage(
+          {
+            type: "TESTPILOT_START_DEBUG",
+            payload: {
+              testcaseId,
+              testcaseTitle,
+              testcaseExternalId,
+              targetUrl: targetUrl.trim() || null,
+              scriptContent,
+            },
+          },
+          "*"
+        );
+      });
+
+      if (!ack.ok) {
+        setError(ack.error || "Failed to launch Step-by-Step Debugger.");
+        return;
+      }
+      setExtensionReady(true);
+      setSuccess("Step-by-Step Debugger opened in a new Chrome tab.");
+    } finally {
+      setLaunchingRecorder(false);
+    }
+  }
+
+  function jumpToLine(lineNumber: number) {
+    const el = textareaRef.current;
+    if (!el) return;
+    const lines = scriptContent.split("\n");
+    const targetIdx = Math.max(0, Math.min(lineNumber - 1, lines.length - 1));
+    let start = 0;
+    for (let i = 0; i < targetIdx; i += 1) {
+      start += lines[i].length + 1;
+    }
+    const end = start + lines[targetIdx].length;
+    el.focus();
+    el.setSelectionRange(start, end);
+  }
+
   function handleDownload() {
     if (!scriptContent.trim()) return;
     const slug = (testcaseExternalId || testcaseId).replace(/[^a-zA-Z0-9_-]+/g, "-").toLowerCase();
@@ -317,6 +496,32 @@ export function TestCaseScriptTab({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleLaunchRecorder}
+            disabled={launchingRecorder}
+            title={extensionReady ? "Chrome extension connected" : "Requires sdk/chrome-recorder Chrome extension"}
+          >
+            {launchingRecorder ? (
+              <IconLoader2 size={14} className="animate-spin" />
+            ) : (
+              <IconPlayerRecord size={14} className={extensionReady ? "text-[var(--error)]" : undefined} />
+            )}
+            {launchingRecorder ? "Launching..." : "Record with Extension"}
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={handleDebugInExtension}
+            disabled={launchingRecorder || !scriptContent.trim()}
+            title="Step through each Playwright line in Chrome"
+          >
+            <IconBug size={14} />
+            Debug in Extension
+          </Button>
           {!scriptContent.trim() && (
             <Button
               type="button"
@@ -395,8 +600,20 @@ export function TestCaseScriptTab({
 
       {/* Code editor */}
       <Field>
-        <FieldLabel>Playwright Spec Code</FieldLabel>
+        <div className="flex items-center justify-between gap-2">
+          <FieldLabel>Playwright Spec Code</FieldLabel>
+          {activeRun && parsePlaywrightErrorLine(activeRun.errorMessage) && (
+            <button
+              type="button"
+              onClick={() => jumpToLine(parsePlaywrightErrorLine(activeRun.errorMessage)!)}
+              className="text-xs font-medium text-[var(--error-foreground)] underline hover:opacity-80"
+            >
+              Jump to failing line {parsePlaywrightErrorLine(activeRun.errorMessage)}
+            </button>
+          )}
+        </div>
         <textarea
+          ref={textareaRef}
           value={scriptContent}
           onChange={(e) => {
             setScriptContent(e.target.value);

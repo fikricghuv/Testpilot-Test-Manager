@@ -20,6 +20,7 @@ import { ChangedField, summarizeDocumentChange } from "../common/text-diff.util"
 import { validatePersonName } from "../common/person-name.util";
 import { canonicalizeImportValue, EXPORT_LOCALES, ExportLocale } from "../common/export-i18n";
 import { detectScriptLanguage } from "../common/script-language";
+import { parsePlaywrightTraceArchive } from "../common/playwright-trace.parser";
 import { writeNotifications } from "./notification-writer";
 import {
   DEFAULT_TELEGRAM_EVENTS,
@@ -9313,6 +9314,36 @@ export class LegacyService implements OnModuleInit {
       throw new NotFoundException({ error: "File content is not available" });
     }
     return { buffer: await this.storage.getBuffer(file.storage_path), fileName: String(file.file_name) };
+  }
+
+  async getExecutionTraceSummary(
+    cycleId: string,
+    userId: string | null | undefined,
+    executionId: string,
+    attachmentId: string
+  ) {
+    const uid = this.requireUser(userId);
+    const execution = await this.executionOwner(cycleId, executionId);
+    await this.requireProjectAccess(uid, String(execution.project_id));
+    if (!isUuid(attachmentId)) throw new NotFoundException({ error: "Attachment not found" });
+    const res = await this.db.query(
+      `SELECT id, file_name, content_type, evidence_kind, storage_path FROM attachments
+        WHERE id = $1 AND entity_type = 'execution' AND entity_id = $2 AND project_id = $3 AND deleted_at IS NULL`,
+      [attachmentId, executionId, execution.project_id]
+    );
+    const file = res.rows[0];
+    if (!file) throw new NotFoundException({ error: "Attachment not found" });
+    if (!LegacyService.isTraceArchive(file)) {
+      throw new BadRequestException({ error: "This attachment is not a Playwright trace" });
+    }
+    if (!file.storage_path || !(await this.storage.exists(file.storage_path))) {
+      throw new NotFoundException({ error: "File content is not available" });
+    }
+    const zipBuffer = await this.storage.getBuffer(file.storage_path);
+    return {
+      fileName: String(file.file_name),
+      ...parsePlaywrightTraceArchive(zipBuffer)
+    };
   }
 
   async listExecutionAttachments(cycleId: string, userId: string | null | undefined, executionId: string) {

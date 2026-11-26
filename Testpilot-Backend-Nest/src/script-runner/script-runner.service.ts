@@ -1,5 +1,12 @@
 import { InjectQueue } from "@nestjs/bullmq";
-import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+  ServiceUnavailableException
+} from "@nestjs/common";
 import type { Queue } from "bullmq";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -8,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as zlib from "node:zlib";
+import { ApiTokenService } from "../auth/api-token.service";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
 import { StorageService } from "../storage/storage.service";
@@ -22,6 +30,7 @@ import {
   SCRIPT_STATUSES
 } from "./script-runner.constants";
 import type {
+  RecorderSessionResponse,
   ScriptFramework,
   ScriptRunnerJobPayload,
   ScriptSource,
@@ -124,7 +133,8 @@ export class ScriptRunnerService {
     private readonly db: DatabaseService,
     private readonly legacy: LegacyService,
     private readonly storage: StorageService,
-    @InjectQueue(SCRIPT_RUNNER_QUEUE) private readonly queue: Queue<ScriptRunnerJobPayload>
+    @InjectQueue(SCRIPT_RUNNER_QUEUE) private readonly queue: Queue<ScriptRunnerJobPayload>,
+    @Optional() private readonly apiTokens?: ApiTokenService
   ) {}
 
   private async assertTestCaseInProject(projectId: string, testcaseId: string): Promise<{ id: string; title: string; externalId: string | null }> {
@@ -215,6 +225,17 @@ export class ScriptRunnerService {
 
     const targetUrl = validateTargetUrl(input.targetUrl);
     const notes = typeof input.notes === "string" && input.notes.trim() ? input.notes.trim().slice(0, 500) : null;
+    const verifiedLocators: Record<string, string> = {};
+    if (input.verifiedLocators && typeof input.verifiedLocators === "object" && !Array.isArray(input.verifiedLocators)) {
+      let count = 0;
+      for (const [key, val] of Object.entries(input.verifiedLocators)) {
+        if (count >= 200) break;
+        if (typeof key === "string" && typeof val === "string" && key.trim() && val.trim()) {
+          verifiedLocators[key.trim().slice(0, 200)] = val.trim().slice(0, 500);
+          count += 1;
+        }
+      }
+    }
 
     await this.db.transaction(async (client) => {
       const existingRes = await client.query<{ id: string }>(
@@ -240,10 +261,10 @@ export class ScriptRunnerService {
       const nextVersion = (maxVerRes.rows[0]?.max_ver ?? 0) + 1;
 
       const verRes = await client.query<{ id: string }>(
-        `INSERT INTO test_script_versions (script_id, version, script_content, source, notes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO test_script_versions (script_id, version, script_content, source, notes, verified_locators, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
          RETURNING id`,
-        [scriptId, nextVersion, scriptContent, source, notes, uid]
+        [scriptId, nextVersion, scriptContent, source, notes, JSON.stringify(verifiedLocators), uid]
       );
       const versionId = verRes.rows[0].id;
 
@@ -364,6 +385,38 @@ export class ScriptRunnerService {
       [projectId, testcaseId]
     );
     return { deleted: (res.rowCount ?? 0) > 0 };
+  }
+
+  async issueRecorderSession(
+    userId: string | null | undefined,
+    projectId: string,
+    testcaseId: string
+  ): Promise<RecorderSessionResponse> {
+    const uid = this.legacy.requireSession(userId);
+    await this.legacy.requireProjectAccess(uid, projectId);
+    const tc = await this.assertTestCaseInProject(projectId, testcaseId);
+
+    if (!this.apiTokens) {
+      throw new ServiceUnavailableException({ error: "Recorder token service is unavailable." });
+    }
+
+    // Reclaim any prior recorder tokens for this user+project so repeated sessions never exhaust the project cap.
+    await this.db.query(
+      `DELETE FROM api_tokens WHERE project_id = $1::uuid AND user_id = $2::uuid AND name LIKE 'recorder:%'`,
+      [projectId, uid]
+    );
+
+    const tokenLabel = `recorder:${tc.externalId || testcaseId.slice(0, 8)}`;
+    const issued = await this.apiTokens.issueToken(uid, projectId, tokenLabel, ["read", "write"], 1);
+
+    return {
+      token: issued.token,
+      expiresAt: issued.expiresAt,
+      projectId,
+      testcaseId,
+      testcaseTitle: tc.title,
+      testcaseExternalId: tc.externalId
+    };
   }
 
   async triggerRun(
@@ -515,7 +568,7 @@ export class ScriptRunnerService {
         `  outputDir: ${JSON.stringify(resultsDir)},`,
         `  timeout: ${SCRIPT_EXECUTION_TIMEOUT_MS},`,
         `  reporter: [["list"]],`,
-        `  use: { headless: true, ${baseUrlLine} screenshot: "on", trace: "on" }`,
+        `  use: { headless: true, ${baseUrlLine} screenshot: "on", trace: "on", video: "on" }`,
         `});`
       ].join("\n");
 
@@ -698,7 +751,7 @@ export class ScriptRunnerService {
     fileName: string,
     ext: string,
     contentType: string,
-    evidenceKind: "screenshot" | "api" | "trace",
+    evidenceKind: "screenshot" | "video" | "api" | "trace",
     buffer: Buffer
   ): Promise<void> {
     const storageKey = `executions/${projectId}/${executionId}/${randomUUID()}.${ext}`;
@@ -720,33 +773,50 @@ export class ScriptRunnerService {
     if (!executionId) return;
     try {
       const pngPaths = await this.findFilesByExt(resultsDir, ".png");
-      if (pngPaths.length > 0) {
-        // Web UI runs already have screenshots — keep evidence focused on those.
-        for (let i = 0; i < pngPaths.length; i++) {
-          const buffer = await fs.readFile(pngPaths[i]);
-          const fileName = pngPaths.length === 1 ? "screenshot.png" : `screenshot-${i + 1}.png`;
-          await this.storeAttachment(projectId, executionId, uploadedBy, fileName, "png", "image/png", "screenshot", buffer);
-        }
-        return;
+      for (let i = 0; i < pngPaths.length; i++) {
+        const buffer = await fs.readFile(pngPaths[i]);
+        const fileName = pngPaths.length === 1 ? "screenshot.png" : `screenshot-${i + 1}.png`;
+        await this.storeAttachment(projectId, executionId, uploadedBy, fileName, "png", "image/png", "screenshot", buffer);
       }
 
-      // API-only runs (no browser screenshots): store compact response-only JSON evidence.
+      const videoPaths = await this.findFilesByExt(resultsDir, ".webm");
+      for (let i = 0; i < videoPaths.length; i++) {
+        const buffer = await fs.readFile(videoPaths[i]);
+        const fileName = videoPaths.length === 1 ? "video.webm" : `video-${i + 1}.webm`;
+        await this.storeAttachment(projectId, executionId, uploadedBy, fileName, "webm", "video/webm", "video", buffer);
+      }
+
       const tracePaths = await this.findFilesByExt(resultsDir, ".zip");
       for (let i = 0; i < tracePaths.length; i++) {
         const zipBuffer = await fs.readFile(tracePaths[i]);
-        const apiEvidence = this.extractApiResponseEvidence(zipBuffer);
-        if (apiEvidence) {
-          const apiFileName = tracePaths.length === 1 ? "api-response.json" : `api-response-${i + 1}.json`;
-          await this.storeAttachment(
-            projectId,
-            executionId,
-            uploadedBy,
-            apiFileName,
-            "json",
-            "application/json",
-            "api",
-            Buffer.from(JSON.stringify(apiEvidence), "utf8")
-          );
+        const traceFileName = tracePaths.length === 1 ? "trace.zip" : `trace-${i + 1}.zip`;
+        await this.storeAttachment(
+          projectId,
+          executionId,
+          uploadedBy,
+          traceFileName,
+          "zip",
+          "application/zip",
+          "trace",
+          zipBuffer
+        );
+
+        // API-only runs (no browser screenshots): also store compact response-only JSON evidence.
+        if (pngPaths.length === 0) {
+          const apiEvidence = this.extractApiResponseEvidence(zipBuffer);
+          if (apiEvidence) {
+            const apiFileName = tracePaths.length === 1 ? "api-response.json" : `api-response-${i + 1}.json`;
+            await this.storeAttachment(
+              projectId,
+              executionId,
+              uploadedBy,
+              apiFileName,
+              "json",
+              "application/json",
+              "api",
+              Buffer.from(JSON.stringify(apiEvidence), "utf8")
+            );
+          }
         }
       }
     } catch (err) {
