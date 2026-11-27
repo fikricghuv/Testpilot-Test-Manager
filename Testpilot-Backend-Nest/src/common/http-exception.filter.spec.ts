@@ -1,4 +1,4 @@
-import type { ArgumentsHost } from "@nestjs/common";
+import { BadRequestException, type ArgumentsHost } from "@nestjs/common";
 import { HttpExceptionFilter } from "./http-exception.filter";
 import { UnsafeOutboundUrlError } from "./safe-fetch";
 
@@ -25,5 +25,15 @@ describe("HttpExceptionFilter: a refused outbound URL is the caller's to fix", (
     const { status, body } = run(new Error("connect ECONNREFUSED 10.0.0.2:5432"));
     expect(status).toBe(500);
     expect(body).toEqual({ error: "Internal server error" });
+  });
+
+  it("unwraps string and array messages from BadRequestException instead of returning 'Bad Request'", () => {
+    const single = run(new BadRequestException("Target URL is required."));
+    expect(single.status).toBe(400);
+    expect(single.body.error).toBe("Target URL is required.");
+
+    const multi = run(new BadRequestException(["VUs must be <= 100", "Duration must be <= 300s"]));
+    expect(multi.status).toBe(400);
+    expect(multi.body.error).toBe("VUs must be <= 100; Duration must be <= 300s");
   });
 });

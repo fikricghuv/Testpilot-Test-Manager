@@ -19,9 +19,12 @@ import { promisify } from "node:util";
 import * as zlib from "node:zlib";
 import { chromium } from "playwright";
 import { ApiTokenService } from "../auth/api-token.service";
+import { buildSafeChildEnv, redactSensitiveOutput } from "../common/child-env.util";
+import { assertSafePlaywrightScript, assertSafeTargetUrl } from "../common/script-safety.util";
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
 import { StorageService } from "../storage/storage.service";
+import { analyzePlaywrightFailure } from "./playwright-failure.analyzer";
 import {
   MAX_SCRIPT_CONTENT_LENGTH,
   MAX_SCRIPT_OUTPUT_LENGTH,
@@ -77,16 +80,7 @@ function validateTargetUrl(raw: unknown): string | null {
   }
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    throw new BadRequestException({ error: "targetUrl must be a valid http or https URL." });
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new BadRequestException({ error: "targetUrl must use http or https." });
-  }
-  return parsed.toString();
+  return assertSafeTargetUrl(trimmed);
 }
 
 function mapScriptRow(row: Record<string, any>): TestScriptRecord {
@@ -135,6 +129,7 @@ function mapRunRow(row: Record<string, any>): TestScriptRunRecord {
     stdout: row.stdout ?? null,
     stderr: row.stderr ?? null,
     errorMessage: row.error_message ?? null,
+    failureAnalysis: row.failure_analysis ?? null,
     triggeredBy: row.triggered_by ?? null,
     startedAt: row.started_at instanceof Date ? row.started_at.toISOString() : row.started_at ?? null,
     finishedAt: row.finished_at instanceof Date ? row.finished_at.toISOString() : row.finished_at ?? null,
@@ -224,6 +219,7 @@ export class ScriptRunnerService {
     if (scriptContent.length > MAX_SCRIPT_CONTENT_LENGTH) {
       throw new BadRequestException({ error: `scriptContent exceeds ${MAX_SCRIPT_CONTENT_LENGTH} characters.` });
     }
+    assertSafePlaywrightScript(scriptContent);
 
     const framework: ScriptFramework = input.framework ?? "playwright-ts";
     if (!SCRIPT_FRAMEWORKS.includes(framework)) {
@@ -255,21 +251,18 @@ export class ScriptRunnerService {
     }
 
     await this.db.transaction(async (client) => {
+      await client.query(
+        `INSERT INTO test_scripts (project_id, testcase_id, framework, target_url, status, created_by, updated_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)
+         ON CONFLICT (testcase_id, framework) DO NOTHING`,
+        [projectId, testcaseId, framework, targetUrl, status, uid]
+      );
+
       const existingRes = await client.query<{ id: string }>(
         `SELECT id FROM test_scripts WHERE testcase_id = $1 AND framework = $2 FOR UPDATE`,
         [testcaseId, framework]
       );
-
-      let scriptId = existingRes.rows[0]?.id;
-      if (!scriptId) {
-        const inserted = await client.query<{ id: string }>(
-          `INSERT INTO test_scripts (project_id, testcase_id, framework, target_url, status, created_by, updated_by)
-           VALUES ($1, $2, $3, $4, $5, $6, $6)
-           RETURNING id`,
-          [projectId, testcaseId, framework, targetUrl, status, uid]
-        );
-        scriptId = inserted.rows[0].id;
-      }
+      const scriptId = existingRes.rows[0].id;
 
       const maxVerRes = await client.query<{ max_ver: number }>(
         `SELECT COALESCE(MAX(version), 0)::int AS max_ver FROM test_script_versions WHERE script_id = $1`,
@@ -1383,6 +1376,10 @@ export class ScriptRunnerService {
         `});`
       ].join("\n");
 
+      assertSafePlaywrightScript(jobData.script_content);
+      if (jobData.target_url) {
+        assertSafeTargetUrl(jobData.target_url);
+      }
       await fs.writeFile(configPath, configContent, "utf8");
       await fs.writeFile(specPath, jobData.script_content, "utf8");
 
@@ -1395,13 +1392,14 @@ export class ScriptRunnerService {
           cwd: tempDir,
           timeout: SCRIPT_EXECUTION_TIMEOUT_MS,
           maxBuffer: 5 * 1024 * 1024,
-          env: {
-            ...process.env,
-            HOME: tempDir,
-            MOZ_DISABLE_CONTENT_SANDBOX: "1",
-            MOZ_DISABLE_GMP_SANDBOX: "1",
-            NODE_PATH: process.env.NODE_PATH ? `${nodeModulesDir}${path.delimiter}${process.env.NODE_PATH}` : nodeModulesDir
-          }
+          env: buildSafeChildEnv({
+            homeDir: tempDir,
+            extra: {
+              MOZ_DISABLE_CONTENT_SANDBOX: "1",
+              MOZ_DISABLE_GMP_SANDBOX: "1",
+              NODE_PATH: process.env.NODE_PATH ? `${nodeModulesDir}${path.delimiter}${process.env.NODE_PATH}` : nodeModulesDir
+            }
+          })
         }
       );
 
@@ -1410,18 +1408,19 @@ export class ScriptRunnerService {
       await this.finalizeRun(runId, jobData.cycle_id, jobData.execution_id, {
         status: "passed",
         durationMs: Date.now() - startedAt,
-        stdout: truncateOutput(stdout),
-        stderr: truncateOutput(stderr),
+        stdout: redactSensitiveOutput(truncateOutput(stdout)),
+        stderr: redactSensitiveOutput(truncateOutput(stderr)),
         errorMessage: null
       });
     } catch (err) {
       const execErr = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
       const isTestFailure = typeof execErr.code === "number" && execErr.code === 1;
       const status = isTestFailure ? "failed" : "error";
-      const errorMessage =
+      const errorMessage = redactSensitiveOutput(
         truncateOutput(execErr.stderr) ||
-        truncateOutput(execErr.message) ||
-        "Playwright execution failed.";
+          truncateOutput(execErr.message) ||
+          "Playwright execution failed."
+      );
 
       if (resultsDir) {
         await this.collectAndStoreEvidence(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
@@ -1430,8 +1429,8 @@ export class ScriptRunnerService {
       await this.finalizeRun(runId, jobData.cycle_id, jobData.execution_id, {
         status,
         durationMs: Date.now() - startedAt,
-        stdout: truncateOutput(execErr.stdout),
-        stderr: truncateOutput(execErr.stderr),
+        stdout: redactSensitiveOutput(truncateOutput(execErr.stdout)),
+        stderr: redactSensitiveOutput(truncateOutput(execErr.stderr)),
         errorMessage
       });
     } finally {
@@ -1653,6 +1652,10 @@ export class ScriptRunnerService {
     }
   ): Promise<void> {
     const executionStatus = outcome.status === "passed" ? "Passed" : "Failed";
+    const failureAnalysis =
+      outcome.status === "passed"
+        ? null
+        : analyzePlaywrightFailure(outcome.stdout, outcome.stderr, outcome.errorMessage);
 
     await this.db.transaction(async (client) => {
       await client.query(
@@ -1662,9 +1665,18 @@ export class ScriptRunnerService {
              stdout = $4,
              stderr = $5,
              error_message = $6,
+             failure_analysis = $7::jsonb,
              finished_at = now()
          WHERE id = $1`,
-        [runId, outcome.status, outcome.durationMs, outcome.stdout, outcome.stderr, outcome.errorMessage]
+        [
+          runId,
+          outcome.status,
+          outcome.durationMs,
+          outcome.stdout,
+          outcome.stderr,
+          outcome.errorMessage,
+          failureAnalysis ? JSON.stringify(failureAnalysis) : null
+        ]
       );
 
       if (executionId) {
@@ -1680,6 +1692,7 @@ export class ScriptRunnerService {
       }
 
       if (cycleId) {
+        await client.query(`SELECT id FROM cycles WHERE id = $1 FOR UPDATE`, [cycleId]);
         await client.query(
           `UPDATE cycles
            SET status = 'Completed',

@@ -21,6 +21,7 @@ import {
 import {
   API_BASE,
   activateTestCaseScriptVersion,
+  createBug,
   createTestCaseRecorderSession,
   deleteTestCaseScript,
   deleteTestCaseScriptVersion,
@@ -31,11 +32,17 @@ import {
   saveTestCaseScript,
   startTestCaseAiGenerate,
   startTestCaseAiHeal,
+  zyraGenerateTestData,
+  zyraTriageFailure,
+  type BugPriority,
+  type BugSeverity,
   type TestAgentJobRecord,
   type TestScriptBrowser,
   type TestScriptRunRecord,
   type TestScriptStateResponse,
   type TestScriptStatus,
+  type ZyraFailureTriageResult,
+  type ZyraTestDataResult,
 } from "@/lib/api";
 import { Button, ConfirmModal, CopyButton, Field, FieldLabel, Input, Modal, StatusChip } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
@@ -107,8 +114,73 @@ export function TestCaseScriptTab({
   const [activeRun, setActiveRun] = useState<TestScriptRunRecord | null>(null);
   const [agentJob, setAgentJob] = useState<TestAgentJobRecord | null>(null);
   const [startingAgent, setStartingAgent] = useState(false);
+  const [triagingRun, setTriagingRun] = useState(false);
+  const [triageResult, setTriageResult] = useState<ZyraFailureTriageResult | null>(null);
+  const [creatingBug, setCreatingBug] = useState(false);
+  const [createdBugKey, setCreatedBugKey] = useState<string | null>(null);
+  const [generatingData, setGeneratingData] = useState(false);
+  const [testDataResult, setTestDataResult] = useState<ZyraTestDataResult | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const handleZyraTriage = async () => {
+    if (!activeRun) return;
+    setTriagingRun(true);
+    setError(null);
+    setCreatedBugKey(null);
+    try {
+      const res = await zyraTriageFailure(projectId, { runId: activeRun.id, testcaseId });
+      setTriageResult(res);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Zyra failed to triage failure.");
+    } finally {
+      setTriagingRun(false);
+    }
+  };
+
+  const handleCreateBugFromTriage = async () => {
+    if (!triageResult) return;
+    setCreatingBug(true);
+    setError(null);
+    try {
+      const bug = await createBug(projectId, {
+        title: triageResult.bugDraft.title,
+        description: [
+          triageResult.bugDraft.description,
+          "",
+          "**Steps to Reproduce**",
+          triageResult.bugDraft.stepsToReproduce,
+          "",
+          `**Expected:** ${triageResult.bugDraft.expectedResult}`,
+          `**Actual:** ${triageResult.bugDraft.actualResult}`,
+        ].join("\n"),
+        severity: (triageResult.bugDraft.severity.charAt(0).toUpperCase() +
+          triageResult.bugDraft.severity.slice(1)) as BugSeverity,
+        priority: (triageResult.bugDraft.priority.charAt(0).toUpperCase() +
+          triageResult.bugDraft.priority.slice(1)) as BugPriority,
+        links: [{ testcaseId }],
+      });
+      setCreatedBugKey(bug.externalId || bug.id);
+      setSuccess(`Bug ${bug.externalId || bug.id} created from Zyra triage.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create bug from Zyra triage.");
+    } finally {
+      setCreatingBug(false);
+    }
+  };
+
+  const handleZyraTestData = async () => {
+    setGeneratingData(true);
+    setError(null);
+    try {
+      const res = await zyraGenerateTestData(projectId, { testcaseId });
+      setTestDataResult(res);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Zyra failed to generate test data.");
+    } finally {
+      setGeneratingData(false);
+    }
+  };
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -686,18 +758,42 @@ export function TestCaseScriptTab({
             Generate with AI (3-Agent)
           </Button>
           {activeRun && (activeRun.status === "failed" || activeRun.status === "error") && (
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={handleAiHeal}
-              disabled={startingAgent || Boolean(agentJob && agentJob.stage !== "completed" && agentJob.stage !== "failed")}
-              title="Analyze failure and auto-fix with Healer agent"
-            >
-              <IconWand size={14} />
-              Heal with AI
-            </Button>
+            <>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={handleAiHeal}
+                disabled={startingAgent || Boolean(agentJob && agentJob.stage !== "completed" && agentJob.stage !== "failed")}
+                title="Analyze failure and auto-fix with Healer agent"
+              >
+                <IconWand size={14} />
+                Heal with AI
+              </Button>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => void handleZyraTriage()}
+                disabled={triagingRun}
+                title="Have Zyra triage this failure and draft a bug report"
+              >
+                {triagingRun ? <IconLoader2 size={14} className="animate-spin" /> : <IconBug size={14} />}
+                Triage with Zyra
+              </Button>
+            </>
           )}
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => void handleZyraTestData()}
+            disabled={generatingData}
+            title="Generate valid, boundary, invalid, and security test datasets with Zyra"
+          >
+            {generatingData ? <IconLoader2 size={14} className="animate-spin" /> : <IconSparkles size={14} />}
+            Zyra Test Data
+          </Button>
           <Button
             type="button"
             variant="secondary"
@@ -974,6 +1070,51 @@ export function TestCaseScriptTab({
         />
       </Field>
 
+      {testDataResult && (
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4 text-xs space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <IconSparkles size={14} className="text-[var(--brand-primary)]" />
+              <span className="font-semibold text-[var(--foreground)]">Zyra Test Data &amp; Boundary Cases</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <CopyButton value={testDataResult.playwrightFixtureSnippet} label="Copy Fixture" />
+              <button
+                type="button"
+                onClick={() => setTestDataResult(null)}
+                className="text-[var(--muted)] hover:text-[var(--foreground)]"
+                title="Dismiss"
+              >
+                <IconX size={14} />
+              </button>
+            </div>
+          </div>
+          <p className="text-[var(--foreground-muted)]">{testDataResult.summary}</p>
+          <div className="max-h-56 overflow-auto rounded border border-[var(--border-subtle)]">
+            <table className="w-full text-left text-[11px]">
+              <thead className="bg-[var(--surface-muted)] text-[var(--muted)]">
+                <tr>
+                  <th className="px-2 py-1.5">Category</th>
+                  <th className="px-2 py-1.5">Scenario</th>
+                  <th className="px-2 py-1.5">Input</th>
+                  <th className="px-2 py-1.5">Expected</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border-subtle)]">
+                {testDataResult.datasets.map((row, idx) => (
+                  <tr key={idx}>
+                    <td className="px-2 py-1.5 font-mono uppercase">{row.category}</td>
+                    <td className="px-2 py-1.5 font-medium text-[var(--foreground)]">{row.name}</td>
+                    <td className="px-2 py-1.5 font-mono text-[10px]">{JSON.stringify(row.input)}</td>
+                    <td className="px-2 py-1.5 text-[var(--foreground-muted)]">{row.expectedBehavior}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Latest Run Output */}
       {activeRun && (
         <div className="space-y-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--background)] p-4">
@@ -1001,6 +1142,114 @@ export function TestCaseScriptTab({
               </Button>
             </div>
           </div>
+
+          {triageResult && (
+            <div className="rounded-lg border border-[var(--brand-primary)]/40 bg-[var(--brand-primary)]/5 p-3 text-xs space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <IconSparkles size={14} className="text-[var(--brand-primary)]" />
+                  <span className="font-semibold text-[var(--foreground)]">Zyra Failure Triage</span>
+                  <span className="rounded bg-[var(--brand-primary)]/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase text-[var(--brand-primary)]">
+                    {triageResult.classification.replace(/_/g, " ")}
+                  </span>
+                  <span className="text-[11px] text-[var(--muted)]">
+                    ({triageResult.confidence} confidence)
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {createdBugKey ? (
+                    <span className="text-[11px] font-medium text-[var(--success-foreground)]">
+                      Bug created: {createdBugKey}
+                    </span>
+                  ) : (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="primary"
+                      disabled={creatingBug}
+                      onClick={() => void handleCreateBugFromTriage()}
+                    >
+                      {creatingBug ? <IconLoader2 size={12} className="animate-spin" /> : <IconBug size={12} />}
+                      Create Bug Draft
+                    </Button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setTriageResult(null)}
+                    className="text-[var(--muted)] hover:text-[var(--foreground)]"
+                    title="Dismiss"
+                  >
+                    <IconX size={14} />
+                  </button>
+                </div>
+              </div>
+              <p className="text-[var(--foreground)]">
+                <span className="font-semibold">Root Cause: </span>
+                {triageResult.rootCause}
+              </p>
+              <p className="text-[var(--foreground-muted)]">
+                <span className="font-semibold text-[var(--foreground)]">Suggested Fix: </span>
+                {triageResult.suggestedFix}
+              </p>
+              <div className="rounded border border-[var(--border-subtle)] bg-[var(--surface)] p-2 text-[11px]">
+                <div className="font-semibold text-[var(--foreground)]">
+                  Bug Draft: {triageResult.bugDraft.title}
+                </div>
+                <div className="mt-1 text-[var(--muted)]">
+                  Severity: {triageResult.bugDraft.severity} · Priority: {triageResult.bugDraft.priority}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeRun.failureAnalysis && (
+            <div className="rounded-lg border border-[var(--error)]/40 bg-[var(--error)]/5 p-3 text-xs space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded bg-[var(--error)]/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-[var(--error-foreground)]">
+                  {activeRun.failureAnalysis.category.replace(/_/g, " ")}
+                </span>
+                <span className="font-semibold text-[var(--foreground)]">
+                  {activeRun.failureAnalysis.title}
+                </span>
+              </div>
+              <p className="text-[var(--foreground-muted)]">{activeRun.failureAnalysis.summary}</p>
+              {(activeRun.failureAnalysis.failedLine ||
+                activeRun.failureAnalysis.selector ||
+                activeRun.failureAnalysis.expected ||
+                activeRun.failureAnalysis.received) && (
+                <div className="grid gap-1 rounded border border-[var(--border-subtle)] bg-[var(--surface)] p-2 font-mono text-[11px]">
+                  {activeRun.failureAnalysis.failedLine && (
+                    <div>
+                      <span className="text-[var(--foreground-muted)]">Line: </span>
+                      <span className="text-[var(--foreground)]">{activeRun.failureAnalysis.failedLine}</span>
+                    </div>
+                  )}
+                  {activeRun.failureAnalysis.selector && (
+                    <div>
+                      <span className="text-[var(--foreground-muted)]">Selector: </span>
+                      <span className="text-[var(--foreground)]">{activeRun.failureAnalysis.selector}</span>
+                    </div>
+                  )}
+                  {activeRun.failureAnalysis.expected && (
+                    <div>
+                      <span className="text-[var(--foreground-muted)]">Expected: </span>
+                      <span className="text-[var(--success-foreground)]">{activeRun.failureAnalysis.expected}</span>
+                    </div>
+                  )}
+                  {activeRun.failureAnalysis.received && (
+                    <div>
+                      <span className="text-[var(--foreground-muted)]">Received: </span>
+                      <span className="text-[var(--error-foreground)]">{activeRun.failureAnalysis.received}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+              <div className="rounded border border-[var(--border-subtle)] bg-[var(--surface)]/70 px-2.5 py-1.5 text-[11px] text-[var(--foreground)]">
+                <span className="font-semibold">Suggestion: </span>
+                {activeRun.failureAnalysis.suggestion}
+              </div>
+            </div>
+          )}
 
           {activeRun.errorMessage && (
             <pre className="max-h-40 overflow-auto rounded-lg border border-[var(--error)]/40 bg-[var(--surface)] p-3 font-mono text-[11px] text-[var(--error-foreground)] whitespace-pre-wrap">

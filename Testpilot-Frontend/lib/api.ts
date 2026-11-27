@@ -25,17 +25,26 @@ function genericStatusMessage(status: number): string {
   return "Something went wrong. Please try again.";
 }
 
+const GENERIC_HTTP_LABELS = new Set([
+  "Bad Request",
+  "Unauthorized",
+  "Forbidden",
+  "Not Found",
+  "Conflict",
+  "Unprocessable Entity",
+  "Too Many Requests",
+  "Internal Server Error",
+]);
+
 function formatApiError(status: number, body: ApiErrorBody): string {
   if (!body.error && body.errors?.length) {
     return body.errors.map((e) => e.message).filter(Boolean).join(", ") || genericStatusMessage(status);
   }
-  // custom-field-validation.ts (definition config checks — e.g. a multi-select's minSelected
-  // exceeding its maxSelected) throws a bare { field, message } object rather than { error }/
-  // { errors }, since it isn't wrapped by anything that reshapes it before it reaches the HTTP
-  // layer. Falling back to `message` here — instead of straight to the generic text — is what
-  // keeps that already-specific backend wording ("Minimum selections cannot be greater than
-  // maximum selections.") from being swallowed into "Something went wrong."
-  const msg = body.error || body.message || genericStatusMessage(status);
+  const rawMessage = Array.isArray(body.message)
+    ? body.message.filter(Boolean).join("; ")
+    : body.message;
+  const errorIsGeneric = typeof body.error === "string" && GENERIC_HTTP_LABELS.has(body.error);
+  const msg = (errorIsGeneric && rawMessage ? rawMessage : body.error) || rawMessage || genericStatusMessage(status);
   const detail = body.detail?.trim();
   if (detail) return `${msg}: ${detail}`;
   return msg;
@@ -1533,6 +1542,81 @@ export async function saveZyraTask(
     method: "POST",
     body: data,
   });
+}
+
+export interface ZyraFailureTriageResult {
+  classification: "application_bug" | "selector_drift" | "flaky_test" | "environment_issue" | "script_bug";
+  confidence: "high" | "medium" | "low";
+  rootCause: string;
+  suggestedFix: string;
+  bugDraft: {
+    title: string;
+    description: string;
+    stepsToReproduce: string;
+    expectedResult: string;
+    actualResult: string;
+    severity: "critical" | "high" | "medium" | "low";
+    priority: "critical" | "high" | "medium" | "low";
+  };
+  provider: string;
+  model: string;
+}
+
+export interface ZyraPerformanceInsightsResult {
+  healthVerdict: "healthy" | "degraded" | "bottleneck_detected" | "threshold_failed";
+  summary: string;
+  bottlenecks: string[];
+  recommendations: string[];
+  recommendedConfig: {
+    loadProfile: string;
+    vus: number;
+    durationSec: number;
+    p95ThresholdMs: number;
+    maxErrorRate: number;
+  };
+  provider: string;
+  model: string;
+}
+
+export interface ZyraTestDataResult {
+  summary: string;
+  datasets: Array<{
+    category: "valid" | "boundary" | "invalid" | "security_edge";
+    name: string;
+    input: Record<string, unknown>;
+    expectedBehavior: string;
+  }>;
+  playwrightFixtureSnippet: string;
+  provider: string;
+  model: string;
+}
+
+export async function zyraTriageFailure(
+  projectId: string,
+  data: { runId?: string; executionId?: string; testcaseId?: string }
+): Promise<ZyraFailureTriageResult> {
+  return api(`/api/projects/${projectId}/agents/zyra/triage-failure`, { method: "POST", body: data });
+}
+
+export async function zyraAnalyzePerformance(
+  projectId: string,
+  data: { performanceTestId: string; runId?: string }
+): Promise<ZyraPerformanceInsightsResult> {
+  return api(`/api/projects/${projectId}/agents/zyra/analyze-performance`, { method: "POST", body: data });
+}
+
+export async function zyraGenerateTestData(
+  projectId: string,
+  data: { testcaseId?: string; prompt?: string }
+): Promise<ZyraTestDataResult> {
+  return api(`/api/projects/${projectId}/agents/zyra/generate-test-data`, { method: "POST", body: data });
+}
+
+export async function zyraGenerateAutomation(
+  projectId: string,
+  data: { testcaseId: string; targetUrl: string; instructions?: string | null }
+): Promise<TestAgentJobRecord> {
+  return api(`/api/projects/${projectId}/agents/zyra/generate-automation`, { method: "POST", body: data });
 }
 
 export async function listProjectMembers(projectId: string): Promise<{ userId: string; email: string; name: string; role: string; joinedAt: string }[]> {
@@ -4766,6 +4850,17 @@ export interface TestScriptVersionRecord {
   createdAt: string;
 }
 
+export interface ScriptFailureAnalysis {
+  category: "selector_not_found" | "assertion_failed" | "timeout" | "network_error" | "script_error" | "unknown";
+  title: string;
+  summary: string;
+  failedLine: string | null;
+  selector: string | null;
+  expected: string | null;
+  received: string | null;
+  suggestion: string;
+}
+
 export interface TestScriptRunRecord {
   id: string;
   projectId: string;
@@ -4780,6 +4875,7 @@ export interface TestScriptRunRecord {
   stdout: string | null;
   stderr: string | null;
   errorMessage: string | null;
+  failureAnalysis?: ScriptFailureAnalysis | null;
   triggeredBy: string | null;
   startedAt: string | null;
   finishedAt: string | null;

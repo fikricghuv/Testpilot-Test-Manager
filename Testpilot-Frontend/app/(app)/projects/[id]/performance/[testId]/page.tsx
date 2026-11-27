@@ -8,6 +8,7 @@ import {
   IconLoader2,
   IconPlayerPlay,
   IconPlayerStop,
+  IconSparkles,
   IconTerminal2,
   IconX,
 } from "@tabler/icons-react";
@@ -17,12 +18,14 @@ import {
   getPerformanceTest,
   triggerPerformanceRun,
   updatePerformanceTest,
+  zyraAnalyzePerformance,
   type PerformanceFlowStep,
   type PerformanceHttpMethod,
   type PerformanceRunRecord,
   type PerformanceRunStatus,
   type PerformanceTestMode,
   type PerformanceTestRecord,
+  type ZyraPerformanceInsightsResult,
 } from "@/lib/api";
 import {
   Button,
@@ -107,7 +110,23 @@ export default function PerformanceTestDetailPage() {
   const [saving, setSaving] = useState(false);
   const [triggering, setTriggering] = useState(false);
   const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [analyzingZyra, setAnalyzingZyra] = useState(false);
+  const [zyraInsights, setZyraInsights] = useState<ZyraPerformanceInsightsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const handleAnalyzeWithZyra = async (runId?: string) => {
+    if (!projectId || !testId) return;
+    setAnalyzingZyra(true);
+    setError(null);
+    try {
+      const res = await zyraAnalyzePerformance(projectId, { performanceTestId: testId, runId });
+      setZyraInsights(res);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Zyra failed to analyze performance run.");
+    } finally {
+      setAnalyzingZyra(false);
+    }
+  };
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
   // Editable state
@@ -428,18 +447,32 @@ export default function PerformanceTestDetailPage() {
           actions={
             <div className="flex items-center gap-2">
               {selectedRun && selectedRun.status !== "queued" && selectedRun.status !== "running" ? (
-                <Button
-                  variant="secondary"
-                  disabled={downloadingPdf}
-                  onClick={() => void handleDownloadPdf(selectedRun.id)}
-                >
-                  {downloadingPdf ? (
-                    <IconLoader2 size={16} className="animate-spin" />
-                  ) : (
-                    <IconDownload size={16} />
-                  )}
-                  Download PDF
-                </Button>
+                <>
+                  <Button
+                    variant="secondary"
+                    disabled={analyzingZyra}
+                    onClick={() => void handleAnalyzeWithZyra(selectedRun.id)}
+                  >
+                    {analyzingZyra ? (
+                      <IconLoader2 size={16} className="animate-spin" />
+                    ) : (
+                      <IconSparkles size={16} />
+                    )}
+                    Analyze with Zyra
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    disabled={downloadingPdf}
+                    onClick={() => void handleDownloadPdf(selectedRun.id)}
+                  >
+                    {downloadingPdf ? (
+                      <IconLoader2 size={16} className="animate-spin" />
+                    ) : (
+                      <IconDownload size={16} />
+                    )}
+                    Download PDF
+                  </Button>
+                </>
               ) : null}
               {selectedRun && (selectedRun.status === "queued" || selectedRun.status === "running") ? (
                 <Button variant="secondary" onClick={() => void handleCancelRun(selectedRun.id)}>
@@ -464,6 +497,58 @@ export default function PerformanceTestDetailPage() {
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
           {error}
         </div>
+      ) : null}
+
+      {zyraInsights ? (
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <IconSparkles size={16} className="text-[var(--brand-primary)]" />
+              <CardTitle>Zyra Performance Insights</CardTitle>
+              <StatusChip tone={zyraInsights.healthVerdict === "healthy" ? "success" : "error"}>
+                {zyraInsights.healthVerdict.replace(/_/g, " ")}
+              </StatusChip>
+            </div>
+            <button
+              type="button"
+              onClick={() => setZyraInsights(null)}
+              className="text-[var(--muted)] hover:text-[var(--foreground)]"
+              title="Dismiss"
+            >
+              <IconX size={16} />
+            </button>
+          </CardHeader>
+          <CardBody className="space-y-3 text-sm">
+            <p className="text-[var(--foreground)]">{zyraInsights.summary}</p>
+            {zyraInsights.bottlenecks.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Bottlenecks</div>
+                <ul className="mt-1 list-disc pl-5 text-xs text-[var(--foreground-muted)] space-y-1">
+                  {zyraInsights.bottlenecks.map((item, i) => (
+                    <li key={i}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {zyraInsights.recommendations.length > 0 && (
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">Recommendations</div>
+                <ul className="mt-1 list-disc pl-5 text-xs text-[var(--foreground-muted)] space-y-1">
+                  {zyraInsights.recommendations.map((item, i) => (
+                    <li key={i}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-muted)]/50 px-3 py-2 text-xs text-[var(--muted)]">
+              Recommended next config: profile <strong>{zyraInsights.recommendedConfig.loadProfile}</strong>,{" "}
+              <strong>{zyraInsights.recommendedConfig.vus} VUs</strong> for{" "}
+              <strong>{zyraInsights.recommendedConfig.durationSec}s</strong> (p95 &lt;{" "}
+              {zyraInsights.recommendedConfig.p95ThresholdMs}ms, max error rate{" "}
+              {(zyraInsights.recommendedConfig.maxErrorRate * 100).toFixed(1)}%)
+            </div>
+          </CardBody>
+        </Card>
       ) : null}
 
       {/* Sub-navigation Tabs + Run Selector */}

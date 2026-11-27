@@ -16,6 +16,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import ExcelJS from "exceljs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { buildSafeChildEnv, redactSensitiveOutput } from "../common/child-env.util";
 import { DatabaseService } from "../database/database.service";
 import { isUuid, LegacyService } from "../legacy/legacy.service";
 import {
@@ -710,7 +711,9 @@ export class PerformanceTestsService {
         errorMessage = "One or more k6 thresholds failed.";
       } else if (result.exitCode !== 0) {
         finalStatus = "error";
-        errorMessage = truncateOutput(result.stderr) || `k6 exited with code ${result.exitCode ?? "unknown"}.`;
+        errorMessage =
+          redactSensitiveOutput(truncateOutput(result.stderr)) ||
+          `k6 exited with code ${result.exitCode ?? "unknown"}.`;
       }
 
       await this.db.query(
@@ -757,8 +760,8 @@ export class PerformanceTestsService {
           rawSummary ? JSON.stringify(rawSummary) : null,
           timeseries ? JSON.stringify(timeseries) : null,
           breakdown ? JSON.stringify(breakdown) : null,
-          truncateOutput(result.stdout),
-          truncateOutput(result.stderr),
+          redactSensitiveOutput(truncateOutput(result.stdout)),
+          redactSensitiveOutput(truncateOutput(result.stderr)),
           errorMessage,
           Date.now() - startedAt
         ]
@@ -797,7 +800,10 @@ export class PerformanceTestsService {
     return new Promise((resolve, reject) => {
       const child = spawn(bin, args, {
         cwd: opts.cwd,
-        env: { ...process.env, HOME: opts.cwd, K6_NO_USAGE_REPORT: "true" },
+        env: buildSafeChildEnv({
+          homeDir: opts.cwd,
+          extra: { K6_NO_USAGE_REPORT: "true" }
+        }),
         stdio: ["ignore", "pipe", "pipe"]
       });
 

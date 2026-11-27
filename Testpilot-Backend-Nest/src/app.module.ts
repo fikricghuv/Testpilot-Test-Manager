@@ -27,6 +27,7 @@ import { AutomationAgentsModule } from "./automation-agents/automation-agents.mo
 import { PerformanceTestsModule } from "./performance-tests/performance-tests.module";
 import { NyraModule } from "./nyra/nyra.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
+import { ZyraInsightsModule } from "./zyra-insights/zyra-insights.module";
 import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
 
 @Module({
@@ -59,7 +60,8 @@ import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
     ScriptRunnerModule,
     AutomationAgentsModule,
     PerformanceTestsModule,
-    NyraModule
+    NyraModule,
+    ZyraInsightsModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard
   // itself no-ops on reads and on workspaces that are within their limits.

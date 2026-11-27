@@ -5,7 +5,7 @@ import { SCRIPT_RUNNER_JOB, SCRIPT_RUNNER_QUEUE } from "./script-runner.constant
 import { ScriptRunnerService } from "./script-runner.service";
 import type { ScriptRunnerJobPayload } from "./script-runner.types";
 
-@Processor(SCRIPT_RUNNER_QUEUE)
+@Processor(SCRIPT_RUNNER_QUEUE, { concurrency: 2 })
 export class ScriptRunnerProcessor extends WorkerHost {
   private readonly logger = new Logger(ScriptRunnerProcessor.name);
 

@@ -1,3 +1,4 @@
+import type { ScriptFailureAnalysis } from "./playwright-failure.analyzer";
 import type {
   SCRIPT_BROWSERS,
   SCRIPT_FRAMEWORKS,
@@ -53,6 +54,7 @@ export interface TestScriptRunRecord {
   stdout: string | null;
   stderr: string | null;
   errorMessage: string | null;
+  failureAnalysis?: ScriptFailureAnalysis | null;
   triggeredBy: string | null;
   startedAt: string | null;
   finishedAt: string | null;

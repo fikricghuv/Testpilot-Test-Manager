@@ -6,7 +6,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { buildSafeChildEnv, redactSensitiveOutput } from "../common/child-env.util";
 import { decryptSecret, encryptSecret } from "../common/crypto.util";
+import { assertSafePlaywrightScript } from "../common/script-safety.util";
 import { DatabaseService } from "../database/database.service";
 import { isUuid, LegacyService } from "../legacy/legacy.service";
 import { ScriptRunnerService } from "../script-runner/script-runner.service";
@@ -781,6 +783,7 @@ export class AutomationAgentsService {
   ): Promise<{ passed: boolean; errorMessage: string | null; errorContext: string | null }> {
     let tempDir: string | null = null;
     try {
+      assertSafePlaywrightScript(scriptContent);
       tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "testpilot-agent-"));
       const resultsDir = path.join(tempDir, "test-results");
       const specPath = path.join(tempDir, "test.spec.ts");
@@ -813,10 +816,12 @@ export class AutomationAgentsService {
         cwd: tempDir,
         timeout: 90_000,
         maxBuffer: 5 * 1024 * 1024,
-        env: {
-          ...process.env,
-          NODE_PATH: process.env.NODE_PATH ? `${nodeModulesDir}${path.delimiter}${process.env.NODE_PATH}` : nodeModulesDir
-        }
+        env: buildSafeChildEnv({
+          homeDir: tempDir,
+          extra: {
+            NODE_PATH: process.env.NODE_PATH ? `${nodeModulesDir}${path.delimiter}${process.env.NODE_PATH}` : nodeModulesDir
+          }
+        })
       });
 
       return { passed: true, errorMessage: null, errorContext: null };
@@ -829,10 +834,14 @@ export class AutomationAgentsService {
           errorContext = await fs.readFile(ctxFiles[0], "utf8").catch(() => null);
         }
       }
+      const knownSecrets = auth?.password ? [auth.password] : [];
       return {
         passed: false,
-        errorMessage: (execErr.stderr || execErr.stdout || execErr.message || "Verification failed").slice(0, 8000),
-        errorContext
+        errorMessage: redactSensitiveOutput(
+          (execErr.stderr || execErr.stdout || execErr.message || "Verification failed").slice(0, 8000),
+          knownSecrets
+        ),
+        errorContext: errorContext ? redactSensitiveOutput(errorContext, knownSecrets) : null
       };
     } finally {
       if (tempDir) {

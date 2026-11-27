@@ -2,6 +2,17 @@ import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from
 import type { Response } from "express";
 import { UnsafeOutboundUrlError } from "./safe-fetch";
 
+const GENERIC_HTTP_ERROR_LABELS = new Set([
+  "Bad Request",
+  "Unauthorized",
+  "Forbidden",
+  "Not Found",
+  "Conflict",
+  "Unprocessable Entity",
+  "Too Many Requests",
+  "Internal Server Error"
+]);
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
   return `${Math.round(bytes / 1024)}KB`;
@@ -42,6 +53,21 @@ export class HttpExceptionFilter implements ExceptionFilter {
       }
       if (typeof body === "string") {
         response.status(status).json({ error: body });
+      } else if (typeof body === "object" && body !== null) {
+        const obj = body as { error?: unknown; message?: unknown };
+        const rawMsg = Array.isArray(obj.message)
+          ? obj.message.filter((m): m is string => typeof m === "string" && m.trim().length > 0).join("; ")
+          : typeof obj.message === "string"
+          ? obj.message.trim()
+          : "";
+        const hasGenericErrorLabel =
+          typeof obj.error === "string" && GENERIC_HTTP_ERROR_LABELS.has(obj.error);
+
+        if (rawMsg && (!obj.error || hasGenericErrorLabel)) {
+          response.status(status).json({ ...obj, error: rawMsg });
+        } else {
+          response.status(status).json(body);
+        }
       } else {
         response.status(status).json(body);
       }
