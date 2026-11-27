@@ -1,7 +1,8 @@
 "use client";
 
-import { IconBrain, IconTrendingUp, IconTrendingDown, IconFlame, IconEyeOff, IconAlertCircle } from "@tabler/icons-react";
-import type { ReportsOverview } from "@/lib/api";
+import Link from "next/link";
+import { IconBrain, IconTrendingUp, IconTrendingDown, IconFlame, IconEyeOff, IconAlertCircle, IconBolt } from "@tabler/icons-react";
+import type { PerformanceProjectReport, ReportsOverview } from "@/lib/api";
 import { TrendLineChart } from "./charts";
 import { LoadingBlock } from "./shared";
 
@@ -35,7 +36,19 @@ function SuiteHealthBars({ rows }: { rows: ReportsOverview["suiteHealth"] }) {
   );
 }
 
-export function OverviewTab({ overview, loading }: { overview: ReportsOverview | null; loading: boolean }) {
+export function OverviewTab({
+  projectId,
+  overview,
+  loading,
+  performanceReport,
+  onOpenPerformance,
+}: {
+  projectId?: string;
+  overview: ReportsOverview | null;
+  loading: boolean;
+  performanceReport?: PerformanceProjectReport | null;
+  onOpenPerformance?: () => void;
+}) {
   if (loading) return <LoadingBlock label="Loading overview…" />;
   if (!overview) return <LoadingBlock label="No data available." />;
 
@@ -101,6 +114,73 @@ export function OverviewTab({ overview, loading }: { overview: ReportsOverview |
             )}
           </div>
         </div>
+      </div>
+
+      {/* Performance Testing Summary Card */}
+      <div className="mt-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <IconBolt size={16} stroke={1.75} className="text-[var(--brand-primary)]" />
+            <h3 className="text-[13px] font-semibold text-[var(--foreground)]">Performance Testing (k6 · 30d)</h3>
+          </div>
+          <div className="flex items-center gap-3">
+            {onOpenPerformance ? (
+              <button
+                type="button"
+                onClick={onOpenPerformance}
+                className="text-xs font-medium text-[var(--brand-primary)] hover:underline"
+              >
+                View full report
+              </button>
+            ) : null}
+            {projectId ? (
+              <Link
+                href={`/projects/${projectId}/performance`}
+                className="text-xs text-[var(--muted)] hover:text-[var(--foreground)] hover:underline"
+              >
+                Manage scenarios
+              </Link>
+            ) : null}
+          </div>
+        </div>
+        {performanceReport ? (
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div className="rounded-lg bg-[var(--surface-secondary)]/50 px-3 py-2">
+              <div className="text-[11px] text-[var(--muted-soft)]">Scenarios</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold text-[var(--foreground)]">
+                {performanceReport.kpis.totalScenarios}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[var(--surface-secondary)]/50 px-3 py-2">
+              <div className="text-[11px] text-[var(--muted-soft)]">Total Runs</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold text-[var(--foreground)]">
+                {performanceReport.kpis.totalRuns}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[var(--surface-secondary)]/50 px-3 py-2">
+              <div className="text-[11px] text-[var(--muted-soft)]">Threshold Pass</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold text-[var(--foreground)]">
+                {performanceReport.kpis.passRatePct !== null ? `${performanceReport.kpis.passRatePct}%` : "—"}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[var(--surface-secondary)]/50 px-3 py-2">
+              <div className="text-[11px] text-[var(--muted-soft)]">Avg p95</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold text-[var(--foreground)]">
+                {performanceReport.kpis.avgP95Ms !== null ? `${performanceReport.kpis.avgP95Ms.toFixed(1)} ms` : "—"}
+              </div>
+            </div>
+            <div className="rounded-lg bg-[var(--surface-secondary)]/50 px-3 py-2">
+              <div className="text-[11px] text-[var(--muted-soft)]">Avg Error Rate</div>
+              <div className="mt-0.5 font-mono text-sm font-semibold text-[var(--foreground)]">
+                {performanceReport.kpis.avgErrorRate !== null
+                  ? `${(performanceReport.kpis.avgErrorRate * 100).toFixed(2)}%`
+                  : "—"}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className="text-[12px] text-[var(--muted-soft)]">No performance runs recorded in the last 30 days.</p>
+        )}
       </div>
     </div>
   );

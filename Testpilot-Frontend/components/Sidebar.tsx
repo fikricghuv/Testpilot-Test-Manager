@@ -60,6 +60,7 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
     section: "Execution",
     items: [
       { href: "cycles", label: "Runs", icon: "play" },
+      { href: "performance", label: "Performance", icon: "activity" },
       { href: "bugs", label: "Bugs", icon: "bug" },
       { href: "reports", label: "Insights", icon: "chart" },
     ],

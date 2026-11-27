@@ -13,6 +13,8 @@ import {
   getReportsInsights,
   getReportsTrends,
   getReportsExportUrl,
+  getPerformanceProjectReport,
+  getPerformanceProjectReportExportUrl,
   listPlans,
   listTestRuns,
   listSuites,
@@ -24,6 +26,8 @@ import {
   type ReportsOverview,
   type ReportsInsights,
   type ReportsTrends,
+  type PerformanceProjectReport,
+  type PerformanceReportRange,
   type SuiteNode,
   type CustomTag,
 } from "@/lib/api";
@@ -40,6 +44,7 @@ import { TraceabilityTab } from "@/components/reports/TraceabilityTab";
 import { RepositoryTab } from "@/components/reports/RepositoryTab";
 import { AIInsightsTab } from "@/components/reports/AIInsightsTab";
 import { TrendsTab } from "@/components/reports/TrendsTab";
+import { PerformanceReportTab } from "@/components/reports/PerformanceReportTab";
 import { getPageCache, setPageCache } from "@/lib/pageDataCache";
 
 // Two of these four caches are eager, unconditional-on-mount fetches — what the header stat chips
@@ -78,6 +83,7 @@ const REPORT_VIEW_LABELS: Record<ReportView, string> = {
   execution: "Execution Report",
   matrix: "Traceability Matrix",
   repository: "Repository",
+  performance: "Performance",
   insights: "AI Insights",
   trends: "Trends",
 };
@@ -148,6 +154,11 @@ export default function ReportsPage() {
   // Trends state
   const [trends, setTrends] = useState<ReportsTrends | null>(null);
   const [trendsLoading, setTrendsLoading] = useState(false);
+
+  // Performance report state
+  const [perfRange, setPerfRange] = useState<PerformanceReportRange>("30d");
+  const [perfReport, setPerfReport] = useState<PerformanceProjectReport | null>(null);
+  const [perfLoading, setPerfLoading] = useState(false);
 
   useEffect(() => {
     if (!auth) router.replace("/login");
@@ -229,6 +240,16 @@ export default function ReportsPage() {
       .catch(() => setInsights(null))
       .finally(() => setInsightsLoading(false));
   }, [auth, projectId]);
+
+  useEffect(() => {
+    if (!auth) return;
+    if (activeView !== "overview" && activeView !== "performance") return;
+    setPerfLoading(true);
+    getPerformanceProjectReport(projectId, activeView === "overview" ? "30d" : perfRange)
+      .then(setPerfReport)
+      .catch(() => setPerfReport(null))
+      .finally(() => setPerfLoading(false));
+  }, [auth, projectId, activeView, perfRange]);
 
   const loadExecReport = useCallback(() => {
     setExecLoading(true);
@@ -335,6 +356,16 @@ export default function ReportsPage() {
       ? { filterBy: execFilterBy, filterValue: execFilterValue }
       : undefined;
 
+  const csvExportHref =
+    activeView === "performance"
+      ? getPerformanceProjectReportExportUrl(projectId, perfRange, "csv")
+      : getReportsExportUrl(projectId, activeView, "csv", exportParams);
+
+  const xlsxExportHref =
+    activeView === "performance"
+      ? getPerformanceProjectReportExportUrl(projectId, perfRange, "xlsx")
+      : getReportsExportUrl(projectId, activeView, "xlsx", exportParams);
+
   if (!auth) {
     return <PageLoader variant="content" />;
   }
@@ -378,7 +409,7 @@ export default function ReportsPage() {
                     {REPORT_VIEW_LABELS[activeView]}
                   </p>
                   <a
-                    href={getReportsExportUrl(projectId, activeView, "csv", exportParams)}
+                    href={csvExportHref}
                     target="_blank"
                     rel="noreferrer"
                     data-testid="reports-export-csv"
@@ -389,7 +420,7 @@ export default function ReportsPage() {
                     Export as CSV
                   </a>
                   <a
-                    href={getReportsExportUrl(projectId, activeView, "xlsx", exportParams)}
+                    href={xlsxExportHref}
                     target="_blank"
                     rel="noreferrer"
                     data-testid="reports-export-xlsx"
@@ -444,12 +475,20 @@ export default function ReportsPage() {
             activeView={activeView}
             onViewChange={setActiveView}
             flakyCount={insights?.flakyTests.length ?? 0}
-            csvHref={getReportsExportUrl(projectId, activeView, "csv", exportParams)}
-            xlsxHref={getReportsExportUrl(projectId, activeView, "xlsx", exportParams)}
+            csvHref={csvExportHref}
+            xlsxHref={xlsxExportHref}
           />
 
           <div className="min-w-0 flex-1 overflow-y-auto p-5">
-            {activeView === "overview" && <OverviewTab overview={overview} loading={overviewLoading} />}
+            {activeView === "overview" && (
+              <OverviewTab
+                projectId={projectId}
+                overview={overview}
+                loading={overviewLoading}
+                performanceReport={perfReport}
+                onOpenPerformance={() => setActiveView("performance")}
+              />
+            )}
             {activeView === "execution" && (
               <ExecutionReportTab
                 rows={execRows}
@@ -482,6 +521,15 @@ export default function ReportsPage() {
               onOffsetChange={setMatrixOffset}
             />}
             {activeView === "repository" && <RepositoryTab summary={repoSummary} loading={repoLoading} />}
+            {activeView === "performance" && (
+              <PerformanceReportTab
+                projectId={projectId}
+                report={perfReport}
+                loading={perfLoading}
+                range={perfRange}
+                onRangeChange={setPerfRange}
+              />
+            )}
             {activeView === "insights" && <AIInsightsTab insights={insights} loading={insightsLoading} />}
             {activeView === "trends" && <TrendsTab trends={trends} loading={trendsLoading} />}
           </div>

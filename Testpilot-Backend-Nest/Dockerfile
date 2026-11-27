@@ -26,6 +26,13 @@ RUN npm install --no-save @tesseract.js-data/eng@1.0.0 \
 ENV PLAYWRIGHT_BROWSERS_PATH=/app/pw-browsers
 RUN npx playwright install --with-deps chromium firefox webkit
 
+ARG K6_VERSION=v0.55.0
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates tar \
+    && ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/grafana/k6/releases/download/${K6_VERSION}/k6-${K6_VERSION}-linux-${ARCH}.tar.gz" \
+    | tar -xz --strip-components=1 -C /usr/local/bin "k6-${K6_VERSION}-linux-${ARCH}/k6" \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /build/dist ./dist
 COPY migrations ./migrations
 

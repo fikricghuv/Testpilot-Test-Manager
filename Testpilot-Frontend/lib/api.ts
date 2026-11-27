@@ -5068,3 +5068,417 @@ export async function saveAutomationAuthConfig(
     { method: "PUT", body: data }
   );
 }
+
+// ---------- Performance Tests (Grafana k6) ----------
+
+export type PerformanceTestMode = "builder" | "flow" | "script";
+export type PerformanceHttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+export type PerformanceRunStatus = "queued" | "running" | "passed" | "failed" | "error" | "cancelled";
+export type PerformanceLoadProfile = "fixed" | "ramping" | "constant-arrival-rate";
+
+export interface PerformanceStage {
+  durationSec: number;
+  targetVus: number;
+}
+
+export interface PerformanceBuilderConfig {
+  targetUrl: string;
+  method: PerformanceHttpMethod;
+  headers?: Record<string, string>;
+  body?: string | null;
+  loadProfile?: PerformanceLoadProfile;
+  vus: number;
+  durationSec: number;
+  targetRps?: number | null;
+  stages?: PerformanceStage[];
+  sleepSec?: number;
+  p95ThresholdMs?: number | null;
+  errorRateThresholdPct?: number | null;
+  expectedStatus?: number | null;
+}
+
+export interface PerformanceRunSummary {
+  id: string;
+  status: PerformanceRunStatus;
+  vus: number | null;
+  durationSec: number | null;
+  totalRequests: number | null;
+  rps: number | null;
+  errorRate: number | null;
+  avgMs: number | null;
+  p95Ms: number | null;
+  thresholdsPassed: boolean | null;
+  durationMs: number | null;
+  createdAt: string;
+  finishedAt: string | null;
+}
+
+export interface PerformanceTimeseriesPoint {
+  t: number;
+  rps: number;
+  failedRps?: number;
+  avgMs: number;
+  medMs?: number;
+  p90Ms?: number;
+  p95Ms: number;
+  p99Ms?: number;
+  errorRate: number;
+  vus: number;
+  waitingMs?: number;
+  connectingMs?: number;
+  tlsMs?: number;
+}
+
+export interface PerformanceEndpointBreakdown {
+  method: string;
+  url: string;
+  count: number;
+  failed: number;
+  errorRate: number;
+  avgMs: number;
+  medMs: number;
+  p90Ms: number;
+  p95Ms: number;
+  maxMs: number;
+}
+
+export interface PerformanceCheckBreakdown {
+  group: string;
+  name: string;
+  passes: number;
+  fails: number;
+}
+
+export interface PerformanceRunBreakdown {
+  endpoints: PerformanceEndpointBreakdown[];
+  statusCodes: Record<string, number>;
+  checks: PerformanceCheckBreakdown[];
+}
+
+export interface PerformanceRunRecord extends PerformanceRunSummary {
+  projectId: string;
+  testId: string;
+  minMs: number | null;
+  medMs: number | null;
+  p90Ms: number | null;
+  maxMs: number | null;
+  checksPassed: number | null;
+  checksFailed: number | null;
+  summaryJson: Record<string, unknown> | null;
+  timeseriesJson: PerformanceTimeseriesPoint[] | null;
+  breakdownJson: PerformanceRunBreakdown | null;
+  stdout: string | null;
+  stderr: string | null;
+  errorMessage: string | null;
+  triggeredBy: string | null;
+  startedAt: string | null;
+}
+
+export interface PerformanceFlowStep {
+  id: string;
+  name: string;
+  method: PerformanceHttpMethod;
+  url: string;
+  headers?: Record<string, string>;
+  body?: string | null;
+  expectedStatus?: number | null;
+  sleepAfterSec?: number;
+  enabled?: boolean;
+}
+
+export interface PerformanceFlowConfig {
+  loadProfile?: PerformanceLoadProfile;
+  vus: number;
+  durationSec: number;
+  targetRps?: number | null;
+  stages?: PerformanceStage[];
+  p95ThresholdMs?: number | null;
+  errorRateThresholdPct?: number | null;
+  steps: PerformanceFlowStep[];
+}
+
+export interface RecordedApiCall {
+  id: string;
+  method: PerformanceHttpMethod;
+  url: string;
+  headers: Record<string, string>;
+  body: string | null;
+  status: number | null;
+  resourceType: string;
+  timestamp: string;
+}
+
+export interface RecorderActiveSelect {
+  x: number;
+  y: number;
+  options: Array<{ value: string; text: string; selected: boolean }>;
+}
+
+export interface RecorderSessionState {
+  sessionId: string;
+  projectId: string;
+  startUrl: string;
+  currentUrl: string | null;
+  interactive: boolean;
+  status: "recording" | "stopped" | "error";
+  capturedCalls: RecordedApiCall[];
+  activeSelect?: RecorderActiveSelect | null;
+  errorMessage: string | null;
+  startedAt: string;
+}
+
+export interface PerformanceTestRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string | null;
+  mode: PerformanceTestMode;
+  builderConfig: PerformanceBuilderConfig | null;
+  flowConfig: PerformanceFlowConfig | null;
+  scriptContent: string;
+  createdBy: string | null;
+  updatedBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+  latestRun?: PerformanceRunSummary | null;
+}
+
+export async function listPerformanceTests(
+  projectId: string
+): Promise<{ list: PerformanceTestRecord[] }> {
+  return api<{ list: PerformanceTestRecord[] }>(
+    `/api/projects/${projectId}/performance-tests`
+  );
+}
+
+export async function createPerformanceTest(
+  projectId: string,
+  data: {
+    name: string;
+    description?: string | null;
+    mode?: PerformanceTestMode;
+    builderConfig?: PerformanceBuilderConfig | null;
+    flowConfig?: PerformanceFlowConfig | null;
+    scriptContent?: string | null;
+  }
+): Promise<{ test: PerformanceTestRecord }> {
+  return api<{ test: PerformanceTestRecord }>(
+    `/api/projects/${projectId}/performance-tests`,
+    { method: "POST", body: data }
+  );
+}
+
+export async function getPerformanceTest(
+  projectId: string,
+  testId: string
+): Promise<{ test: PerformanceTestRecord; runs: PerformanceRunRecord[] }> {
+  return api<{ test: PerformanceTestRecord; runs: PerformanceRunRecord[] }>(
+    `/api/projects/${projectId}/performance-tests/${testId}`
+  );
+}
+
+export async function updatePerformanceTest(
+  projectId: string,
+  testId: string,
+  data: {
+    name?: string;
+    description?: string | null;
+    mode?: PerformanceTestMode;
+    builderConfig?: PerformanceBuilderConfig | null;
+    flowConfig?: PerformanceFlowConfig | null;
+    scriptContent?: string | null;
+  }
+): Promise<{ test: PerformanceTestRecord }> {
+  return api<{ test: PerformanceTestRecord }>(
+    `/api/projects/${projectId}/performance-tests/${testId}`,
+    { method: "PUT", body: data }
+  );
+}
+
+export async function deletePerformanceTest(
+  projectId: string,
+  testId: string
+): Promise<{ deleted: true }> {
+  return api<{ deleted: true }>(
+    `/api/projects/${projectId}/performance-tests/${testId}`,
+    { method: "DELETE" }
+  );
+}
+
+export async function triggerPerformanceRun(
+  projectId: string,
+  testId: string
+): Promise<{ run: PerformanceRunRecord }> {
+  return api<{ run: PerformanceRunRecord }>(
+    `/api/projects/${projectId}/performance-tests/${testId}/run`,
+    { method: "POST" }
+  );
+}
+
+export async function getPerformanceRun(
+  projectId: string,
+  testId: string,
+  runId: string
+): Promise<{ run: PerformanceRunRecord }> {
+  return api<{ run: PerformanceRunRecord }>(
+    `/api/projects/${projectId}/performance-tests/${testId}/runs/${runId}`
+  );
+}
+
+export async function cancelPerformanceRun(
+  projectId: string,
+  testId: string,
+  runId: string
+): Promise<{ run: PerformanceRunRecord }> {
+  return api<{ run: PerformanceRunRecord }>(
+    `/api/projects/${projectId}/performance-tests/${testId}/runs/${runId}/cancel`,
+    { method: "POST" }
+  );
+}
+
+export async function startPerformanceRecorder(
+  projectId: string,
+  startUrl: string
+): Promise<{ session: RecorderSessionState }> {
+  return api<{ session: RecorderSessionState }>(
+    `/api/projects/${projectId}/performance-tests/recorder/start`,
+    { method: "POST", body: { startUrl } }
+  );
+}
+
+export async function getPerformanceRecorder(
+  projectId: string,
+  sessionId: string
+): Promise<{ session: RecorderSessionState }> {
+  return api<{ session: RecorderSessionState }>(
+    `/api/projects/${projectId}/performance-tests/recorder/${sessionId}`
+  );
+}
+
+export async function stopPerformanceRecorder(
+  projectId: string,
+  sessionId: string
+): Promise<{ session: RecorderSessionState }> {
+  return api<{ session: RecorderSessionState }>(
+    `/api/projects/${projectId}/performance-tests/recorder/${sessionId}/stop`,
+    { method: "POST" }
+  );
+}
+
+export async function performPerformanceRecorderAction(
+  projectId: string,
+  sessionId: string,
+  action: { type: string; x?: number; y?: number; text?: string; key?: string; url?: string; deltaY?: number; value?: string }
+): Promise<{ session: RecorderSessionState }> {
+  return api<{ session: RecorderSessionState }>(
+    `/api/projects/${projectId}/performance-tests/recorder/${sessionId}/action`,
+    { method: "POST", body: action }
+  );
+}
+
+export function getPerformanceRecorderFrameUrl(projectId: string, sessionId: string, tick: number): string {
+  return `${API_BASE}/api/projects/${projectId}/performance-tests/recorder/${sessionId}/frame?t=${tick}`;
+}
+
+export async function downloadPerformanceRunPdf(
+  projectId: string,
+  testId: string,
+  runId: string,
+  fileName = "performance-report.pdf"
+): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/api/projects/${projectId}/performance-tests/${testId}/runs/${runId}/report`,
+    { credentials: "include" }
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to generate PDF report (${res.status})`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function importPerformanceHar(
+  projectId: string,
+  har: unknown
+): Promise<{ calls: RecordedApiCall[] }> {
+  return api<{ calls: RecordedApiCall[] }>(
+    `/api/projects/${projectId}/performance-tests/import-har`,
+    { method: "POST", body: { har } }
+  );
+}
+
+export type PerformanceReportRange = "7d" | "30d" | "all";
+
+export interface PerformanceProjectReport {
+  range: PerformanceReportRange;
+  kpis: {
+    totalScenarios: number;
+    totalRuns: number;
+    passedRuns: number;
+    failedRuns: number;
+    passRatePct: number | null;
+    avgP95Ms: number | null;
+    avgRps: number | null;
+    avgErrorRate: number | null;
+  };
+  trend: Array<{
+    runId: string;
+    testId: string;
+    testName: string;
+    status: PerformanceRunStatus;
+    p95Ms: number | null;
+    rps: number | null;
+    errorRate: number | null;
+    createdAt: string;
+  }>;
+  scenarios: Array<{
+    id: string;
+    name: string;
+    mode: PerformanceTestMode;
+    totalRuns: number;
+    passedRuns: number;
+    failedRuns: number;
+    passRatePct: number | null;
+    avgP95Ms: number | null;
+    avgRps: number | null;
+    avgErrorRate: number | null;
+    latestStatus: PerformanceRunStatus | null;
+    latestRunAt: string | null;
+  }>;
+  slowestEndpoints: Array<{
+    method: string;
+    url: string;
+    testId: string;
+    testName: string;
+    totalCount: number;
+    failedCount: number;
+    errorRate: number;
+    avgMs: number;
+    p95Ms: number;
+    maxMs: number;
+  }>;
+}
+
+export async function getPerformanceProjectReport(
+  projectId: string,
+  range: PerformanceReportRange = "30d"
+): Promise<PerformanceProjectReport> {
+  return api<PerformanceProjectReport>(
+    `/api/projects/${projectId}/performance-tests/report?range=${encodeURIComponent(range)}`
+  );
+}
+
+export function getPerformanceProjectReportExportUrl(
+  projectId: string,
+  range: PerformanceReportRange,
+  format: "csv" | "xlsx"
+): string {
+  return `${API_BASE}/api/projects/${projectId}/performance-tests/report/export/${format}?range=${encodeURIComponent(range)}`;
+}

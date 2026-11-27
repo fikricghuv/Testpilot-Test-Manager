@@ -24,6 +24,7 @@ import { AnalyticsReportModule } from "./analytics-report/analytics-report.modul
 import { ReviewBoardModule } from "./review-board/review-board.module";
 import { ScriptRunnerModule } from "./script-runner/script-runner.module";
 import { AutomationAgentsModule } from "./automation-agents/automation-agents.module";
+import { PerformanceTestsModule } from "./performance-tests/performance-tests.module";
 import { NyraModule } from "./nyra/nyra.module";
 import { ZyraArchiveSweepModule } from "./zyra-archive-sweep/zyra-archive-sweep.module";
 import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
@@ -57,6 +58,7 @@ import { DueDateSweepModule } from "./due-date-sweep/due-date-sweep.module";
     ReviewBoardModule,
     ScriptRunnerModule,
     AutomationAgentsModule,
+    PerformanceTestsModule,
     NyraModule
   ],
   // Global so every current and future mutating /api/projects/:id route is covered; the guard

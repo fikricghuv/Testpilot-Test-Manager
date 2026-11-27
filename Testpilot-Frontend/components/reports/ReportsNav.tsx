@@ -6,12 +6,13 @@ import {
   IconTable,
   IconDatabase,
   IconActivity,
+  IconBolt,
   IconTrendingUp,
   IconFileExport,
   IconTableExport,
 } from "@tabler/icons-react";
 
-export type ReportView = "overview" | "execution" | "matrix" | "repository" | "insights" | "trends";
+export type ReportView = "overview" | "execution" | "matrix" | "repository" | "performance" | "insights" | "trends";
 
 type NavItem = {
   id: ReportView;
@@ -24,6 +25,7 @@ const REPORT_ITEMS: NavItem[] = [
   { id: "execution", label: "Execution Report", icon: IconChartBar },
   { id: "matrix", label: "Traceability", icon: IconTable },
   { id: "repository", label: "Repository", icon: IconDatabase },
+  { id: "performance", label: "Performance", icon: IconBolt },
 ];
 
 function NavRow({
