@@ -17,7 +17,7 @@ import {
   setCustomFieldDefinitionStatus,
   type CustomFieldDefinition,
 } from "@/lib/api";
-import { Button, Card, Modal, StatusChip } from "@/components/ui";
+import { Button, Card, ConfirmModal, Modal, StatusChip } from "@/components/ui";
 import { FIELD_TYPE_LABELS } from "./customFieldTypes";
 
 function statusTone(status: string): "success" | "neutral" | "error" {
@@ -43,6 +43,7 @@ export default function CustomFieldDefinitionList({
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<CustomFieldDefinition | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [archiveTarget, setArchiveTarget] = useState<CustomFieldDefinition | null>(null);
   // Fields deleted during this page view, kept only so an "Undo" affordance can be shown in place
   // of the row. Deliberately plain component state (not persisted anywhere): once the settings
   // page is reloaded, the undo window is gone for good even though the row is still recoverable
@@ -109,15 +110,22 @@ export default function CustomFieldDefinitionList({
     }
   }
 
-  async function archive(definition: CustomFieldDefinition) {
-    if (!window.confirm(`Archive "${definition.name}"? Archived fields become read-only everywhere.`)) return;
+  function archive(definition: CustomFieldDefinition) {
+    setArchiveTarget(definition);
+  }
+
+  async function confirmArchive() {
+    if (!archiveTarget) return;
+    const definition = archiveTarget;
     setBusyId(definition.id);
     setError(null);
     try {
       await setCustomFieldDefinitionStatus(projectId, definition.id, "archived");
+      setArchiveTarget(null);
       onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to archive field.");
+      setArchiveTarget(null);
     } finally {
       setBusyId(null);
     }
@@ -396,6 +404,23 @@ export default function CustomFieldDefinitionList({
           </div>
         </div>
       </Modal>
+
+      <ConfirmModal
+        open={Boolean(archiveTarget)}
+        title="Archive custom field"
+        message={
+          archiveTarget
+            ? `Archive "${archiveTarget.name}"? Archived fields become read-only everywhere.`
+            : ""
+        }
+        confirmLabel="Archive"
+        loading={Boolean(archiveTarget && busyId === archiveTarget.id)}
+        loadingLabel="Archiving…"
+        onConfirm={() => void confirmArchive()}
+        onCancel={() => {
+          if (!busyId) setArchiveTarget(null);
+        }}
+      />
     </>
   );
 }

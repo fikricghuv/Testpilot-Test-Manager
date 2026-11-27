@@ -23,6 +23,7 @@ import { StorageService } from "../storage/storage.service";
 import {
   MAX_SCRIPT_CONTENT_LENGTH,
   MAX_SCRIPT_OUTPUT_LENGTH,
+  SCRIPT_BROWSERS,
   SCRIPT_EXECUTION_TIMEOUT_MS,
   SCRIPT_FRAMEWORKS,
   SCRIPT_RUNNER_JOB,
@@ -31,7 +32,9 @@ import {
   SCRIPT_STATUSES
 } from "./script-runner.constants";
 import type {
+  RecordHeadedRunInput,
   RecorderSessionResponse,
+  ScriptBrowser,
   ScriptFramework,
   ScriptRunnerJobPayload,
   ScriptSource,
@@ -54,6 +57,15 @@ function truncateOutput(value: unknown): string | null {
   if (!trimmed) return null;
   if (trimmed.length <= MAX_SCRIPT_OUTPUT_LENGTH) return trimmed;
   return `${trimmed.slice(0, MAX_SCRIPT_OUTPUT_LENGTH)}\n...[truncated]`;
+}
+
+function normalizeBrowser(raw: unknown): ScriptBrowser {
+  if (raw === undefined || raw === null || raw === "") return "chromium";
+  const val = String(raw).trim().toLowerCase() as ScriptBrowser;
+  if (!SCRIPT_BROWSERS.includes(val)) {
+    throw new BadRequestException({ error: `Unsupported browser: ${String(raw)}. Use chromium, firefox, webkit, or all.` });
+  }
+  return val;
 }
 
 function validateTargetUrl(raw: unknown): string | null {
@@ -446,9 +458,11 @@ export class ScriptRunnerService {
 
     const overrideUrl = validateTargetUrl(input.targetUrl);
     const effectiveTargetUrl = overrideUrl ?? script.target_url ?? null;
+    const browser = normalizeBrowser(input.browser);
 
     const runRow = await this.db.transaction(async (client) => {
-      const cycleName = `Script Run: ${tc.externalId || tc.title}`.slice(0, 255);
+      const browserTag = browser !== "chromium" ? ` [${browser}]` : "";
+      const cycleName = `Script Run: ${tc.externalId || tc.title}${browserTag}`.slice(0, 255);
       const cycleRes = await client.query<{ id: string }>(
         `INSERT INTO cycles (project_id, name, owner_id, status, started_at, source, triggered_by)
          VALUES ($1, $2, $3, 'In Progress', now(), 'automation', 'local')
@@ -485,11 +499,133 @@ export class ScriptRunnerService {
 
     await this.queue.add(
       SCRIPT_RUNNER_JOB,
-      { runId: runRow.id },
+      { runId: runRow.id, browser },
       { removeOnComplete: 50, removeOnFail: 50 }
     );
 
     return { run: mapRunRow(runRow) };
+  }
+
+  /**
+   * Records the result of a headed Chrome Extension run so it produces a Test Run (cycle),
+   * execution record, optional screenshot evidence, and downloadable report just like headless runs.
+   */
+  async recordHeadedRun(
+    userId: string | null | undefined,
+    projectId: string,
+    testcaseId: string,
+    input: RecordHeadedRunInput
+  ): Promise<{ run: TestScriptRunRecord | null; cycleId: string; executionId: string }> {
+    const uid = this.legacy.requireSession(userId);
+    await this.legacy.requireProjectAccess(uid, projectId);
+    const tc = await this.assertTestCaseInProject(projectId, testcaseId);
+
+    const status = input.status === "passed" || input.status === "failed" || input.status === "error"
+      ? input.status
+      : "failed";
+    const execStatus = status === "passed" ? "Pass" : "Fail";
+    const effectiveTargetUrl = validateTargetUrl(input.targetUrl) ?? null;
+    const durationMs =
+      typeof input.durationMs === "number" && Number.isFinite(input.durationMs) && input.durationMs >= 0
+        ? Math.round(input.durationMs)
+        : null;
+    const stdout = typeof input.stdout === "string" ? input.stdout.slice(0, 16_000) : null;
+    const stderr = typeof input.stderr === "string" ? input.stderr.slice(0, 16_000) : null;
+    const errorMessage = typeof input.errorMessage === "string" ? input.errorMessage.slice(0, 8_000) : null;
+
+    const scriptRes = await this.db.query<{ id: string; active_version_id: string | null }>(
+      `SELECT id, active_version_id
+       FROM test_scripts
+       WHERE project_id = $1 AND testcase_id = $2 AND framework = 'playwright-ts'
+       LIMIT 1`,
+      [projectId, testcaseId]
+    );
+    const script = scriptRes.rows[0] || null;
+
+    const result = await this.db.transaction(async (client) => {
+      const cycleName = `Headed Run: ${tc.externalId || tc.title}`.slice(0, 255);
+      const cycleRes = await client.query<{ id: string }>(
+        `INSERT INTO cycles (project_id, name, owner_id, status, started_at, completed_at, source, triggered_by)
+         VALUES ($1, $2, $3, 'Completed', now(), now(), 'automation', 'local')
+         RETURNING id`,
+        [projectId, cycleName, uid]
+      );
+      const cycleId = cycleRes.rows[0].id;
+
+      const cycleItemRes = await client.query<{ id: string }>(
+        `INSERT INTO cycle_items (cycle_id, testcase_id, snapshot_title, position) VALUES ($1, $2, $3, 1) RETURNING id`,
+        [cycleId, testcaseId, tc.title]
+      );
+      const cycleItemId = cycleItemRes.rows[0].id;
+
+      const execRes = await client.query<{ id: string }>(
+        `INSERT INTO executions (cycle_item_id, status, reported_by, executed_by, duration_ms, error_message)
+         VALUES ($1, $2, 'automation', $3, $4, $5)
+         RETURNING id`,
+        [cycleItemId, execStatus, uid, durationMs, errorMessage]
+      );
+      const executionId = execRes.rows[0].id;
+
+      let runRow: Record<string, any> | null = null;
+      if (script) {
+        const insertedRun = await client.query(
+          `INSERT INTO test_script_runs (
+             project_id, testcase_id, script_id, version_id, cycle_id, execution_id,
+             status, target_url, duration_ms, stdout, stderr, error_message,
+             triggered_by, started_at, finished_at
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, now(), now())
+           RETURNING *`,
+          [
+            projectId,
+            testcaseId,
+            script.id,
+            script.active_version_id,
+            cycleId,
+            executionId,
+            status,
+            effectiveTargetUrl,
+            durationMs,
+            stdout,
+            stderr,
+            errorMessage,
+            uid
+          ]
+        );
+        runRow = insertedRun.rows[0];
+      }
+
+      return { cycleId, executionId, runRow };
+    });
+
+    if (typeof input.screenshotDataUrl === "string") {
+      const match = input.screenshotDataUrl.match(/^data:image\/(png|jpeg|jpg);base64,([A-Za-z0-9+/=]+)$/);
+      if (match) {
+        const ext = match[1] === "png" ? "png" : "jpg";
+        const contentType = ext === "png" ? "image/png" : "image/jpeg";
+        const buffer = Buffer.from(match[2], "base64");
+        if (buffer.length > 0 && buffer.length <= 5 * 1024 * 1024) {
+          await this.storeAttachment(
+            projectId,
+            result.executionId,
+            uid,
+            `headed-screenshot.${ext}`,
+            ext,
+            contentType,
+            "screenshot",
+            buffer
+          ).catch((err) => {
+            this.logger.warn(`Failed to store headed screenshot: ${err instanceof Error ? err.message : err}`);
+          });
+        }
+      }
+    }
+
+    return {
+      run: result.runRow ? mapRunRow(result.runRow) : null,
+      cycleId: result.cycleId,
+      executionId: result.executionId
+    };
   }
 
   async triggerSuiteRun(
@@ -515,6 +651,7 @@ export class ScriptRunnerService {
 
     const overrideUrl = validateTargetUrl(input.targetUrl);
     const onlyVerified = Boolean(input.onlyVerified);
+    const browser = normalizeBrowser(input.browser);
 
     const casesRes = await this.db.query<{
       testcase_id: string;
@@ -549,7 +686,8 @@ export class ScriptRunnerService {
     }
 
     const { cycleId, runs } = await this.db.transaction(async (client) => {
-      const cycleName = `Suite Run: ${suite.name}`.slice(0, 255);
+      const browserTag = browser !== "chromium" ? ` [${browser}]` : "";
+      const cycleName = `Suite Run: ${suite.name}${browserTag}`.slice(0, 255);
       const cycleRes = await client.query<{ id: string }>(
         `INSERT INTO cycles (project_id, name, owner_id, status, started_at, source, triggered_by)
          VALUES ($1, $2, $3, 'In Progress', now(), 'automation', 'local')
@@ -596,7 +734,7 @@ export class ScriptRunnerService {
     });
 
     for (const run of runs) {
-      await this.queue.add(SCRIPT_RUNNER_JOB, { runId: run.id }, { removeOnComplete: 50, removeOnFail: 50 });
+      await this.queue.add(SCRIPT_RUNNER_JOB, { runId: run.id, browser }, { removeOnComplete: 50, removeOnFail: 50 });
     }
 
     await this.legacy.logProjectActivity(projectId, uid, "triggered_suite_automation_run", "suite", suiteId, suite.name, {
@@ -1169,7 +1307,7 @@ export class ScriptRunnerService {
    * Executes a queued Playwright script in an isolated temporary directory and persists
    * the verdict back into test_script_runs, executions, and cycles.
    */
-  async executeRunJob(runId: string): Promise<void> {
+  async executeRunJob(runId: string, rawBrowser?: ScriptBrowser): Promise<void> {
     const runRes = await this.db.query<{
       id: string;
       project_id: string;
@@ -1218,15 +1356,28 @@ export class ScriptRunnerService {
       const specPath = path.join(tempDir, "test.spec.ts");
       const configPath = path.join(tempDir, "playwright.config.ts");
 
+      const browser = normalizeBrowser(rawBrowser);
+      const selectedProjects: string[] = [];
+      if (browser === "chromium" || browser === "all") {
+        selectedProjects.push(`{ name: "chromium", use: { ...devices["Desktop Chrome"] } }`);
+      }
+      if (browser === "firefox" || browser === "all") {
+        selectedProjects.push(`{ name: "firefox", use: { ...devices["Desktop Firefox"] } }`);
+      }
+      if (browser === "webkit" || browser === "all") {
+        selectedProjects.push(`{ name: "webkit", use: { ...devices["Desktop Safari"] } }`);
+      }
+
       const baseUrlLine = jobData.target_url ? `baseURL: ${JSON.stringify(jobData.target_url)},` : "";
       const configContent = [
-        `import { defineConfig } from "@playwright/test";`,
+        `import { defineConfig, devices } from "@playwright/test";`,
         `export default defineConfig({`,
         `  testDir: ".",`,
         `  outputDir: ${JSON.stringify(resultsDir)},`,
         `  timeout: ${SCRIPT_EXECUTION_TIMEOUT_MS},`,
         `  reporter: [["list"]],`,
-        `  use: { headless: true, ${baseUrlLine} screenshot: "on", trace: "on", video: "on" }`,
+        `  use: { headless: true, ignoreHTTPSErrors: true, ${baseUrlLine} screenshot: "on", trace: "on", video: "on" },`,
+        `  projects: [${selectedProjects.join(", ")}]`,
         `});`
       ].join("\n");
 
@@ -1244,6 +1395,9 @@ export class ScriptRunnerService {
           maxBuffer: 5 * 1024 * 1024,
           env: {
             ...process.env,
+            HOME: tempDir,
+            MOZ_DISABLE_CONTENT_SANDBOX: "1",
+            MOZ_DISABLE_GMP_SANDBOX: "1",
             NODE_PATH: process.env.NODE_PATH ? `${nodeModulesDir}${path.delimiter}${process.env.NODE_PATH}` : nodeModulesDir
           }
         }

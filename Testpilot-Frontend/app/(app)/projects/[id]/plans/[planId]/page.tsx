@@ -42,7 +42,7 @@ import {
   getTestRunEnvironments,
 } from "@/lib/api";
 import { computePassRate, computeExecutionProgress } from "@/lib/executionMetrics";
-import { Button, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
+import { Button, ConfirmModal, StatusChip, Input, PageLoader, Select, Field, FieldLabel, Card, EmptyStateBlock } from "@/components/ui";
 import Modal from "@/components/ui/Modal";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
@@ -249,10 +249,11 @@ export default function PlanDetailPage() {
     }
   }
 
-  async function handleDissociate(cycleId: string) {
-    if (!confirm("Remove this run from the plan?")) return;
-    await dissociateRunFromPlan(cycleId);
-    await loadData();
+  const [confirmAction, setConfirmAction] = useState<{ kind: "dissociate"; cycleId: string } | { kind: "delete-plan" } | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+
+  function handleDissociate(cycleId: string) {
+    setConfirmAction({ kind: "dissociate", cycleId });
   }
 
   // The saved start date: an unchanged past start must not block saving an already-started plan.
@@ -278,10 +279,26 @@ export default function PlanDetailPage() {
     await loadData();
   }
 
-  async function handleDelete() {
-    if (!confirm("Delete this test plan? Associated runs will not be deleted but will be unlinked.")) return;
-    await deletePlan(planId);
-    router.push(`/projects/${projectId}/plans`);
+  function handleDelete() {
+    setConfirmAction({ kind: "delete-plan" });
+  }
+
+  async function executeConfirmAction() {
+    if (!confirmAction || confirmBusy) return;
+    setConfirmBusy(true);
+    try {
+      if (confirmAction.kind === "dissociate") {
+        await dissociateRunFromPlan(confirmAction.cycleId);
+        setConfirmAction(null);
+        await loadData();
+      } else {
+        await deletePlan(planId);
+        setConfirmAction(null);
+        router.push(`/projects/${projectId}/plans`);
+      }
+    } finally {
+      setConfirmBusy(false);
+    }
   }
 
   const derivedProgress = useMemo<PlanProgress | null>(() => {
@@ -714,6 +731,23 @@ export default function PlanDetailPage() {
           </div>
         </div>
       </div>
+
+      <ConfirmModal
+        open={Boolean(confirmAction)}
+        title={confirmAction?.kind === "dissociate" ? "Remove run from plan" : "Delete test plan"}
+        message={
+          confirmAction?.kind === "dissociate"
+            ? "Remove this run from the plan?"
+            : "Delete this test plan? Associated runs will not be deleted but will be unlinked."
+        }
+        confirmLabel={confirmAction?.kind === "dissociate" ? "Remove" : "Delete"}
+        loading={confirmBusy}
+        loadingLabel={confirmAction?.kind === "dissociate" ? "Removing…" : "Deleting…"}
+        onConfirm={() => void executeConfirmAction()}
+        onCancel={() => {
+          if (!confirmBusy) setConfirmAction(null);
+        }}
+      />
     </main>
   );
 }

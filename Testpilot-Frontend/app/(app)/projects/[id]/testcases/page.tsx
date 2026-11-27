@@ -47,6 +47,7 @@ import {
   getTestCaseTags,
   runSuiteScripts,
   UNASSIGNED_SUITE_ID,
+  type TestScriptBrowser,
   type TestCaseListItem,
   type SuiteNode,
   type RepositorySummary,
@@ -79,6 +80,7 @@ import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import {
   Button,
+  ConfirmModal,
   CopyButton,
   Input,
   Select,
@@ -297,6 +299,7 @@ export default function TestCasesPage() {
   const projectId = params.id as string;
   const activeSuiteId = searchParams.get("suiteId");
   const [runningSuite, setRunningSuite] = useState(false);
+  const [suiteBrowser, setSuiteBrowser] = useState<TestScriptBrowser>("chromium");
   /*
    * "?suiteId=none" is the "No suites" node — the cases that belong to no suite.
    *
@@ -1354,10 +1357,15 @@ export default function TestCasesPage() {
     }
   }
 
-  async function handleDeletePanelTestCase() {
+  const [panelConfirmAction, setPanelConfirmAction] = useState<"delete" | "archive" | null>(null);
+
+  function handleDeletePanelTestCase() {
     if (!panelTestcaseId || panelSaving) return;
-    const ok = window.confirm("Delete this test case?");
-    if (!ok) return;
+    setPanelConfirmAction("delete");
+  }
+
+  async function confirmDeletePanelTestCase() {
+    if (!panelTestcaseId || panelSaving) return;
     setPanelSaving(true);
     setPanelError(null);
     try {
@@ -1374,19 +1382,24 @@ export default function TestCasesPage() {
         applyTestCasesPatch(applySingleCaseDelta(suites, repoSummary, deletedCase.status, deletedCase.suiteId, -1));
       }
       await loadSelectedSuiteCases();
+      setPanelConfirmAction(null);
       closePanel();
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to delete test case.";
       setPanelError(message);
+      setPanelConfirmAction(null);
     } finally {
       setPanelSaving(false);
     }
   }
 
-  async function handleArchivePanelTestCase() {
+  function handleArchivePanelTestCase() {
     if (!panelTestcaseId || panelSaving) return;
-    const ok = window.confirm("Archive this test case?");
-    if (!ok) return;
+    setPanelConfirmAction("archive");
+  }
+
+  async function confirmArchivePanelTestCase() {
+    if (!panelTestcaseId || panelSaving) return;
     setPanelSaving(true);
     setPanelError(null);
     try {
@@ -1402,11 +1415,13 @@ export default function TestCasesPage() {
           applyTestCaseEditDelta(suites, repoSummary, { oldStatus: prior.status, newStatus: "Archived", oldSuiteId: suiteId, newSuiteId: suiteId })
         );
       }
+      setPanelConfirmAction(null);
       await loadSelectedSuiteCases();
       await openViewPanel(panelTestcaseId);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to archive test case.";
       setPanelError(message);
+      setPanelConfirmAction(null);
     } finally {
       setPanelSaving(false);
     }
@@ -2023,27 +2038,40 @@ export default function TestCasesPage() {
                     </span>
                   )}
                   {activeSuiteId && !isUnfiledView && (
-                    <button
-                      type="button"
-                      disabled={runningSuite}
-                      onClick={async () => {
-                        setRunningSuite(true);
-                        setSuiteCasesError(null);
-                        try {
-                          const res = await runSuiteScripts(projectId, activeSuiteId);
-                          router.push(`/projects/${projectId}/cycles/${res.cycleId}`);
-                        } catch (err) {
-                          setSuiteCasesError(err instanceof Error ? err.message : "Failed to run Playwright suite.");
-                        } finally {
-                          setRunningSuite(false);
-                        }
-                      }}
-                      className="inline-flex items-center gap-1.5 rounded-full border border-[var(--brand-primary)] bg-[var(--brand-primary)] px-2.5 py-0.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-                      title="Run all Playwright scripts in this suite"
-                    >
-                      {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
-                      {runningSuite ? "Starting..." : "Run Suite (Playwright)"}
-                    </button>
+                    <div className="inline-flex items-center overflow-hidden rounded-full border border-[var(--brand-primary)] bg-[var(--brand-primary)] text-white">
+                      <select
+                        value={suiteBrowser}
+                        onChange={(e) => setSuiteBrowser(e.target.value as TestScriptBrowser)}
+                        aria-label="Suite browser"
+                        className="h-6 bg-transparent pl-2.5 pr-1 text-[11px] font-medium text-white focus:outline-none"
+                      >
+                        <option value="chromium" className="text-black">Chromium</option>
+                        <option value="firefox" className="text-black">Firefox</option>
+                        <option value="webkit" className="text-black">WebKit</option>
+                        <option value="all" className="text-black">All Browsers</option>
+                      </select>
+                      <button
+                        type="button"
+                        disabled={runningSuite}
+                        onClick={async () => {
+                          setRunningSuite(true);
+                          setSuiteCasesError(null);
+                          try {
+                            const res = await runSuiteScripts(projectId, activeSuiteId, { browser: suiteBrowser });
+                            router.push(`/projects/${projectId}/cycles/${res.cycleId}`);
+                          } catch (err) {
+                            setSuiteCasesError(err instanceof Error ? err.message : "Failed to run Playwright suite.");
+                          } finally {
+                            setRunningSuite(false);
+                          }
+                        }}
+                        className="inline-flex h-6 items-center gap-1.5 border-l border-white/25 px-2.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                        title="Run all Playwright scripts in this suite"
+                      >
+                        {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
+                        {runningSuite ? "Starting..." : "Run Suite"}
+                      </button>
+                    </div>
                   )}
                   <div className="ml-auto flex flex-wrap items-center gap-1.5">
                     {archivedHidden && (
@@ -3278,6 +3306,26 @@ export default function TestCasesPage() {
           {importToast}
         </div>
       )}
+
+      <ConfirmModal
+        open={Boolean(panelConfirmAction)}
+        title={panelConfirmAction === "delete" ? "Delete test case" : "Archive test case"}
+        message={
+          panelConfirmAction === "delete"
+            ? "Delete this test case?"
+            : "Archive this test case?"
+        }
+        confirmLabel={panelConfirmAction === "delete" ? "Delete" : "Archive"}
+        loading={panelSaving}
+        loadingLabel={panelConfirmAction === "delete" ? "Deleting…" : "Archiving…"}
+        onConfirm={() => {
+          if (panelConfirmAction === "delete") void confirmDeletePanelTestCase();
+          else if (panelConfirmAction === "archive") void confirmArchivePanelTestCase();
+        }}
+        onCancel={() => {
+          if (!panelSaving) setPanelConfirmAction(null);
+        }}
+      />
     </main>
   );
 }

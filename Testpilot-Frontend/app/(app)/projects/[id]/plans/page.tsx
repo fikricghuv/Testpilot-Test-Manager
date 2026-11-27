@@ -16,6 +16,7 @@ import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
 import {
   Button,
+  ConfirmModal,
   Input,
   Field,
   FieldLabel,
@@ -213,8 +214,16 @@ export default function PlansPage() {
     }
   }
 
-  async function handleDelete(plan: PlanListItem) {
-    if (!confirm(`Delete "${plan.name}"? Associated runs will not be deleted but will be unlinked.`)) return;
+  const [deleteTarget, setDeleteTarget] = useState<PlanListItem | null>(null);
+
+  function handleDelete(plan: PlanListItem) {
+    setDeleteTarget(plan);
+  }
+
+  async function confirmDeletePlan() {
+    if (!deleteTarget) return;
+    const plan = deleteTarget;
+    setDeleteTarget(null);
     const previous = plans;
     setPlans((list) => list.filter((p) => p.id !== plan.id));
     try {
@@ -553,6 +562,19 @@ export default function PlansPage() {
           />
         </>
       )}
+
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title="Delete test plan"
+        message={
+          deleteTarget
+            ? `Delete "${deleteTarget.name}"? Associated runs will not be deleted but will be unlinked.`
+            : ""
+        }
+        confirmLabel="Delete"
+        onConfirm={() => void confirmDeletePlan()}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </ListWorkspaceLayout>
   );
 }

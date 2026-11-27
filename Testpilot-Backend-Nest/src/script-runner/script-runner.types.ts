@@ -1,8 +1,15 @@
-import type { SCRIPT_FRAMEWORKS, SCRIPT_RUN_STATUSES, SCRIPT_SOURCES, SCRIPT_STATUSES } from "./script-runner.constants";
+import type {
+  SCRIPT_BROWSERS,
+  SCRIPT_FRAMEWORKS,
+  SCRIPT_RUN_STATUSES,
+  SCRIPT_SOURCES,
+  SCRIPT_STATUSES
+} from "./script-runner.constants";
 
 export type ScriptFramework = (typeof SCRIPT_FRAMEWORKS)[number];
 export type ScriptStatus = (typeof SCRIPT_STATUSES)[number];
 export type ScriptSource = (typeof SCRIPT_SOURCES)[number];
+export type ScriptBrowser = (typeof SCRIPT_BROWSERS)[number];
 export type ScriptRunStatus = (typeof SCRIPT_RUN_STATUSES)[number];
 
 export interface TestScriptRecord {
@@ -79,11 +86,23 @@ export interface RecorderSessionResponse {
 
 export interface TriggerScriptRunInput {
   targetUrl?: string | null;
+  browser?: ScriptBrowser;
+}
+
+export interface RecordHeadedRunInput {
+  status: "passed" | "failed" | "error";
+  targetUrl?: string | null;
+  durationMs?: number | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+  screenshotDataUrl?: string | null;
 }
 
 export interface TriggerSuiteRunInput {
   onlyVerified?: boolean;
   targetUrl?: string | null;
+  browser?: ScriptBrowser;
 }
 
 export interface SuiteRunResponse {
@@ -96,4 +115,5 @@ export interface SuiteRunResponse {
 
 export interface ScriptRunnerJobPayload {
   runId: string;
+  browser?: ScriptBrowser;
 }

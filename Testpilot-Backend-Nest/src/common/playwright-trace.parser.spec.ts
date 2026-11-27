@@ -50,6 +50,14 @@ describe("parsePlaywrightTraceArchive", () => {
         error: { message: "Strict mode violation", stack: "at test.spec.ts:8:5" }
       }),
       JSON.stringify({ type: "screencast-frame", file: "screencast/page1-1255.jpeg", timestamp: 1255 }),
+      JSON.stringify({
+        type: "frame-snapshot",
+        snapshot: {
+          snapshotName: "after@call@1",
+          frameUrl: "https://example.com/login",
+          html: ["html", {}, ["head", {}], ["body", {}, ["input", { type: "text", __playwright_value__: "student" }]]]
+        }
+      }),
       JSON.stringify({ type: "console", messageType: "error", text: "Failed to load resource", time: 1400 })
     ].join("\n");
 
@@ -94,6 +102,7 @@ describe("parsePlaywrightTraceArchive", () => {
       status: "passed"
     });
     expect(parsed.steps[0].frameDataUrl).toMatch(/^data:image\/png;base64,/);
+    expect(parsed.steps[0].afterSnapshotHtml).toContain('value="student"');
     expect(parsed.steps[1]).toMatchObject({
       apiName: "expect.toContainText",
       line: 8,

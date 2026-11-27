@@ -48,7 +48,7 @@ import {
   type KnowledgeBaseSummary,
   integrationProviderLabel,
 } from "@/lib/api";
-import { Button, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
+import { Button, ConfirmModal, Input, Textarea, Modal, Field, FieldLabel, FieldError, PageLoader, StatusChip, EmptyStateBlock } from "@/components/ui";
 import { ChangeHistoryList } from "@/components/knowledge-base/ChangeHistory";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
@@ -1197,7 +1197,14 @@ function KnowledgeBasePageInner() {
    * A failed lookup falls back to the cautious wording rather than the reassuring one — if we can't
    * tell, the user should be warned, not soothed.
    */
-  async function confirmFolderDelete(folderId: string, label: string): Promise<boolean> {
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => Promise<void>;
+  } | null>(null);
+  const [deletingItem, setDeletingItem] = useState(false);
+
+  async function buildFolderDeleteMessage(folderId: string, label: string): Promise<string> {
     let hasContents = true;
     try {
       const contents = await listKnowledgeFolderItems(projectId, folderId);
@@ -1205,11 +1212,9 @@ function KnowledgeBasePageInner() {
     } catch {
       hasContents = true;
     }
-    return window.confirm(
-      hasContents
-        ? `Deleting "${label}" will also move all its contents to trash. Continue?`
-        : `Delete "${label}"? It will be moved to trash.`,
-    );
+    return hasContents
+      ? `Deleting "${label}" will also move all its contents to trash. Continue?`
+      : `Delete "${label}"? It will be moved to trash.`;
   }
 
   async function handleFolderAction(action: FolderAction, folder: KnowledgeFolderTreeNode) {
@@ -1221,19 +1226,25 @@ function KnowledgeBasePageInner() {
     } else if (action === "move") {
       setMoveTarget({ kind: "folder", id: folder.id, excludeId: folder.id });
     } else if (action === "delete") {
-      if (!(await confirmFolderDelete(folder.id, folder.name))) return;
-      setError(null);
-      try {
-        await deleteKnowledgeFolder(projectId, folder.id);
-        if (selectedFolderId === folder.id) {
-          const root = await loadTree();
-          selectFolder(root.id);
-        } else {
-          await refresh();
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to delete folder.");
-      }
+      const message = await buildFolderDeleteMessage(folder.id, folder.name);
+      setDeleteConfirm({
+        title: "Delete folder",
+        message,
+        onConfirm: async () => {
+          setError(null);
+          try {
+            await deleteKnowledgeFolder(projectId, folder.id);
+            if (selectedFolderId === folder.id) {
+              const root = await loadTree();
+              selectFolder(root.id);
+            } else {
+              await refresh();
+            }
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "Failed to delete folder.");
+          }
+        },
+      });
     }
   }
 
@@ -1331,20 +1342,27 @@ function KnowledgeBasePageInner() {
 
   async function handleDeleteItem(item: KnowledgeItem) {
     const label = itemLabel(item);
-    const confirmed =
+    const message =
       item.type === "folder"
-        ? await confirmFolderDelete(item.id, label)
-        : window.confirm(`Delete "${label}"? It will be moved to trash.`);
-    if (!confirmed) return;
-    setError(null);
-    try {
-      if (item.type === "document") await deleteKnowledgeDocument(projectId, item.id);
-      else if (item.type === "file") await deleteKnowledgeFile(projectId, item.id);
-      else await deleteKnowledgeFolder(projectId, item.id);
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to delete item.");
-    }
+        ? await buildFolderDeleteMessage(item.id, label)
+        : `Delete "${label}"? It will be moved to trash.`;
+    const title =
+      item.type === "folder" ? "Delete folder" : item.type === "document" ? "Delete document" : "Delete file";
+    setDeleteConfirm({
+      title,
+      message,
+      onConfirm: async () => {
+        setError(null);
+        try {
+          if (item.type === "document") await deleteKnowledgeDocument(projectId, item.id);
+          else if (item.type === "file") await deleteKnowledgeFile(projectId, item.id);
+          else await deleteKnowledgeFolder(projectId, item.id);
+          await refresh();
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Failed to delete item.");
+        }
+      },
+    });
   }
 
   function openItem(item: KnowledgeItem) {
@@ -1849,6 +1867,26 @@ function KnowledgeBasePageInner() {
           </div>
         </div>
       </div>
+
+      <ConfirmModal
+        open={Boolean(deleteConfirm)}
+        title={deleteConfirm?.title ?? "Delete"}
+        message={deleteConfirm?.message ?? ""}
+        confirmLabel="Delete"
+        loading={deletingItem}
+        loadingLabel="Deleting…"
+        onConfirm={() => {
+          if (!deleteConfirm || deletingItem) return;
+          setDeletingItem(true);
+          void deleteConfirm.onConfirm().finally(() => {
+            setDeletingItem(false);
+            setDeleteConfirm(null);
+          });
+        }}
+        onCancel={() => {
+          if (!deletingItem) setDeleteConfirm(null);
+        }}
+      />
     </main>
   );
 }

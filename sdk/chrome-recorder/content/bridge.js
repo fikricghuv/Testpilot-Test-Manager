@@ -49,6 +49,17 @@
         },
         "*"
       );
+    } else if (msg?.type === "HEADED_RUN_REPORTED") {
+      window.postMessage(
+        {
+          type: "TESTPILOT_HEADED_RUN_REPORTED",
+          projectId: msg.projectId,
+          testcaseId: msg.testcaseId,
+          cycleId: msg.cycleId,
+          status: msg.status
+        },
+        "*"
+      );
     }
   });
 })();

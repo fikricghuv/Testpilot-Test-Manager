@@ -74,6 +74,13 @@ export default function TraceInspectorPage() {
 
   const selectedStep = summary?.steps[selectedIdx] ?? null;
 
+  const activeSnapshotHtml = useMemo(() => {
+    if (filmstripOverrideUrl || !selectedStep) return null;
+    return snapshotPhase === "before"
+      ? selectedStep.beforeSnapshotHtml || null
+      : selectedStep.afterSnapshotHtml || selectedStep.beforeSnapshotHtml || null;
+  }, [filmstripOverrideUrl, selectedStep, snapshotPhase]);
+
   const activeImageUrl = useMemo(() => {
     if (filmstripOverrideUrl) return filmstripOverrideUrl;
     if (!selectedStep) return null;
@@ -289,8 +296,17 @@ export default function TraceInspectorPage() {
               </div>
             )}
 
-            {activeImageUrl ? (
-              <div className="relative mx-auto overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] shadow-sm">
+            {activeSnapshotHtml ? (
+              <div className="flex-1 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-white shadow-sm">
+                <iframe
+                  srcDoc={activeSnapshotHtml}
+                  title={`DOM Snapshot (${snapshotPhase})`}
+                  sandbox=""
+                  className="h-full min-h-[420px] w-full border-0 bg-white"
+                />
+              </div>
+            ) : activeImageUrl ? (
+              <div className="relative mx-auto w-fit overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--surface)] shadow-sm">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={activeImageUrl}

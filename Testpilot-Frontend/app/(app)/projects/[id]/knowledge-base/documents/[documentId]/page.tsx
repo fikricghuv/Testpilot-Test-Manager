@@ -31,7 +31,7 @@ import {
   integrationProviderLabel,
 } from "@/lib/api";
 import { canModifyKnowledgeItem } from "@/lib/knowledge-permissions";
-import { Button, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
+import { Button, ConfirmModal, Input, Modal, PageLoader, StatusChip } from "@/components/ui";
 import RichTextEditor from "@/components/knowledge-base/RichTextEditor";
 import { DocumentComments } from "@/components/knowledge-base/DocumentComments";
 import { ZyraMemoryEntries } from "@/components/knowledge-base/ZyraMemoryEntries";
@@ -420,13 +420,25 @@ export default function KnowledgeDocumentPage() {
     }
   }
 
-  async function handleDelete() {
-    if (!window.confirm(`Delete "${title}"? It will be moved to trash.`)) return;
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deletingDoc, setDeletingDoc] = useState(false);
+
+  function handleDelete() {
+    setDeleteConfirmOpen(true);
+  }
+
+  async function confirmDeleteDoc() {
+    if (deletingDoc) return;
+    setDeletingDoc(true);
     try {
       await deleteKnowledgeDocument(projectId, documentId);
+      setDeleteConfirmOpen(false);
       router.push(`/projects/${projectId}/knowledge-base`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete document.");
+      setDeleteConfirmOpen(false);
+    } finally {
+      setDeletingDoc(false);
     }
   }
 
@@ -785,6 +797,19 @@ export default function KnowledgeDocumentPage() {
       <Modal open={historyOpen} onClose={closeHistoryModal} title="Update History">
         {historyModalBody}
       </Modal>
+
+      <ConfirmModal
+        open={deleteConfirmOpen}
+        title="Delete document"
+        message={`Delete "${title}"? It will be moved to trash.`}
+        confirmLabel="Delete"
+        loading={deletingDoc}
+        loadingLabel="Deleting…"
+        onConfirm={() => void confirmDeleteDoc()}
+        onCancel={() => {
+          if (!deletingDoc) setDeleteConfirmOpen(false);
+        }}
+      />
     </div>
   );
 }

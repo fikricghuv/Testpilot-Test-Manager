@@ -32,6 +32,7 @@ import {
   startTestCaseAiGenerate,
   startTestCaseAiHeal,
   type TestAgentJobRecord,
+  type TestScriptBrowser,
   type TestScriptRunRecord,
   type TestScriptStateResponse,
   type TestScriptStatus,
@@ -87,6 +88,7 @@ export function TestCaseScriptTab({
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
   const [runMode, setRunMode] = useState<"headless" | "headed">("headless");
+  const [selectedBrowser, setSelectedBrowser] = useState<TestScriptBrowser>("chromium");
   const [launchingRecorder, setLaunchingRecorder] = useState(false);
   const [extensionReady, setExtensionReady] = useState(false);
   const [showInstallModal, setShowInstallModal] = useState(false);
@@ -169,6 +171,17 @@ export function TestCaseScriptTab({
         event.data.testcaseId === testcaseId
       ) {
         void loadScript();
+      } else if (
+        event.data.type === "TESTPILOT_HEADED_RUN_REPORTED" &&
+        event.data.projectId === projectId &&
+        event.data.testcaseId === testcaseId
+      ) {
+        void loadScript();
+        setSuccess(
+          event.data.status === "passed"
+            ? "Headed Chrome run passed and report was generated."
+            : "Headed Chrome run finished with failures and report was generated."
+        );
       }
     }
     function onFocusOrVisible() {
@@ -319,6 +332,7 @@ export function TestCaseScriptTab({
       }
       const res = await runTestCaseScript(projectId, testcaseId, {
         targetUrl: targetUrl.trim() || null,
+        browser: selectedBrowser,
       });
       setActiveRun(res.run);
     } catch (err) {
@@ -493,6 +507,26 @@ export function TestCaseScriptTab({
     setError(null);
     setSuccess(null);
     try {
+      let session: { apiBaseUrl: string; token: string; projectId: string } | null = null;
+      if (autoRun) {
+        if (dirty) {
+          const updated = await saveTestCaseScript(projectId, testcaseId, {
+            scriptContent,
+            framework: "playwright-ts",
+            targetUrl: targetUrl.trim() || null,
+            status,
+            notes: notes.trim() || "Auto-saved before headed run",
+          });
+          applyLoadedState(updated);
+        }
+        const issued = await createTestCaseRecorderSession(projectId, testcaseId);
+        session = {
+          apiBaseUrl: API_BASE,
+          token: issued.token,
+          projectId: issued.projectId,
+        };
+      }
+
       const ack = await new Promise<{ ok: boolean; error?: string | null }>((resolve) => {
         const timeout = setTimeout(() => {
           window.removeEventListener("message", handleAck);
@@ -514,6 +548,9 @@ export function TestCaseScriptTab({
           {
             type: "TESTPILOT_START_DEBUG",
             payload: {
+              apiBaseUrl: session?.apiBaseUrl || null,
+              token: session?.token || null,
+              projectId: session?.projectId || null,
               testcaseId,
               testcaseTitle,
               testcaseExternalId,
@@ -533,9 +570,11 @@ export function TestCaseScriptTab({
       setExtensionReady(true);
       setSuccess(
         autoRun
-          ? "Playwright started in visible Chrome tab via Extension."
+          ? "Playwright started in visible Chrome tab via Extension. Report will appear when execution completes."
           : "Step-by-Step Debugger opened in a new Chrome tab."
       );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to launch Chrome Extension runner.");
     } finally {
       setLaunchingRecorder(false);
     }
@@ -724,6 +763,19 @@ export function TestCaseScriptTab({
               <option value="headless">Headless (Server)</option>
               <option value="headed">Headed (Extension)</option>
             </select>
+            {runMode === "headless" && (
+              <select
+                value={selectedBrowser}
+                onChange={(e) => setSelectedBrowser(e.target.value as TestScriptBrowser)}
+                aria-label="Playwright browser"
+                className="h-8 border-l border-[var(--border)] bg-transparent px-2 text-xs font-medium text-[var(--foreground)] focus:outline-none"
+              >
+                <option value="chromium">Chromium</option>
+                <option value="firefox">Firefox</option>
+                <option value="webkit">WebKit (Safari)</option>
+                <option value="all">All Browsers</option>
+              </select>
+            )}
             <Button
               type="button"
               variant="primary"

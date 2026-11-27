@@ -4,6 +4,9 @@
 
   let debugHighlightBox = null;
   let debugHighlightLabel = null;
+  let highlightedTarget = null;
+  let highlightedText = "";
+  let highlightedStrict = false;
 
   function ensureDebugHighlight() {
     if (debugHighlightBox) return;
@@ -41,9 +44,42 @@
   }
 
   function hideDebugHighlight() {
+    highlightedTarget = null;
     if (debugHighlightBox) debugHighlightBox.style.display = "none";
     if (debugHighlightLabel) debugHighlightLabel.style.display = "none";
   }
+
+  function syncDebugHighlightPosition() {
+    if (!highlightedTarget || !document.contains(highlightedTarget)) {
+      if (debugHighlightBox) debugHighlightBox.style.display = "none";
+      if (debugHighlightLabel) debugHighlightLabel.style.display = "none";
+      return;
+    }
+    const rect = highlightedTarget.getBoundingClientRect();
+    ensureDebugHighlight();
+    Object.assign(debugHighlightBox.style, {
+      display: "block",
+      top: `${rect.top}px`,
+      left: `${rect.left}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      borderColor: highlightedStrict ? "#ef4444" : "#f59e0b",
+      background: highlightedStrict ? "rgba(239, 68, 68, 0.14)" : "rgba(245, 158, 11, 0.14)"
+    });
+    debugHighlightLabel.textContent = highlightedText;
+    Object.assign(debugHighlightLabel.style, {
+      display: "block",
+      top: `${Math.max(4, rect.top - 22)}px`,
+      left: `${Math.max(4, rect.left)}px`
+    });
+  }
+
+  window.addEventListener("scroll", () => {
+    if (highlightedTarget) syncDebugHighlightPosition();
+  }, true);
+  window.addEventListener("resize", () => {
+    if (highlightedTarget) syncDebugHighlightPosition();
+  });
 
   function cleanText(v) {
     return String(v || "").replace(/\s+/g, " ").trim();
@@ -176,27 +212,14 @@
       return { count: 0 };
     }
     const target = matches[0];
-    target.scrollIntoView({ block: "center", behavior: "smooth" });
-    const rect = target.getBoundingClientRect();
-    ensureDebugHighlight();
-    Object.assign(debugHighlightBox.style, {
-      display: "block",
-      top: `${rect.top}px`,
-      left: `${rect.left}px`,
-      width: `${rect.width}px`,
-      height: `${rect.height}px`,
-      borderColor: matches.length === 1 ? "#f59e0b" : "#ef4444",
-      background: matches.length === 1 ? "rgba(245, 158, 11, 0.14)" : "rgba(239, 68, 68, 0.14)"
-    });
-    debugHighlightLabel.textContent =
+    target.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
+    highlightedTarget = target;
+    highlightedStrict = matches.length !== 1;
+    highlightedText =
       matches.length === 1
         ? `Line ${step.line}: 1 match`
         : `Line ${step.line}: ${matches.length} matches (strict violation!)`;
-    Object.assign(debugHighlightLabel.style, {
-      display: "block",
-      top: `${Math.max(4, rect.top - 22)}px`,
-      left: `${Math.max(4, rect.left)}px`
-    });
+    syncDebugHighlightPosition();
     return { count: matches.length };
   }
 
@@ -325,10 +348,72 @@
     return { ok: false, error: lastError };
   }
 
+  let pickCallback = null;
+
+  function onPickMove(e) {
+    if (!pickCallback) return;
+    const target = e.target;
+    if (!target || target.nodeType !== Node.ELEMENT_NODE || target.closest("#testpilot-recorder-root, [data-testpilot-ui='1']")) {
+      hideDebugHighlight();
+      return;
+    }
+    const locApi = window.__testpilotLocator;
+    if (!locApi) return;
+    const rect = target.getBoundingClientRect();
+    const loc = locApi.generatePlaywrightLocator(target);
+    ensureDebugHighlight();
+    Object.assign(debugHighlightBox.style, {
+      display: "block",
+      top: `${rect.top}px`,
+      left: `${rect.left}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      borderColor: "#38bdf8",
+      background: "rgba(56, 189, 248, 0.14)"
+    });
+    debugHighlightLabel.textContent = `page.${loc.expression}`;
+    Object.assign(debugHighlightLabel.style, {
+      display: "block",
+      top: `${Math.max(4, rect.top - 22)}px`,
+      left: `${Math.max(4, rect.left)}px`
+    });
+  }
+
+  function onPickClick(e) {
+    if (!pickCallback) return;
+    const target = e.target;
+    if (!target || target.nodeType !== Node.ELEMENT_NODE || target.closest("#testpilot-recorder-root, [data-testpilot-ui='1']")) {
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    const locApi = window.__testpilotLocator;
+    const expr = locApi ? `page.${locApi.generatePlaywrightLocator(target).expression}` : "page.locator('body')";
+    const cb = pickCallback;
+    stopPickLocator();
+    cb(expr);
+  }
+
+  function startPickLocator(cb) {
+    stopPickLocator();
+    pickCallback = cb;
+    document.addEventListener("mousemove", onPickMove, true);
+    document.addEventListener("click", onPickClick, true);
+  }
+
+  function stopPickLocator() {
+    pickCallback = null;
+    document.removeEventListener("mousemove", onPickMove, true);
+    document.removeEventListener("click", onPickClick, true);
+    hideDebugHighlight();
+  }
+
   window.__testpilotDebugger = {
     highlightStepTarget,
     hideDebugHighlight,
     executeStep,
-    resolveLocatorMatches
+    resolveLocatorMatches,
+    startPickLocator,
+    stopPickLocator
   };
 })();

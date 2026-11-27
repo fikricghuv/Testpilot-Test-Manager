@@ -2,7 +2,12 @@ import { Body, Controller, Delete, Get, Param, Post, Put, Query, Req, Res } from
 import type { Response } from "express";
 import type { AuthenticatedRequest } from "../common/request.types";
 import { ScriptRunnerService } from "./script-runner.service";
-import type { TriggerScriptRunInput, TriggerSuiteRunInput, UpsertTestScriptInput } from "./script-runner.types";
+import type {
+  RecordHeadedRunInput,
+  TriggerScriptRunInput,
+  TriggerSuiteRunInput,
+  UpsertTestScriptInput
+} from "./script-runner.types";
 
 @Controller()
 export class ScriptRunnerController {
@@ -73,6 +78,16 @@ export class ScriptRunnerController {
     @Body() body: TriggerScriptRunInput
   ) {
     return this.scriptRunner.triggerRun(req.userId, projectId, testcaseId, body || {});
+  }
+
+  @Post("/api/projects/:projectId/testcases/:testcaseId/script/headed-run")
+  recordHeadedRun(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Body() body: RecordHeadedRunInput
+  ) {
+    return this.scriptRunner.recordHeadedRun(req.userId, projectId, testcaseId, body || ({} as RecordHeadedRunInput));
   }
 
   @Post("/api/projects/:projectId/suites/:suiteId/script/run")

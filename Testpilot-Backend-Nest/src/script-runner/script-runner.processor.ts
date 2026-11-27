@@ -18,6 +18,6 @@ export class ScriptRunnerProcessor extends WorkerHost {
       this.logger.warn(`Unknown script-runner job name: ${job.name}`);
       return;
     }
-    await this.scriptRunner.executeRunJob(job.data.runId);
+    await this.scriptRunner.executeRunJob(job.data.runId, job.data.browser);
   }
 }

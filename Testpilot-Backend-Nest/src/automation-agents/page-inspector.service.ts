@@ -23,7 +23,10 @@ export class PageInspectorService {
         }
       }
 
-      const context = await browser.newContext(storageState ? { storageState: storageState as never } : {});
+      const context = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        ...(storageState ? { storageState: storageState as never } : {})
+      });
       const page = await context.newPage();
       page.setDefaultTimeout(INSPECT_TIMEOUT_MS);
 

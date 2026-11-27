@@ -4585,6 +4585,8 @@ export interface TraceStepSummary {
   params: Record<string, unknown> | null;
   beforeFrameDataUrl: string | null;
   frameDataUrl: string | null;
+  beforeSnapshotHtml?: string | null;
+  afterSnapshotHtml?: string | null;
 }
 
 export interface TraceFilmstripFrame {
@@ -4723,6 +4725,7 @@ export async function disconnectTelegramIntegration(projectId: string): Promise<
 export type TestScriptFramework = "playwright-ts";
 export type TestScriptStatus = "draft" | "verified" | "archived";
 export type TestScriptSource = "manual" | "zyra" | "healer" | "recorder";
+export type TestScriptBrowser = "chromium" | "firefox" | "webkit" | "all";
 export type TestScriptRunStatus = "queued" | "running" | "passed" | "failed" | "error" | "cancelled";
 
 export interface TestScriptRecord {
@@ -4830,7 +4833,7 @@ export async function deleteTestCaseScript(projectId: string, testcaseId: string
 export async function runTestCaseScript(
   projectId: string,
   testcaseId: string,
-  data?: { targetUrl?: string | null }
+  data?: { targetUrl?: string | null; browser?: TestScriptBrowser }
 ): Promise<{ run: TestScriptRunRecord }> {
   return api<{ run: TestScriptRunRecord }>(`/api/projects/${projectId}/testcases/${testcaseId}/script/run`, {
     method: "POST",
@@ -4849,7 +4852,7 @@ export interface SuiteScriptRunResponse {
 export async function runSuiteScripts(
   projectId: string,
   suiteId: string,
-  data?: { onlyVerified?: boolean; targetUrl?: string | null }
+  data?: { onlyVerified?: boolean; targetUrl?: string | null; browser?: TestScriptBrowser }
 ): Promise<SuiteScriptRunResponse> {
   return api<SuiteScriptRunResponse>(`/api/projects/${projectId}/suites/${suiteId}/script/run`, {
     method: "POST",

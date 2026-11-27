@@ -9,7 +9,7 @@ import {
   deleteKnowledgeDocumentComment,
   type KnowledgeDocumentComment,
 } from "@/lib/api";
-import { Button } from "@/components/ui";
+import { Button, ConfirmModal } from "@/components/ui";
 import { avatarColor } from "@/lib/avatarColors";
 import { formatRelative } from "@/lib/date";
 
@@ -138,14 +138,26 @@ export function DocumentComments({
     }
   }
 
-  async function remove(comment: KnowledgeDocumentComment, isThread: boolean) {
-    if (!window.confirm(isThread ? "Delete this thread and all its replies?" : "Delete this reply?")) return;
+  const [deleteTarget, setDeleteTarget] = useState<{ comment: KnowledgeDocumentComment; isThread: boolean } | null>(null);
+  const [deletingComment, setDeletingComment] = useState(false);
+
+  function remove(comment: KnowledgeDocumentComment, isThread: boolean) {
+    setDeleteTarget({ comment, isThread });
+  }
+
+  async function confirmDeleteComment() {
+    if (!deleteTarget || deletingComment) return;
+    setDeletingComment(true);
     setError(null);
     try {
-      await deleteKnowledgeDocumentComment(projectId, comment.id);
+      await deleteKnowledgeDocumentComment(projectId, deleteTarget.comment.id);
+      setDeleteTarget(null);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete comment.");
+      setDeleteTarget(null);
+    } finally {
+      setDeletingComment(false);
     }
   }
 
@@ -349,6 +361,23 @@ export function DocumentComments({
           ))}
         </ul>
       )}
+
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title={deleteTarget?.isThread ? "Delete thread" : "Delete reply"}
+        message={
+          deleteTarget?.isThread
+            ? "Delete this thread and all its replies?"
+            : "Delete this reply?"
+        }
+        confirmLabel="Delete"
+        loading={deletingComment}
+        loadingLabel="Deleting…"
+        onConfirm={() => void confirmDeleteComment()}
+        onCancel={() => {
+          if (!deletingComment) setDeleteTarget(null);
+        }}
+      />
     </section>
   );
 }

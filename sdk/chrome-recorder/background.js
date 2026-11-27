@@ -249,13 +249,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const sessions = await getSessions();
       sessions[tabId] = {
         mode: "debug",
+        apiBaseUrl: p.apiBaseUrl ? String(p.apiBaseUrl).replace(/\/+$/, "") : null,
+        token: p.token || null,
+        projectId: p.projectId || null,
+        sourceTabId: senderTabId || null,
         testcaseId: p.testcaseId || null,
         testcaseTitle: p.testcaseTitle || "Debug Spec",
         testcaseExternalId: p.testcaseExternalId || null,
         targetUrl: openUrl,
+        scriptContent: String(p.scriptContent || ""),
+        breakpoints: [],
         debugSteps,
         currentStepIndex: 0,
         autoRun: Boolean(p.autoRun),
+        startedAt: Date.now(),
+        reported: false,
         lastDebugError: null
       };
       await setSessions(sessions);
@@ -393,7 +401,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (Array.isArray(msg.debugSteps)) session.debugSteps = msg.debugSteps;
       if (typeof msg.currentStepIndex === "number") session.currentStepIndex = msg.currentStepIndex;
       if (typeof msg.autoRun === "boolean") session.autoRun = msg.autoRun;
+      if (Array.isArray(msg.breakpoints)) session.breakpoints = msg.breakpoints;
       session.lastDebugError = msg.lastDebugError ?? null;
+      await setSessions(sessions);
+      await broadcastToTab(senderTabId, session);
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg?.type === "DEBUG_TOGGLE_BREAKPOINT" && session.mode === "debug") {
+      const line = Number(msg.line);
+      const bps = Array.isArray(session.breakpoints) ? [...session.breakpoints] : [];
+      const idx = bps.indexOf(line);
+      if (idx >= 0) bps.splice(idx, 1);
+      else if (Number.isInteger(line) && line > 0) bps.push(line);
+      session.breakpoints = bps;
       await setSessions(sessions);
       await broadcastToTab(senderTabId, session);
       sendResponse({ ok: true });
@@ -404,10 +426,82 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       session.debugSteps = (session.debugSteps || []).map((s) => ({ ...s, status: "pending" }));
       session.currentStepIndex = 0;
       session.autoRun = false;
+      session.startedAt = Date.now();
+      session.reported = false;
       session.lastDebugError = null;
       await setSessions(sessions);
       await broadcastToTab(senderTabId, session);
       sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg?.type === "REPORT_HEADED_RUN" && session.mode === "debug") {
+      if (!session.apiBaseUrl || !session.token || !session.projectId || !session.testcaseId || session.reported) {
+        sendResponse({ ok: false, skipped: true });
+        return;
+      }
+      session.reported = true;
+      await setSessions(sessions);
+
+      let screenshotDataUrl = null;
+      try {
+        screenshotDataUrl = await chrome.tabs.captureVisibleTab(sender.tab?.windowId, { format: "png" });
+      } catch {
+        // Tab may not be active/focused; report without screenshot
+      }
+
+      const stepsSummary = (session.debugSteps || [])
+        .map((s, i) => `${i + 1}. [${(s.status || "pending").toUpperCase()}] ${s.label || s.code || s.kind}`)
+        .join("\n");
+      const durationMs = Math.max(0, Date.now() - (session.startedAt || Date.now()));
+      const status = msg.status === "passed" ? "passed" : "failed";
+
+      const reportRes = await fetch(
+        `${session.apiBaseUrl}/api/projects/${session.projectId}/testcases/${session.testcaseId}/script/headed-run`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${session.token}`
+          },
+          body: JSON.stringify({
+            status,
+            targetUrl: session.targetUrl,
+            durationMs,
+            stdout: stepsSummary || null,
+            errorMessage: msg.errorMessage || session.lastDebugError || null,
+            screenshotDataUrl
+          })
+        }
+      );
+
+      if (!reportRes.ok) {
+        const errBody = await reportRes.text().catch(() => "");
+        session.reported = false;
+        await setSessions(sessions);
+        await broadcastToTab(senderTabId, session);
+        sendResponse({ ok: false, error: `Report failed (${reportRes.status}): ${errBody.slice(0, 120)}` });
+        return;
+      }
+
+      const reportData = await reportRes.json().catch(() => ({}));
+      await broadcastToTab(senderTabId, session);
+
+      if (session.sourceTabId) {
+        try {
+          await chrome.tabs.sendMessage(session.sourceTabId, {
+            type: "HEADED_RUN_REPORTED",
+            projectId: session.projectId,
+            testcaseId: session.testcaseId,
+            cycleId: reportData?.cycleId || null,
+            status
+          });
+        } catch {
+          // Source TestPilot tab may have been closed
+        }
+      }
+
+      sendResponse({ ok: true, cycleId: reportData?.cycleId || null, executionId: reportData?.executionId || null });
       return;
     }
 

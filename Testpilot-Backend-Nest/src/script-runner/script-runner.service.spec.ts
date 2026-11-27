@@ -192,7 +192,7 @@ describe("ScriptRunnerService", () => {
     expect(res.run.status).toBe("queued");
     expect(queue.add).toHaveBeenCalledWith(
       SCRIPT_RUNNER_JOB,
-      { runId },
+      { runId, browser: "chromium" },
       expect.objectContaining({ removeOnComplete: 50, removeOnFail: 50 })
     );
   });
@@ -398,7 +398,7 @@ describe("ScriptRunnerService", () => {
     expect(res.queuedCount).toBe(1);
     expect(queue.add).toHaveBeenCalledWith(
       SCRIPT_RUNNER_JOB,
-      { runId: "run-suite-1" },
+      { runId: "run-suite-1", browser: "chromium" },
       expect.any(Object)
     );
   });
