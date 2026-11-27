@@ -1,5 +1,5 @@
 import { BullModule } from "@nestjs/bullmq";
-import { Module } from "@nestjs/common";
+import { forwardRef, Module } from "@nestjs/common";
 import { AuthModule } from "../auth/auth.module";
 import { LegacyModule } from "../legacy/legacy.module";
 import { StorageModule } from "../storage/storage.module";
@@ -9,7 +9,12 @@ import { ScriptRunnerProcessor } from "./script-runner.processor";
 import { ScriptRunnerService } from "./script-runner.service";
 
 @Module({
-  imports: [BullModule.registerQueue({ name: SCRIPT_RUNNER_QUEUE }), AuthModule, LegacyModule, StorageModule],
+  imports: [
+    BullModule.registerQueue({ name: SCRIPT_RUNNER_QUEUE }),
+    AuthModule,
+    forwardRef(() => LegacyModule),
+    StorageModule
+  ],
   controllers: [ScriptRunnerController],
   providers: [ScriptRunnerService, ScriptRunnerProcessor],
   exports: [ScriptRunnerService]

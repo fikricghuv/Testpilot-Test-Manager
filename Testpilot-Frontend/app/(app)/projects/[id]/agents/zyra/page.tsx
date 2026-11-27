@@ -5,14 +5,21 @@ import { useRouter } from "next/navigation";
 import { useParams } from "@/lib/routeParams";
 import { createPortal } from "react-dom";
 import { FormEvent, Fragment, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { IconArrowDown, IconClipboardCheck, IconCopy, IconPencil, IconPlus, IconSettings, IconSparkles, IconTrash } from "@tabler/icons-react";
+import { IconArrowDown, IconClipboardCheck, IconCopy, IconListCheck, IconLoader2, IconPencil, IconPlayerPlay, IconPlus, IconSearch, IconSettings, IconSparkles, IconTrash, IconX } from "@tabler/icons-react";
 import {
   continueZyraChatMessage,
   createZyraChatSession,
   deleteZyraChatSession,
+  getAutomationAgentJob,
   getZyraAgent,
   getZyraChatSession,
+  listTestCases,
   listZyraChatSessions,
+  runTestCaseScript,
+  startTestCaseAiGenerate,
+  type TestAgentJobRecord,
+  type TestCaseListItem,
+  type TestScriptRunRecord,
   openZyraTurnProgress,
   renameZyraChatSession,
   startZyraChatMessage,
@@ -1095,6 +1102,15 @@ export default function ZyraChatPage() {
   // Which turn each open stream narrates — so a stream closed early can drop that turn's live state.
   const streamTurnIdsRef = useRef(new Map<EventSource, string>());
   const [input, setInput] = useState("");
+  const [selectedTestcases, setSelectedTestcases] = useState<Array<{ id: string; externalId?: string | null; title: string }>>([]);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerSearch, setPickerSearch] = useState("");
+  const [pickerCases, setPickerCases] = useState<TestCaseListItem[]>([]);
+  const [pickerLoading, setPickerLoading] = useState(false);
+  const [automationTargetUrl, setAutomationTargetUrl] = useState("");
+  const [automationJobs, setAutomationJobs] = useState<Array<{ testcaseId: string; label: string; job: TestAgentJobRecord }>>([]);
+  const [automationRuns, setAutomationRuns] = useState<Array<{ testcaseId: string; label: string; run: TestScriptRunRecord }>>([]);
+  const [automationBusy, setAutomationBusy] = useState<"generate" | "run" | null>(null);
   const [loading, setLoading] = useState(true);
   // Keyed by session id, not a single flag, so an in-flight send in one conversation never shows
   // as "thinking" or disables the input in a different conversation the user has switched to.
@@ -1465,7 +1481,11 @@ export default function ZyraChatPage() {
     // this polls for it. Awaiting the whole turn on one request is what broke behind Cloudflare — a
     // generation turn runs for minutes, Cloudflare drops the request at 100 s with a CORS-less 524,
     // and the page showed "Failed to fetch" while the backend went on to save the reply.
-    const startPromise = startZyraChatMessage(projectId, sessionId, trimmed, { turnId, ...(choice ? { choice } : {}) });
+    const startPromise = startZyraChatMessage(projectId, sessionId, trimmed, {
+      turnId,
+      ...(choice ? { choice } : {}),
+      ...(selectedTestcases.length ? { selectedTestcaseIds: selectedTestcases.map((tc) => tc.id) } : {}),
+    });
     watchZyraTurnProgress(sessionId, turnId);
     let started: Awaited<typeof startPromise>;
     try {
@@ -1645,6 +1665,175 @@ export default function ZyraChatPage() {
       stop();
       dropLiveTurn(turnId);
     };
+  }
+
+  async function toggleTestcasePicker() {
+    const next = !pickerOpen;
+    setPickerOpen(next);
+    if (next && pickerCases.length === 0 && !pickerLoading) {
+      setPickerLoading(true);
+      try {
+        const res = await listTestCases(projectId, { limit: 100 });
+        setPickerCases(res.list || []);
+      } catch {
+        // Keep picker empty on error
+      } finally {
+        setPickerLoading(false);
+      }
+    }
+  }
+
+  function toggleSelectedTestcase(tc: { id: string; externalId?: string | null; title: string }) {
+    setSelectedTestcases((prev) =>
+      prev.some((item) => item.id === tc.id)
+        ? prev.filter((item) => item.id !== tc.id)
+        : [...prev, { id: tc.id, externalId: tc.externalId ?? null, title: tc.title }]
+    );
+  }
+
+  useEffect(() => {
+    if (!activeSession?.messages?.length) return;
+    const finishedJobIds = new Set<string>();
+    const startedJobs: Array<{ jobId: string; testcaseId: string; label: string }> = [];
+
+    for (const msg of activeSession.messages) {
+      for (const entry of msg.activity || []) {
+        const detail = String(entry.detail || "");
+        const match = detail.match(/\bJob\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
+        if (!match) continue;
+        const jobId = match[1];
+        if (entry.title === "3-Agent Playwright completed" || entry.title === "3-Agent Playwright failed") {
+          finishedJobIds.add(jobId);
+        } else if (entry.title === "Started 3-Agent Playwright Generator" || entry.title === "Started Playwright Healer") {
+          const label = detail.split(" — Job ")[0] || "Test Case";
+          startedJobs.push({ jobId, testcaseId: "", label });
+        }
+      }
+    }
+
+    const pendingFromChat = startedJobs.filter(
+      (item) =>
+        !finishedJobIds.has(item.jobId) &&
+        !automationJobs.some((existing) => existing.job.id === item.jobId)
+    );
+    if (pendingFromChat.length === 0) return;
+
+    let cancelled = false;
+    void Promise.all(
+      pendingFromChat.map(async (item) => {
+        try {
+          const res = await getAutomationAgentJob(projectId, item.jobId);
+          return { testcaseId: res.job.testcaseId || "", label: item.label, job: res.job };
+        } catch {
+          return null;
+        }
+      })
+    ).then((loaded) => {
+      if (cancelled) return;
+      const valid = loaded.filter((x): x is { testcaseId: string; label: string; job: TestAgentJobRecord } => x !== null);
+      if (valid.length > 0) {
+        setAutomationJobs((prev) => [
+          ...valid.filter((v) => !prev.some((p) => p.job.id === v.job.id)),
+          ...prev,
+        ]);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSession?.messages, automationJobs, projectId]);
+
+  useEffect(() => {
+    const active = automationJobs.filter((item) => item.job.stage !== "completed" && item.job.stage !== "failed");
+    if (active.length === 0) return;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        let anyFinished = false;
+        const updated = await Promise.all(
+          automationJobs.map(async (item) => {
+            if (item.job.stage === "completed" || item.job.stage === "failed") return item;
+            try {
+              const res = await getAutomationAgentJob(projectId, item.job.id);
+              if (res.job.stage === "completed" || res.job.stage === "failed") {
+                anyFinished = true;
+              }
+              return { ...item, job: res.job };
+            } catch {
+              return item;
+            }
+          })
+        );
+        if (!cancelled) {
+          setAutomationJobs(updated);
+          if (anyFinished && activeSession?.id) {
+            void getZyraChatSession(projectId, activeSession.id)
+              .then((fresh) => {
+                if (!cancelled) setActiveSession((prev) => (prev && prev.id === fresh.id ? fresh : prev));
+              })
+              .catch(() => undefined);
+          }
+        }
+      } catch {
+        // Ignore transient poll error
+      }
+    }, 1500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [automationJobs, projectId, activeSession?.id]);
+
+  async function handleDirectGenerateScripts() {
+    if (selectedTestcases.length === 0 || automationBusy) return;
+    const trimmedUrl = automationTargetUrl.trim();
+    if (!trimmedUrl) {
+      setError("Enter a Target URL before running Generate with AI (3-Agent).");
+      return;
+    }
+    setAutomationBusy("generate");
+    setError(null);
+    try {
+      const started: Array<{ testcaseId: string; label: string; job: TestAgentJobRecord }> = [];
+      for (const tc of selectedTestcases) {
+        const res = await startTestCaseAiGenerate(projectId, tc.id, { targetUrl: trimmedUrl });
+        started.push({
+          testcaseId: tc.id,
+          label: tc.externalId ? `${tc.externalId} · ${tc.title}` : tc.title,
+          job: res.job,
+        });
+      }
+      setAutomationJobs((prev) => [...started, ...prev.filter((p) => !started.some((s) => s.testcaseId === p.testcaseId))]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start 3-Agent Playwright generator.");
+    } finally {
+      setAutomationBusy(null);
+    }
+  }
+
+  async function handleDirectRunScripts() {
+    if (selectedTestcases.length === 0 || automationBusy) return;
+    setAutomationBusy("run");
+    setError(null);
+    try {
+      const started: Array<{ testcaseId: string; label: string; run: TestScriptRunRecord }> = [];
+      for (const tc of selectedTestcases) {
+        const res = await runTestCaseScript(projectId, tc.id, {
+          targetUrl: automationTargetUrl.trim() || null,
+          browser: "chromium",
+        });
+        started.push({
+          testcaseId: tc.id,
+          label: tc.externalId ? `${tc.externalId} · ${tc.title}` : tc.title,
+          run: res.run,
+        });
+      }
+      setAutomationRuns((prev) => [...started, ...prev.filter((p) => !started.some((s) => s.testcaseId === p.testcaseId))]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start Playwright script run.");
+    } finally {
+      setAutomationBusy(null);
+    }
   }
 
   function onSubmit(event: FormEvent) {
@@ -1949,7 +2138,185 @@ export default function ZyraChatPage() {
                       </Button>
                     </div>
                   )}
-                  <form onSubmit={onSubmit}>
+                  <form onSubmit={onSubmit} className="relative">
+                    {selectedTestcases.length > 0 && (
+                      <div className="mb-2.5 space-y-2 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)]/50 p-2.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-[11px] font-medium text-[var(--muted)]">Selected:</span>
+                          {selectedTestcases.map((tc) => (
+                            <span
+                              key={tc.id}
+                              className="inline-flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[11px] text-[var(--foreground)]"
+                            >
+                              {tc.externalId && <span className="font-mono font-semibold text-[var(--accent-light)]">{tc.externalId}</span>}
+                              <span className="max-w-[180px] truncate">{tc.title}</span>
+                              <button
+                                type="button"
+                                onClick={() => toggleSelectedTestcase(tc)}
+                                className="ml-0.5 text-[var(--muted)] hover:text-[var(--foreground)]"
+                                aria-label={`Remove ${tc.externalId || tc.title}`}
+                              >
+                                <IconX size={11} />
+                              </button>
+                            </span>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={() => setSelectedTestcases([])}
+                            className="text-[11px] text-[var(--muted)] hover:text-[var(--foreground)] hover:underline"
+                          >
+                            Clear
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Input
+                            type="url"
+                            value={automationTargetUrl}
+                            onChange={(e) => setAutomationTargetUrl(e.target.value)}
+                            placeholder="Target URL (e.g. https://staging.example.com)"
+                            className="h-8 min-w-[210px] flex-1 bg-[var(--surface)] text-xs"
+                          />
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => void handleDirectGenerateScripts()}
+                            disabled={automationBusy !== null}
+                            title="Planner inspects live DOM/ARIA, Generator writes grounded spec, Healer verifies"
+                          >
+                            {automationBusy === "generate" ? (
+                              <IconLoader2 size={14} className="animate-spin" />
+                            ) : (
+                              <IconSparkles size={14} />
+                            )}
+                            Generate with AI (3-Agent)
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => void handleDirectRunScripts()}
+                            disabled={automationBusy !== null}
+                          >
+                            {automationBusy === "run" ? (
+                              <IconLoader2 size={14} className="animate-spin" />
+                            ) : (
+                              <IconPlayerPlay size={14} />
+                            )}
+                            Run Playwright
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+
+                    {(automationJobs.length > 0 || automationRuns.length > 0) && (
+                      <div className="mb-2.5 space-y-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-2.5">
+                        {automationJobs.map((item) => {
+                          const running = item.job.stage !== "completed" && item.job.stage !== "failed";
+                          return (
+                            <div key={item.job.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                              <div className="flex min-w-0 items-center gap-2">
+                                {running && <IconLoader2 size={13} className="shrink-0 animate-spin text-[var(--brand-primary)]" />}
+                                <span className="truncate font-medium text-[var(--foreground)]">{item.label}</span>
+                                <StatusChip tone={item.job.stage === "completed" ? "success" : item.job.stage === "failed" ? "error" : "brand"}>
+                                  3-Agent: {item.job.stage}
+                                </StatusChip>
+                                {item.job.errorMessage && (
+                                  <span className="truncate text-[11px] text-[var(--error-foreground)]">{item.job.errorMessage}</span>
+                                )}
+                              </div>
+                              <Link
+                                href={`/projects/${projectId}/testcases?testcaseId=${item.testcaseId}`}
+                                className="shrink-0 text-[11px] font-medium text-[var(--accent-light)] hover:underline"
+                              >
+                                Open Script →
+                              </Link>
+                            </div>
+                          );
+                        })}
+                        {automationRuns.map((item) => (
+                          <div key={item.run.id} className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="truncate font-medium text-[var(--foreground)]">{item.label}</span>
+                              <StatusChip tone={item.run.status === "passed" ? "success" : item.run.status === "failed" || item.run.status === "error" ? "error" : "warning"}>
+                                Run: {item.run.status}
+                              </StatusChip>
+                            </div>
+                            <Link
+                              href={item.run.cycleId ? `/projects/${projectId}/cycles/${item.run.cycleId}` : `/projects/${projectId}/testcases?testcaseId=${item.testcaseId}`}
+                              className="shrink-0 text-[11px] font-medium text-[var(--accent-light)] hover:underline"
+                            >
+                              {item.run.cycleId ? "View Test Run →" : "Open Test Case →"}
+                            </Link>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {pickerOpen && (
+                      <div className="mb-2.5 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3 shadow-lg">
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-[var(--foreground)]">Select Test Cases for Zyra</span>
+                          <button
+                            type="button"
+                            onClick={() => setPickerOpen(false)}
+                            className="text-[var(--muted)] hover:text-[var(--foreground)]"
+                          >
+                            <IconX size={14} />
+                          </button>
+                        </div>
+                        <div className="relative mb-2">
+                          <IconSearch size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--muted)]" />
+                          <Input
+                            value={pickerSearch}
+                            onChange={(e) => setPickerSearch(e.target.value)}
+                            placeholder="Search by ID (e.g. TC-1) or title..."
+                            className="h-8 pl-7 text-xs"
+                          />
+                        </div>
+                        <div className="max-h-48 space-y-1 overflow-y-auto">
+                          {pickerLoading ? (
+                            <p className="py-3 text-center text-xs text-[var(--muted)]">Loading test cases…</p>
+                          ) : (
+                            pickerCases
+                              .filter((tc) => {
+                                const q = pickerSearch.trim().toLowerCase();
+                                if (!q) return true;
+                                return (
+                                  (tc.externalId || "").toLowerCase().includes(q) ||
+                                  tc.title.toLowerCase().includes(q)
+                                );
+                              })
+                              .map((tc) => {
+                                const checked = selectedTestcases.some((item) => item.id === tc.id);
+                                return (
+                                  <label
+                                    key={tc.id}
+                                    className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-[var(--surface-secondary)]"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleSelectedTestcase(tc)}
+                                      className="h-3.5 w-3.5 accent-[var(--brand-primary)]"
+                                    />
+                                    {tc.externalId && (
+                                      <span className="shrink-0 font-mono text-[11px] font-semibold text-[var(--accent-light)]">
+                                        {tc.externalId}
+                                      </span>
+                                    )}
+                                    <span className="truncate text-[var(--foreground)]">{tc.title}</span>
+                                  </label>
+                                );
+                              })
+                          )}
+                          {!pickerLoading && pickerCases.length === 0 && (
+                            <p className="py-3 text-center text-xs text-[var(--muted)]">No test cases found in this project.</p>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
                     <Textarea
                       ref={textareaRef}
                       value={input}
@@ -1965,11 +2332,25 @@ export default function ZyraChatPage() {
                       className="resize-none"
                     />
                     <div className="mt-2.5 flex items-center justify-between gap-3">
-                      <p className="text-[11px] text-[var(--muted)]">
-                        <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{t("composer.sendHint")}
-                        {" · "}
-                        <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{t("composer.newLineHint")}
-                      </p>
+                      <div className="flex items-center gap-2.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => void toggleTestcasePicker()}
+                          disabled={sending || !agent?.agent.active}
+                        >
+                          <IconListCheck size={14} />
+                          {selectedTestcases.length > 0
+                            ? `Test Cases (${selectedTestcases.length})`
+                            : "Select Test Cases"}
+                        </Button>
+                        <p className="hidden text-[11px] text-[var(--muted)] sm:block">
+                          <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Enter</kbd>{t("composer.sendHint")}
+                          {" · "}
+                          <kbd className="rounded border border-[var(--border)] bg-[var(--surface-secondary)] px-1 py-0.5 font-mono text-[10px]">Shift+Enter</kbd>{t("composer.newLineHint")}
+                        </p>
+                      </div>
                       <div className="flex items-center gap-2">
                         {isPlanRunning && (
                           <Button type="button" size="sm" variant="secondary" onClick={handleStopPlan} disabled={stoppingPlan}>

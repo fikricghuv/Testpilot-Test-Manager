@@ -1,5 +1,5 @@
 import { BullModule } from "@nestjs/bullmq";
-import { Module } from "@nestjs/common";
+import { forwardRef, Module } from "@nestjs/common";
 import { LegacyModule } from "../legacy/legacy.module";
 import { ScriptRunnerModule } from "../script-runner/script-runner.module";
 import { AUTOMATION_AGENTS_QUEUE } from "./automation-agents.constants";
@@ -9,7 +9,11 @@ import { AutomationAgentsService } from "./automation-agents.service";
 import { PageInspectorService } from "./page-inspector.service";
 
 @Module({
-  imports: [BullModule.registerQueue({ name: AUTOMATION_AGENTS_QUEUE }), LegacyModule, ScriptRunnerModule],
+  imports: [
+    BullModule.registerQueue({ name: AUTOMATION_AGENTS_QUEUE }),
+    forwardRef(() => LegacyModule),
+    forwardRef(() => ScriptRunnerModule)
+  ],
   controllers: [AutomationAgentsController],
   providers: [AutomationAgentsService, AutomationAgentsProcessor, PageInspectorService],
   exports: [AutomationAgentsService]

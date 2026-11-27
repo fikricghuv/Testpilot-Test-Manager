@@ -1,5 +1,5 @@
 import { InjectQueue } from "@nestjs/bullmq";
-import { BadRequestException, Injectable, Logger, NotFoundException } from "@nestjs/common";
+import { BadRequestException, forwardRef, Inject, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import type { Queue } from "bullmq";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
@@ -100,9 +100,9 @@ export class AutomationAgentsService {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly legacy: LegacyService,
+    @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService,
     private readonly inspector: PageInspectorService,
-    private readonly scriptRunner: ScriptRunnerService,
+    @Inject(forwardRef(() => ScriptRunnerService)) private readonly scriptRunner: ScriptRunnerService,
     @InjectQueue(AUTOMATION_AGENTS_QUEUE) private readonly queue: Queue<{ jobId: string }>
   ) {}
 
@@ -202,7 +202,7 @@ export class AutomationAgentsService {
     userId: string | null | undefined,
     projectId: string,
     testcaseId: string,
-    input: { targetUrl: string; instructions?: string | null }
+    input: { targetUrl: string; instructions?: string | null; zyraSessionId?: string | null }
   ): Promise<{ job: TestAgentJobRecord }> {
     return this.enqueueJob(userId, projectId, testcaseId, "single", input);
   }
@@ -211,7 +211,7 @@ export class AutomationAgentsService {
     userId: string | null | undefined,
     projectId: string,
     testcaseId: string,
-    input: { targetUrl?: string | null; instructions?: string | null }
+    input: { targetUrl?: string | null; instructions?: string | null; zyraSessionId?: string | null }
   ): Promise<{ job: TestAgentJobRecord }> {
     const uid = this.legacy.requireSession(userId);
     await this.legacy.requireProjectAccess(uid, projectId);
@@ -225,7 +225,8 @@ export class AutomationAgentsService {
     }
     return this.enqueueJob(uid, projectId, testcaseId, "heal", {
       targetUrl: resolvedUrl,
-      instructions: input.instructions
+      instructions: input.instructions,
+      zyraSessionId: input.zyraSessionId
     });
   }
 
@@ -242,7 +243,7 @@ export class AutomationAgentsService {
     projectId: string,
     testcaseId: string | null,
     mode: AgentJobMode,
-    input: { targetUrl: string; instructions?: string | null }
+    input: { targetUrl: string; instructions?: string | null; zyraSessionId?: string | null }
   ): Promise<{ job: TestAgentJobRecord }> {
     const uid = this.legacy.requireSession(userId);
     await this.legacy.requireProjectAccess(uid, projectId);
@@ -264,11 +265,14 @@ export class AutomationAgentsService {
       message: `Queued 3-Agent (${mode}) job for ${targetUrl}`
     };
 
+    const initialPlanJson =
+      input.zyraSessionId && isUuid(input.zyraSessionId) ? { zyraSessionId: input.zyraSessionId } : {};
+
     const res = await this.db.query(
-      `INSERT INTO test_agent_jobs (project_id, testcase_id, mode, stage, target_url, instructions, max_attempts, logs_json, created_by)
-       VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7::jsonb, $8)
+      `INSERT INTO test_agent_jobs (project_id, testcase_id, mode, stage, target_url, instructions, max_attempts, plan_json, logs_json, created_by)
+       VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7::jsonb, $8::jsonb, $9)
        RETURNING *`,
-      [projectId, testcaseId, mode, targetUrl, instructions, DEFAULT_MAX_HEAL_ATTEMPTS, JSON.stringify([initialLog]), uid]
+      [projectId, testcaseId, mode, targetUrl, instructions, DEFAULT_MAX_HEAL_ATTEMPTS, JSON.stringify(initialPlanJson), JSON.stringify([initialLog]), uid]
     );
     const job = mapJobRow(res.rows[0]);
     await this.queue.add(AUTOMATION_AGENTS_JOB, { jobId: job.id }, { removeOnComplete: 50, removeOnFail: 50 });
@@ -505,6 +509,10 @@ export class AutomationAgentsService {
             errorMessage: null,
             logMessage: `Verified! Script passed on attempt ${attempt} and marked as 'verified'.`
           });
+          await this.notifyZyraSession(job.id, "completed", {
+            attempt,
+            resultRunId: triggered.run.id
+          });
           break;
         }
 
@@ -545,11 +553,13 @@ export class AutomationAgentsService {
       }
 
       if (!verified) {
+        const failMsg = lastError || "Healer could not verify the script within max attempts.";
         await this.appendJobUpdate(job.id, {
           stage: "failed",
-          errorMessage: lastError || "Healer could not verify the script within max attempts.",
+          errorMessage: failMsg,
           logMessage: `Stopped after ${job.maxAttempts} attempts. Script kept as draft for manual review.`
         });
+        await this.notifyZyraSession(job.id, "failed", { errorMessage: failMsg });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -559,6 +569,65 @@ export class AutomationAgentsService {
         errorMessage: msg,
         logMessage: `Error: ${msg}`
       });
+      await this.notifyZyraSession(jobId, "failed", { errorMessage: msg });
+    }
+  }
+
+  private async notifyZyraSession(
+    jobId: string,
+    stage: "completed" | "failed",
+    info: { attempt?: number; errorMessage?: string | null; resultRunId?: string | null }
+  ): Promise<void> {
+    try {
+      const res = await this.db.query<{
+        project_id: string;
+        testcase_id: string | null;
+        target_url: string;
+        zyra_session_id: string | null;
+        external_id: string | null;
+        title: string | null;
+      }>(
+        `SELECT j.project_id, j.testcase_id, j.target_url,
+                j.plan_json->>'zyraSessionId' AS zyra_session_id,
+                tc.external_id, tc.title
+         FROM test_agent_jobs j
+         LEFT JOIN testcases tc ON tc.id = j.testcase_id
+         WHERE j.id = $1
+         LIMIT 1`,
+        [jobId]
+      );
+      const row = res.rows[0];
+      if (!row?.zyra_session_id || !isUuid(row.zyra_session_id)) return;
+
+      const sessionRes = await this.db.query(
+        `SELECT id FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL LIMIT 1`,
+        [row.zyra_session_id, row.project_id]
+      );
+      if (!sessionRes.rows[0]) return;
+
+      const tcLabel = row.external_id ? `${row.external_id} – ${row.title || ""}`.trim() : row.title || "Test Case";
+      const content =
+        stage === "completed"
+          ? `✅ **3-Agent Playwright selesai** untuk **${tcLabel}**.\n\nScript terverifikasi pada percobaan ke-${info.attempt ?? 1} untuk \`${row.target_url}\` dan siap dijalankan di tab **Automation Script**.`
+          : `❌ **3-Agent Playwright gagal** untuk **${tcLabel}**.\n\n${info.errorMessage || "Gagal memverifikasi script."}`;
+
+      const activity = [
+        {
+          actor: "agent",
+          title: stage === "completed" ? "3-Agent Playwright completed" : "3-Agent Playwright failed",
+          detail: `${tcLabel} — Job ${jobId}`,
+          createdAt: new Date().toISOString()
+        }
+      ];
+
+      await this.db.query(
+        `INSERT INTO zyra_chat_messages (session_id, project_id, role, content, action_type, status, activity)
+         VALUES ($1, $2, 'assistant', $3, 'automation', 'completed', $4::jsonb)`,
+        [row.zyra_session_id, row.project_id, content, JSON.stringify(activity)]
+      );
+      await this.db.query(`UPDATE zyra_chat_sessions SET updated_at = now() WHERE id = $1`, [row.zyra_session_id]);
+    } catch (err) {
+      this.logger.warn(`Failed to post 3-Agent feedback to Zyra session for job ${jobId}: ${err instanceof Error ? err.message : err}`);
     }
   }
 

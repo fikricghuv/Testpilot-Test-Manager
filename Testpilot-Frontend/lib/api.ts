@@ -1043,6 +1043,7 @@ export interface ZyraCapabilities {
   suiteOperations: boolean;
   runOperations: boolean;
   bugOperations: boolean;
+  automationOperations: boolean;
 }
 
 export interface ZyraAgentState {
@@ -1308,11 +1309,15 @@ export async function sendZyraChatMessage(
   projectId: string,
   sessionId: string,
   message: string,
-  opts: { turnId?: string } = {}
+  opts: { turnId?: string; selectedTestcaseIds?: string[] } = {}
 ): Promise<{ message: ZyraChatMessage; session: ZyraChatSession }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
-    body: { message, turnId: opts.turnId },
+    body: {
+      message,
+      turnId: opts.turnId,
+      ...(opts.selectedTestcaseIds?.length ? { selectedTestcaseIds: opts.selectedTestcaseIds } : {}),
+    },
   });
 }
 
@@ -1332,11 +1337,17 @@ export async function startZyraChatMessage(
   projectId: string,
   sessionId: string,
   message: string,
-  opts: { turnId?: string; choice?: { messageId: string; optionId: string } } = {}
+  opts: { turnId?: string; choice?: { messageId: string; optionId: string }; selectedTestcaseIds?: string[] } = {}
 ): Promise<{ accepted: true; userMessageId: string; session: ZyraChatSession }> {
   return api(`/api/projects/${projectId}/agents/zyra/chat/sessions/${sessionId}/messages`, {
     method: "POST",
-    body: { message, turnId: opts.turnId, background: true, ...(opts.choice ? { choice: opts.choice } : {}) },
+    body: {
+      message,
+      turnId: opts.turnId,
+      background: true,
+      ...(opts.choice ? { choice: opts.choice } : {}),
+      ...(opts.selectedTestcaseIds?.length ? { selectedTestcaseIds: opts.selectedTestcaseIds } : {}),
+    },
   });
 }
 

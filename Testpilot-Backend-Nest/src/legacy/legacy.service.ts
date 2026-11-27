@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException, forwardRef, HttpException, Inject, Injectable, Logger, NotFoundException, OnModuleInit } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, forwardRef, HttpException, Inject, Injectable, Logger, NotFoundException, OnModuleInit, Optional } from "@nestjs/common";
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -33,6 +33,8 @@ import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, assertStartNotInPast, dueP
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
+import { AutomationAgentsService } from "../automation-agents/automation-agents.service";
+import { ScriptRunnerService } from "../script-runner/script-runner.service";
 import {
   foldRu,
   ZYRA_RU,
@@ -337,7 +339,7 @@ type ZyraAiResult = {
 type ZyraChatDecision = {
   reply: string;
   reasoningSummary: string;
-  actionType: "answer" | "create" | "update" | "archive" | "suite" | "run" | "bug" | "mixed";
+  actionType: "answer" | "create" | "update" | "archive" | "suite" | "run" | "bug" | "automation" | "mixed";
   operations: Array<{
     type:
       | "create"
@@ -350,7 +352,9 @@ type ZyraChatDecision = {
       | "delete_run"
       | "create_bug"
       | "update_bug"
-      | "delete_bug";
+      | "delete_bug"
+      | "generate_script"
+      | "run_script";
     testcaseId?: string;
     externalId?: string;
     // move_to_suite: testcases to move (by external id and/or internal id), or every existing testcase
@@ -371,6 +375,10 @@ type ZyraChatDecision = {
     bugId?: string;
     bugExternalId?: string;
     bugTitle?: string;
+    // generate_script / run_script target options
+    targetUrl?: string;
+    browser?: string;
+    instructions?: string;
     draft?: Body;
     fields?: Body;
     reason?: string;
@@ -540,17 +548,18 @@ type ZyraQueryClient = { query: (text: string, values?: unknown[]) => Promise<{ 
 // What the AI router decided this request is (intentFromZyraModelAction). There is no keyword
 // classifier producing these — the model reads the request in the context of the conversation and
 // the project, and the system dispatches on its answer.
-type ZyraChatIntent = "answer" | "example" | "list" | "create" | "update" | "archive" | "suite" | "run" | "bug" | "jira_pending_testcases";
+type ZyraChatIntent = "answer" | "example" | "list" | "create" | "update" | "archive" | "suite" | "run" | "bug" | "automation" | "jira_pending_testcases";
 
 // Configurable Zyra capabilities (per project, stored under project.settings.zyraAgent.capabilities).
 // All default to enabled so existing projects behave unchanged until a user turns one off.
 type ZyraCapabilities = {
-  generation: boolean;      // author/generate new testcases (chat "create" + task-board generation)
-  knowledgeBase: boolean;   // read the project Knowledge Base into Zyra's context
-  testcaseStorage: boolean; // write to the testcase repository: create / update / archive / bulk
-  suiteOperations: boolean; // create suites and move/assign testcases into suites
-  runOperations: boolean;   // create, update, and delete test runs (cycles)
-  bugOperations: boolean;   // create, update, and delete bugs
+  generation: boolean;          // author/generate new testcases (chat "create" + task-board generation)
+  knowledgeBase: boolean;       // read the project Knowledge Base into Zyra's context
+  testcaseStorage: boolean;     // write to the testcase repository: create / update / archive / bulk
+  suiteOperations: boolean;     // create suites and move/assign testcases into suites
+  runOperations: boolean;       // create, update, and delete test runs (cycles)
+  bugOperations: boolean;       // create, update, and delete bugs
+  automationOperations: boolean; // generate/heal and run Playwright scripts for selected test cases
 };
 
 type ZyraChatProjectSnapshot = {
@@ -1444,7 +1453,9 @@ export class LegacyService implements OnModuleInit {
     private readonly testcasesListCache: TestcasesListCacheService,
     private readonly projectOverviewCache: ProjectOverviewCacheService,
     @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService,
-    @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService
+    @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService,
+    @Optional() @Inject(forwardRef(() => AutomationAgentsService)) private readonly automationAgents?: AutomationAgentsService,
+    @Optional() @Inject(forwardRef(() => ScriptRunnerService)) private readonly scriptRunner?: ScriptRunnerService
   ) {}
 
   /*
@@ -15115,12 +15126,15 @@ export class LegacyService implements OnModuleInit {
     body: Body,
     userMessageStatus: string,
     recorder: ZyraTurnTraceRecorder
-  ): Promise<{ projectId: string; userId: string | null | undefined; uid: string; sessionId: string; message: string; userMessageId: string; userMessageStatus: string; sessionRow: Body; claimToken: string; choice: ZyraResolvedChoice | null }> {
+  ): Promise<{ projectId: string; userId: string | null | undefined; uid: string; sessionId: string; message: string; userMessageId: string; userMessageStatus: string; sessionRow: Body; claimToken: string; choice: ZyraResolvedChoice | null; selectedTestcaseIds: string[] }> {
     const uid = this.requireUser(userId);
     await this.requireProjectAccess(uid, projectId);
     if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
     const message = String(body.message || "").trim();
     if (!message) throw new BadRequestException({ error: "message is required" });
+    const selectedTestcaseIds = Array.isArray(body?.selectedTestcaseIds)
+      ? Array.from(new Set(body.selectedTestcaseIds.map((id: unknown) => String(id || "").trim()).filter((id: string) => isUuid(id)))).slice(0, 20)
+      : [];
     const sessionRes = await this.db.query("SELECT * FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId]);
     if (!sessionRes.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
     // The language of what the user just typed (detectScriptLanguage). A message with no signal —
@@ -15183,7 +15197,7 @@ export class LegacyService implements OnModuleInit {
       recorder.attach((trace) =>
         this.db.query("UPDATE zyra_chat_messages SET trace = $2::jsonb WHERE id = $1", [userMessageId, JSON.stringify(trace)])
       );
-      return { projectId, userId, uid, sessionId, message, userMessageId, userMessageStatus, sessionRow: sessionRes.rows[0], claimToken, choice };
+      return { projectId, userId, uid, sessionId, message, userMessageId, userMessageStatus, sessionRow: sessionRes.rows[0], claimToken, choice, selectedTestcaseIds };
     } catch (err) {
       await this.releaseZyraSessionClaim(sessionId, claimToken);
       throw err;
@@ -15487,7 +15501,7 @@ export class LegacyService implements OnModuleInit {
 
       let decision = turn.choice
         ? await this.zyraDecisionForChoice(turn, turn.choice, onStage)
-        : await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, undefined, onStage);
+        : await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, undefined, onStage, turn.selectedTestcaseIds);
       // Which trace the FINAL decision actually came from — see the reassignment below.
       // buildZyraChatDecision suffixes its trace id with ":confirm-retry" whenever confirmationHint
       // is set (so the retry's own router span never collides with the first attempt's), but only
@@ -15516,7 +15530,7 @@ export class LegacyService implements OnModuleInit {
           // duplicates — and so the trace shows the context the persisted decision actually used,
           // not only the discarded first attempt's.
           onStage?.("retrying", { reason: "confirmation", previousAction: pending.actionType || null });
-          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage);
+          const retried = await this.buildZyraChatDecision(projectId, uid, sessionId, message, userMessageId, undefined, hint, onStage, turn.selectedTestcaseIds);
           const fired = retried.operations.length > 0;
           onStage?.("retrying", { fired }, "update");
           const marker = fired ? "confirmation-retry:fired" : "confirmation-retry:exhausted";
@@ -16062,10 +16076,11 @@ export class LegacyService implements OnModuleInit {
     userMessageId?: string,
     resume?: { routedSuite: { id?: string; name?: string } | null; routedCount: ZyraRoutedCount },
     confirmationHint?: string,
-    onStage?: ZyraOnStage
+    onStage?: ZyraOnStage,
+    selectedTestcaseIds?: string[]
   ): Promise<ZyraChatDecision> {
     const turn: { contextRefs?: ZyraTurnContextRefs } = {};
-    const decision = await this.decideZyraChatTurn(projectId, userId, sessionId, message, userMessageId, resume, confirmationHint, onStage, turn);
+    const decision = await this.decideZyraChatTurn(projectId, userId, sessionId, message, userMessageId, resume, confirmationHint, onStage, turn, selectedTestcaseIds);
     return turn.contextRefs ? { ...decision, contextRefs: turn.contextRefs } : decision;
   }
 
@@ -16091,7 +16106,8 @@ export class LegacyService implements OnModuleInit {
     // one, which is every caller except sendZyraChatMessage's turnId-bearing path.
     onStage?: ZyraOnStage,
     // Filled in once this turn's sources are resolved — see buildZyraChatDecision.
-    turn: { contextRefs?: ZyraTurnContextRefs } = {}
+    turn: { contextRefs?: ZyraTurnContextRefs } = {},
+    selectedTestcaseIds?: string[]
   ): Promise<ZyraChatDecision> {
     // No onStage call here — the old single "context" announcement fired before any gathering even
     // started, and provably said nothing about what was actually found. See the granular
@@ -16246,7 +16262,7 @@ export class LegacyService implements OnModuleInit {
     const chronologicalHistory = [...history.rows].reverse();
     // Already empty when the capability is OFF (nothing was fetched above); the ternaries stay as a
     // second line of defence so a future edit to the gathering block can't leak KB content back in.
-    const [existingRunsRes, existingBugsRes] = await Promise.all([
+    const [existingRunsRes, existingBugsRes, selectedCasesRes, automationAuthRes] = await Promise.all([
       this.db.query(
         "SELECT id, name, environment, status FROM cycles WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 20",
         [projectId]
@@ -16254,8 +16270,33 @@ export class LegacyService implements OnModuleInit {
       this.db.query(
         "SELECT id, external_id, title, status, severity, priority FROM bugs WHERE project_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 25",
         [projectId]
+      ).catch(() => ({ rows: [] as Body[] })),
+      selectedTestcaseIds?.length
+        ? this.db.query(
+            `SELECT tc.id, tc.external_id, tc.title, tc.status, tc.priority,
+                    sc.target_url AS script_target_url,
+                    (sc.active_version_id IS NOT NULL) AS has_script
+             FROM testcases tc
+             LEFT JOIN test_scripts sc ON sc.testcase_id = tc.id AND sc.project_id = tc.project_id AND sc.framework = 'playwright-ts'
+             WHERE tc.project_id = $1 AND tc.id = ANY($2::uuid[]) AND tc.deleted_at IS NULL
+             ORDER BY tc.created_at ASC`,
+            [projectId, selectedTestcaseIds]
+          ).catch(() => ({ rows: [] as Body[] }))
+        : Promise.resolve({ rows: [] as Body[] }),
+      this.db.query(
+        "SELECT login_url FROM project_automation_auth WHERE project_id = $1 LIMIT 1",
+        [projectId]
       ).catch(() => ({ rows: [] as Body[] }))
     ]);
+    const defaultAutomationUrl = automationAuthRes.rows[0]?.login_url ? String(automationAuthRes.rows[0].login_url) : null;
+    const selectedCasesSummary = selectedCasesRes.rows.length
+      ? selectedCasesRes.rows
+          .map(
+            (tc) =>
+              `${tc.external_id || tc.id} (id: ${tc.id}) | ${tc.title} | status: ${tc.status || "Draft"} | hasScript: ${tc.has_script ? "yes" : "no"}${tc.script_target_url ? ` | scriptTargetUrl: ${tc.script_target_url}` : ""}`
+          )
+          .join("\n")
+      : "No test cases explicitly selected in chat.";
     const existingRunsSummary = existingRunsRes.rows.length
       ? existingRunsRes.rows.map((r) => `${r.name} (id: ${r.id}, status: ${r.status || "planned"}${r.environment ? `, env: ${r.environment}` : ""})`).join("\n")
       : "No existing test runs.";
@@ -16297,7 +16338,7 @@ export class LegacyService implements OnModuleInit {
     const context = [
       "You are Zyra, an expert test engineer and edge-case designer for this product.",
       "Your workflow is: understand the user's query, decide which project context is needed, choose exactly one supported action, then return a structured plan.",
-      `Enabled capabilities for this project — generation (author new testcases): ${capabilities.generation ? "ON" : "OFF"}; knowledge base access: ${capabilities.knowledgeBase ? "ON" : "OFF"}; testcase storage (create/update/archive/bulk): ${capabilities.testcaseStorage ? "ON" : "OFF"}; suite operations (create/move): ${capabilities.suiteOperations ? "ON" : "OFF"}; run operations (create/update/delete): ${capabilities.runOperations ? "ON" : "OFF"}; bug operations (create/update/delete): ${capabilities.bugOperations ? "ON" : "OFF"}.`,
+      `Enabled capabilities for this project — generation (author new testcases): ${capabilities.generation ? "ON" : "OFF"}; knowledge base access: ${capabilities.knowledgeBase ? "ON" : "OFF"}; testcase storage (create/update/archive/bulk): ${capabilities.testcaseStorage ? "ON" : "OFF"}; suite operations (create/move): ${capabilities.suiteOperations ? "ON" : "OFF"}; run operations (create/update/delete): ${capabilities.runOperations ? "ON" : "OFF"}; bug operations (create/update/delete): ${capabilities.bugOperations ? "ON" : "OFF"}; automation operations (generate/run Playwright scripts): ${capabilities.automationOperations ? "ON" : "OFF"}.`,
       `Configured test case volume for this project: "${projectTestcaseRange}" (${this.testcaseRangeConfig(projectTestcaseRange).instruction}). This is the default when the user does not ask for a specific number — do not promise or propose a count that contradicts it, and do not report requestedCount unless the user actually named one.`,
       "Before proposing or authoring anything, ground yourself in the context below: the knowledge base (semantic retrieval plus any folder the user named), the Jira tickets, and the existing testcases. Coverage answers must be based on the existing testcases shown, never guessed; new testcases must fill gaps in that coverage rather than duplicate it. Say which sources you used in reasoningSummary.",
       "If the user asks for an action whose capability is OFF, do NOT emit those operations — choose action 'answer' and briefly say that capability is disabled in Zyra settings and how to enable it. Never silently substitute a different mutation (e.g. do not create testcases when storage or generation is OFF).",
@@ -16318,6 +16359,9 @@ export class LegacyService implements OnModuleInit {
       "- move_to_suite: move/assign EXISTING testcases into a suite when the user asks to move/assign/organize/group/put existing testcases into a suite. The target suite goes in operation.suiteName (it is created automatically if it does not already exist, so you do not need a separate create_suite op for the same suite). List the testcases to move in operation.externalIds (use the external IDs shown under 'Existing suites' / 'Existing testcases'), set operation.allExisting=true when the user means every existing testcase, or set operation.fromLastPlan=true when the user refers to 'all'/'the N cases' from a recent generation batch (see 'Most recently generated batch' below) — fromLastPlan is exact and does not depend on you correctly recalling every external ID from earlier in the conversation, so prefer it over externalIds whenever the user is clearly referring to a just-generated batch rather than naming specific unrelated testcases.",
       "- create_run / update_run / delete_run: create, update, or delete a test run (cycle) when the user asks to manage test runs. Put runId or runName in the operation, and put fields (name, description, environment, buildVersion, releaseName, startDate, dueDate, status) in operation.fields.",
       "- create_bug / update_bug / delete_bug: create, update, or delete a bug when the user asks to report, edit, triage, or delete a bug. Put bugId, bugExternalId (e.g. BUG-1), or bugTitle in the operation, and put fields (title, description, severity, priority, status, externalUrl, dueDate) in operation.fields.",
+      `- generate_script / run_script: generate (3-Agent Playwright generator/healer) or execute a Playwright TypeScript automation script for EXPLICITLY SELECTED or NAMED test case(s) ONLY. Put target test case IDs in operation.testcaseIds / operation.externalIds (or testcaseId / externalId). Optional: operation.targetUrl (if not supplied by user, use scriptTargetUrl or project automation loginUrl${defaultAutomationUrl ? `: ${defaultAutomationUrl}` : ""}; if no URL exists anywhere for generate_script, choose 'answer' and ask the user for the Target URL), operation.browser ('chromium'|'firefox'|'webkit'|'all' for run_script), operation.instructions. CRITICAL: NEVER emit generate_script or run_script without at least one explicit selected or named test case — if no test case is selected/named, choose 'answer' and ask the user to select test case(s) first.`,
+      "Selected test cases in chat (always use these exact IDs/externalIds when the user refers to 'selected test cases', 'test case ini', or asks to generate/run Playwright automation):",
+      selectedCasesSummary,
       "CRITICAL: 'create'/'update'/'archive' operations are STAGED for review, not applied immediately — nothing is inserted, changed, or removed in the repository until the user separately reviews and saves the staged batch. Still emit the operation as soon as you are confident the user wants it — do not add an extra 'would you like me to save these?' round-trip of your own in the chat, the review step already exists downstream and is not yours to gate. But your WORDING must match reality: describe what you produce as DRAFTED/PROPOSED and staged for review — never as 'created', 'saved', 'updated', or 'archived' (all past tense, all claims about work this turn did not do), however many testcases your reply text lists. If the user wants testcases, choose 'create' now; otherwise do not enumerate any as if they existed.",
       `What you create is staged as a draft pending the user's review — it does not exist in the repository yet. Once saved it lands with status Draft, in the suite the request named, or in "${LegacyService.ZYRA_DRAFT_SUITE_NAME}" if it named none. So say where it WILL be filed once saved, never where it "is" — nothing you create this turn is openable or runnable until the user reviews and saves it.`,
       `"Save them" / "save them to <suite>" after you already emitted a create operation is a move, not a new create: emit move_to_suite with fromLastPlan=true and the target suiteName — fromLastPlan reaches BOTH a batch already saved to the repository AND a batch still only staged/drafted (re-pointing the unsaved ones at the new suite; they still need the user's own Save afterwards, so describe that as staged/drafted, never as saved or moved). Re-creating them would duplicate every case. The signal for "was anything drafted for this" is the transcript's PROPOSAL annotation on a create-routed turn, or the recent-batch counts below (saved + staged) — NOT whether that turn "saved" anything, since a staged create always shows saved nothing and still has real drafts to move. Only treat "save them" as a brand-new create when NEITHER signal shows anything: a plain answer turn that only described hypothetical cases in prose, with no tracked batch below.`,
@@ -16336,7 +16380,7 @@ export class LegacyService implements OnModuleInit {
       "For a create request also report how many testcases the user asked for: set requestedCount to that number when they named one (in digits or words, e.g. 'fifteen' -> 15), and set exhaustive=true when they asked for everything ('all possible cases', 'as many as you can', 'full coverage'). Leave requestedCount null and exhaustive false when they did not say — the project's configured range is used then.",
       "For a create request also report its scope — what the test cases are FOR, judged from the meaning of the message and the conversation, not its exact words: \"named\" when this message names specific tickets; \"referenced\" when it points at tickets named earlier in the conversation or selected (\"all of them\", \"those tickets\", \"the selected ones\"); \"all_tickets\" when it means every ticket, requirement, issue or story in the project; \"project\" when it means the whole project or everything without naming tickets; \"feature\" when it is about one feature, area, page, document or folder; \"unspecified\" when it does not say what the test cases are for (e.g. just \"write all test cases\"). \"All\" means all of whatever the user refers to — do not widen it to every ticket unless they mean that.",
       "Return ONLY a single valid JSON object — no markdown fences, no text before or after the JSON:",
-      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive|create_suite|move_to_suite|create_run|update_run|delete_run|create_bug|update_bug|delete_bug\",\"actionType\":\"answer|create|update|archive|suite|run|bug|mixed\",\"requestedCount\":null,\"exhaustive\":false,\"scope\":\"named|referenced|all_tickets|project|feature|unspecified\",\"operations\":[{\"type\":\"create|update|archive|create_suite|move_to_suite|create_run|update_run|delete_run|create_bug|update_bug|delete_bug\",\"testcaseId\":\"\",\"externalId\":\"\",\"externalIds\":[],\"allExisting\":false,\"fromLastPlan\":false,\"suiteName\":\"\",\"suiteId\":\"\",\"runId\":\"\",\"runName\":\"\",\"bugId\":\"\",\"bugExternalId\":\"\",\"bugTitle\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
+      "{\"reply\":\"\",\"reasoningSummary\":\"\",\"action\":\"answer|list|jira_pending_testcases|create|update|archive|create_suite|move_to_suite|create_run|update_run|delete_run|create_bug|update_bug|delete_bug|generate_script|run_script\",\"actionType\":\"answer|create|update|archive|suite|run|bug|automation|mixed\",\"requestedCount\":null,\"exhaustive\":false,\"scope\":\"named|referenced|all_tickets|project|feature|unspecified\",\"operations\":[{\"type\":\"create|update|archive|create_suite|move_to_suite|create_run|update_run|delete_run|create_bug|update_bug|delete_bug|generate_script|run_script\",\"testcaseId\":\"\",\"externalId\":\"\",\"externalIds\":[],\"testcaseIds\":[],\"allExisting\":false,\"fromLastPlan\":false,\"suiteName\":\"\",\"suiteId\":\"\",\"runId\":\"\",\"runName\":\"\",\"bugId\":\"\",\"bugExternalId\":\"\",\"bugTitle\":\"\",\"targetUrl\":\"\",\"browser\":\"\",\"instructions\":\"\",\"draft\":{},\"fields\":{},\"reason\":\"\"}],\"testcases\":[{}]}",
       "REPLY FIELD RULES — reply is rendered as markdown in a chat UI, must be human-readable:",
       "  - Use ## for main headings, ### for subsections, **bold** for emphasis, - for bullets, 1. for numbered steps.",
       "  - For comparisons or tabular data use markdown table syntax: | Heading | Heading |\\n|---|---|\\n| value | value |",
@@ -16532,6 +16576,9 @@ export class LegacyService implements OnModuleInit {
       if (modelIntent === "bug" && !capabilities.bugOperations) {
         return blockedBy("bugOperations", modelIntent);
       }
+      if (modelIntent === "automation" && !capabilities.automationOperations) {
+        return blockedBy("automationOperations", modelIntent);
+      }
       if ((modelIntent === "update" || modelIntent === "archive") && !capabilities.testcaseStorage) {
         return blockedBy("testcaseStorage", modelIntent);
       }
@@ -16575,7 +16622,20 @@ export class LegacyService implements OnModuleInit {
           sources: { knowledge: knowledgeForChat, jira: mentionedJira, existingTestcases, bugs: bugsForChat }
         });
       }
-      return this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
+      const normalized = this.normalizeZyraChatDecision(raw, message, existingTestcases, modelIntent);
+      if (normalized.operations.some((op) => op.type === "generate_script" || op.type === "run_script")) {
+        const urlInMessage = message.match(/https?:\/\/[^\s"'`<>]+/i)?.[0];
+        normalized.operations = normalized.operations.map((op) => {
+          if (op.type !== "generate_script" && op.type !== "run_script") return op;
+          const hasExplicit = Boolean(op.testcaseId || op.externalId || op.testcaseIds?.length || op.externalIds?.length);
+          return {
+            ...op,
+            ...(hasExplicit || !selectedTestcaseIds?.length ? {} : { testcaseIds: selectedTestcaseIds }),
+            ...(op.targetUrl || !urlInMessage ? {} : { targetUrl: urlInMessage }),
+          };
+        });
+      }
+      return normalized;
     } catch (err) {
       const errorDetail = this.extractAiErrorMessage(err);
       if (this.isZyraTimeoutError(err)) {
@@ -16880,6 +16940,7 @@ export class LegacyService implements OnModuleInit {
       if (op.type === "create_suite" || op.type === "move_to_suite") return capabilities.suiteOperations;
       if (op.type === "create_run" || op.type === "update_run" || op.type === "delete_run") return capabilities.runOperations;
       if (op.type === "create_bug" || op.type === "update_bug" || op.type === "delete_bug") return capabilities.bugOperations;
+      if (op.type === "generate_script" || op.type === "run_script") return capabilities.automationOperations;
       return false;
     });
     // Ids created earlier in THIS batch — merged into fromLastPlan resolution below so a single
@@ -17249,6 +17310,112 @@ export class LegacyService implements OnModuleInit {
           await this.deleteBug(actorId, String(bug.id));
           activity.push({ actor: "agent", title: "Deleted bug", detail: `${bug.external_id || ""} ${bug.title}`.trim(), createdAt: new Date().toISOString() });
           await this.logProjectActivity(projectId, actorId, "zyra_bug_deleted", "bug", String(bug.id), String(bug.title), { source: "zyra_chat", reason: op.reason || null });
+        }
+      } else if (op.type === "generate_script" || op.type === "run_script") {
+        const rawIds = [
+          ...(op.testcaseId ? [op.testcaseId] : []),
+          ...(Array.isArray(op.testcaseIds) ? op.testcaseIds : [])
+        ].filter((id) => isUuid(id));
+        const rawExternalIds = [
+          ...(op.externalId ? [op.externalId] : []),
+          ...(Array.isArray(op.externalIds) ? op.externalIds : [])
+        ]
+          .map((e) => String(e || "").trim().toUpperCase())
+          .filter(Boolean);
+
+        const targetCasesRes =
+          rawIds.length || rawExternalIds.length
+            ? await this.db.query(
+                `SELECT tc.id, tc.external_id, tc.title,
+                        sc.target_url AS script_target_url,
+                        (sc.active_version_id IS NOT NULL) AS has_script
+                 FROM testcases tc
+                 LEFT JOIN test_scripts sc ON sc.testcase_id = tc.id AND sc.project_id = tc.project_id AND sc.framework = 'playwright-ts'
+                 WHERE tc.project_id = $1
+                   AND tc.deleted_at IS NULL
+                   AND (
+                     ($2::uuid[] IS NOT NULL AND tc.id = ANY($2::uuid[]))
+                     OR ($3::text[] IS NOT NULL AND UPPER(COALESCE(tc.external_id, '')) = ANY($3::text[]))
+                   )
+                 ORDER BY tc.created_at ASC
+                 LIMIT 10`,
+                [projectId, rawIds.length ? rawIds : null, rawExternalIds.length ? rawExternalIds : null]
+              )
+            : { rows: [] as Body[] };
+
+        if (!targetCasesRes.rows.length) {
+          activity.push({
+            actor: "agent",
+            title: "No selected test cases matched",
+            detail: "Select or specify at least one existing test case before generating or running Playwright automation.",
+            createdAt: new Date().toISOString()
+          });
+        } else if (op.type === "generate_script") {
+          if (!this.automationAgents) {
+            activity.push({ actor: "agent", title: "Automation generator unavailable", detail: "AutomationAgentsService is not available.", createdAt: new Date().toISOString() });
+          } else {
+            const authRes = await this.db
+              .query("SELECT login_url FROM project_automation_auth WHERE project_id = $1 LIMIT 1", [projectId])
+              .catch(() => ({ rows: [] as Body[] }));
+            const fallbackUrl = authRes.rows[0]?.login_url ? String(authRes.rows[0].login_url) : null;
+
+            for (const tc of targetCasesRes.rows) {
+              const resolvedUrl = op.targetUrl?.trim() || (tc.script_target_url ? String(tc.script_target_url) : null) || fallbackUrl;
+              if (!resolvedUrl) {
+                activity.push({
+                  actor: "agent",
+                  title: `Target URL required (${tc.external_id || tc.title})`,
+                  detail: "Provide a Target URL in chat or configure one on the test case script / Automation Auth settings.",
+                  createdAt: new Date().toISOString()
+                });
+                continue;
+              }
+              const wantsHeal = Boolean(tc.has_script && op.instructions && /\b(heal|fix|repair|update)\b/i.test(op.instructions));
+              const { job } = wantsHeal
+                ? await this.automationAgents.startHeal(userId, projectId, String(tc.id), {
+                    targetUrl: resolvedUrl,
+                    instructions: op.instructions || op.reason || null,
+                    zyraSessionId: sessionId
+                  })
+                : await this.automationAgents.startSingleGenerate(userId, projectId, String(tc.id), {
+                    targetUrl: resolvedUrl,
+                    instructions: op.instructions || op.reason || null,
+                    zyraSessionId: sessionId
+                  });
+              activity.push({
+                actor: "agent",
+                title: wantsHeal ? "Started Playwright Healer" : "Started 3-Agent Playwright Generator",
+                detail: `${tc.external_id || tc.title} — Job ${job.id} (${resolvedUrl})`,
+                createdAt: new Date().toISOString()
+              });
+            }
+          }
+        } else {
+          if (!this.scriptRunner) {
+            activity.push({ actor: "agent", title: "Script runner unavailable", detail: "ScriptRunnerService is not available.", createdAt: new Date().toISOString() });
+          } else {
+            for (const tc of targetCasesRes.rows) {
+              try {
+                const { run } = await this.scriptRunner.triggerRun(userId, projectId, String(tc.id), {
+                  targetUrl: op.targetUrl?.trim() || null,
+                  browser: (op.browser as "chromium" | "firefox" | "webkit" | "all" | undefined) || "chromium"
+                });
+                activity.push({
+                  actor: "agent",
+                  title: "Queued Playwright script run",
+                  detail: `${tc.external_id || tc.title} — Run ${run.id}${run.cycleId ? ` (Cycle ${run.cycleId})` : ""}`,
+                  createdAt: new Date().toISOString()
+                });
+              } catch (err) {
+                activity.push({
+                  actor: "agent",
+                  title: `Skipped run (${tc.external_id || tc.title})`,
+                  detail: err instanceof Error ? err.message : "Failed to queue script run.",
+                  createdAt: new Date().toISOString()
+                });
+              }
+            }
+          }
         }
       }
       } catch (err) {
@@ -23712,12 +23879,12 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   // shapes what the model asked for rather than second-guessing it: operations must be well-formed
   // and reference something real, and rows are only returned for actions that display them.
   private normalizeZyraChatDecision(raw: Body, message: string, existingTestcases: ZyraGenerationInput["existingTestcases"], intent: ZyraChatIntent): ZyraChatDecision {
-    const modelActionType = ["answer", "create", "update", "archive", "suite", "run", "bug", "mixed"].includes(String(raw.actionType))
+    const modelActionType = ["answer", "create", "update", "archive", "suite", "run", "bug", "automation", "mixed"].includes(String(raw.actionType))
       ? String(raw.actionType) as ZyraChatDecision["actionType"]
       : "answer";
-    const mutationIntent = intent === "create" || intent === "update" || intent === "archive" || intent === "suite" || intent === "run" || intent === "bug";
+    const mutationIntent = intent === "create" || intent === "update" || intent === "archive" || intent === "suite" || intent === "run" || intent === "bug" || intent === "automation";
     const tableIntent = mutationIntent || intent === "list";
-    const actionType = intent === "suite" ? "suite" : intent === "run" ? "run" : intent === "bug" ? "bug" : (mutationIntent ? modelActionType : "answer");
+    const actionType = intent === "suite" ? "suite" : intent === "run" ? "run" : intent === "bug" ? "bug" : intent === "automation" ? "automation" : (mutationIntent ? modelActionType : "answer");
     const opTypes = [
       "create",
       "update",
@@ -23730,6 +23897,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       "create_bug",
       "update_bug",
       "delete_bug",
+      "generate_script",
+      "run_script",
     ];
     const operations = normalizeJsonArray(raw.operations)
       .map((op) => {
@@ -23751,6 +23920,9 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
           bugId: op?.bugId ? String(op.bugId).trim() : undefined,
           bugExternalId: op?.bugExternalId ? String(op.bugExternalId).trim().slice(0, 64) : undefined,
           bugTitle: op?.bugTitle ? String(op.bugTitle).trim().slice(0, 200) : undefined,
+          targetUrl: op?.targetUrl ? String(op.targetUrl).trim().slice(0, 1024) : undefined,
+          browser: op?.browser ? String(op.browser).trim().toLowerCase().slice(0, 32) : undefined,
+          instructions: op?.instructions ? String(op.instructions).trim().slice(0, 2000) : undefined,
           draft: op?.draft && typeof op.draft === "object" ? op.draft : undefined,
           fields: op?.fields && typeof op.fields === "object" ? op.fields : undefined,
           reason: op?.reason ? String(op.reason).slice(0, 500) : undefined,
@@ -23766,6 +23938,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
         if (op.type === "update_run" || op.type === "delete_run") return !!(op.runId || op.runName);
         if (op.type === "create_bug") return !!(op.bugTitle || op.fields?.title);
         if (op.type === "update_bug" || op.type === "delete_bug") return !!(op.bugId || op.bugExternalId || op.bugTitle);
+        if (op.type === "generate_script" || op.type === "run_script") return !!(op.testcaseId || op.externalId || op.testcaseIds?.length || op.externalIds?.length);
         // An archive may name a SET (every existing testcase, or several ids) as well as one case —
         // a confirmed "delete all the test cases" arrives as allExisting:true, and dropping it here
         // is what left the confirmation with nothing to stage. applyZyraChatOperations expands it.
@@ -24062,7 +24235,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       testcaseStorage: caps.testcaseStorage !== false,
       suiteOperations: caps.suiteOperations !== false,
       runOperations: caps.runOperations !== false,
-      bugOperations: caps.bugOperations !== false
+      bugOperations: caps.bugOperations !== false,
+      automationOperations: caps.automationOperations !== false
     };
   }
 
@@ -24082,7 +24256,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
     testcaseStorage: "Test case storage is off for this project",
     suiteOperations: "Suite operations are off for this project",
     runOperations: "Test run operations are off for this project",
-    bugOperations: "Bug operations are off for this project"
+    bugOperations: "Bug operations are off for this project",
+    automationOperations: "Playwright automation operations are off for this project"
   };
 
   private zyraCapabilityDisabled(capability: keyof ZyraCapabilities, existingCount: number): ZyraChatDecision {
@@ -24092,7 +24267,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       testcaseStorage: "Test case storage operations (create, update, delete, bulk)",
       suiteOperations: "Suite operations (create, move/assign)",
       runOperations: "Test run operations (create, update, delete)",
-      bugOperations: "Bug operations (create, update, delete)"
+      bugOperations: "Bug operations (create, update, delete)",
+      automationOperations: "Playwright automation operations (generate, heal, run scripts)"
     };
     const reason = zyraReplyLanguage() === "ru"
       ? ZYRA_RU.capabilityDisabled(ZYRA_RU.capabilityLabel[capability])
@@ -24746,6 +24922,8 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       "create_bug",
       "update_bug",
       "delete_bug",
+      "generate_script",
+      "run_script",
     ]);
     if (decision.operations.length && decision.operations.every((op) => nonTestcaseOpTypes.has(op.type))) {
       const banner = this.zyraFalseCompletionBanner(decision.reply, decision.__salvaged, LegacyService.ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM);
@@ -25362,6 +25540,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       if (value === "suite" || value === "create_suite" || value === "move_to_suite" || value === "list_suites") return "suite";
       if (value === "run" || value === "create_run" || value === "update_run" || value === "delete_run") return "run";
       if (value === "bug" || value === "create_bug" || value === "update_bug" || value === "delete_bug") return "bug";
+      if (value === "automation" || value === "generate_script" || value === "run_script") return "automation";
       if (value === "create" || value === "create_testcases") return "create";
       if (value === "update" || value === "update_testcases") return "update";
       if (value === "archive" || value === "archive_testcases") return "archive";

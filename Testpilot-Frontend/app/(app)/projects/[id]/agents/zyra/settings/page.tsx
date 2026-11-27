@@ -46,6 +46,7 @@ const DEFAULT_CAPABILITIES: ZyraCapabilities = {
   suiteOperations: true,
   runOperations: true,
   bugOperations: true,
+  automationOperations: true,
 };
 
 const CAPABILITY_FIELDS: { key: keyof ZyraCapabilities; label: string; description: string }[] = [
@@ -55,6 +56,7 @@ const CAPABILITY_FIELDS: { key: keyof ZyraCapabilities; label: string; descripti
   { key: "suiteOperations", label: "Suite operations", description: "Create suites and move/assign existing test cases into suites." },
   { key: "runOperations", label: "Test run operations", description: "Create, update, and delete test runs (cycles) from chat." },
   { key: "bugOperations", label: "Bug operations", description: "Create, update, and delete bugs from chat." },
+  { key: "automationOperations", label: "Playwright automation operations", description: "Generate, heal, and execute Playwright scripts from chat for selected test cases." },
 ];
 
 function capitalize(value: string): string {

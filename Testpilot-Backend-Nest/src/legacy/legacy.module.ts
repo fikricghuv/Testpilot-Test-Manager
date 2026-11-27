@@ -6,6 +6,8 @@ import { IntegrationSyncModule } from "../integration-sync/integration-sync.modu
 import { PlanLimitsModule } from "../plan-limits/plan-limits.module";
 import { CustomFieldsModule } from "../custom-fields/custom-fields.module";
 import { CustomTagsModule } from "../custom-tags/custom-tags.module";
+import { AutomationAgentsModule } from "../automation-agents/automation-agents.module";
+import { ScriptRunnerModule } from "../script-runner/script-runner.module";
 import { WelcomeEmailModule } from "../welcome-email/welcome-email.module";
 import { LegacyController } from "./legacy.controller";
 import { LegacyService } from "./legacy.service";
@@ -23,7 +25,9 @@ import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
     PlanLimitsModule,
     WelcomeEmailModule,
     forwardRef(() => CustomFieldsModule),
-    forwardRef(() => CustomTagsModule)
+    forwardRef(() => CustomTagsModule),
+    forwardRef(() => AutomationAgentsModule),
+    forwardRef(() => ScriptRunnerModule)
   ],
   controllers: [LegacyController, SignupController],
   providers: [LegacyService, SignupService, ZyraProgressService, KbExtractionRunnerService],

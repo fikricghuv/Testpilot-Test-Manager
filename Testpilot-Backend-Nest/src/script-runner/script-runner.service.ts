@@ -1,6 +1,8 @@
 import { InjectQueue } from "@nestjs/bullmq";
 import {
   BadRequestException,
+  forwardRef,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -146,7 +148,7 @@ export class ScriptRunnerService {
 
   constructor(
     private readonly db: DatabaseService,
-    private readonly legacy: LegacyService,
+    @Inject(forwardRef(() => LegacyService)) private readonly legacy: LegacyService,
     private readonly storage: StorageService,
     @InjectQueue(SCRIPT_RUNNER_QUEUE) private readonly queue: Queue<ScriptRunnerJobPayload>,
     @Optional() private readonly apiTokens?: ApiTokenService

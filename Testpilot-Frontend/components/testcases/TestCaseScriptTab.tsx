@@ -37,7 +37,7 @@ import {
   type TestScriptStateResponse,
   type TestScriptStatus,
 } from "@/lib/api";
-import { Button, CopyButton, Field, FieldLabel, Input, Modal, StatusChip } from "@/components/ui";
+import { Button, ConfirmModal, CopyButton, Field, FieldLabel, Input, Modal, StatusChip } from "@/components/ui";
 import ExecutionEvidencePanel from "@/components/ExecutionEvidencePanel";
 import { formatDateTime } from "@/lib/date";
 
@@ -94,6 +94,7 @@ export function TestCaseScriptTab({
   const [showInstallModal, setShowInstallModal] = useState(false);
   const [checkingExtension, setCheckingExtension] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -379,8 +380,10 @@ export function TestCaseScriptTab({
         setActiveRun(null);
         setSuccess("Automation script removed.");
       }
+      setShowDeleteConfirm(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete script version.");
+      setShowDeleteConfirm(false);
     } finally {
       setDeleting(false);
     }
@@ -1033,11 +1036,10 @@ export function TestCaseScriptTab({
             </div>
             <Button
               type="button"
-              variant="ghost"
+              variant="destructive"
               size="sm"
-              onClick={handleDelete}
+              onClick={() => setShowDeleteConfirm(true)}
               disabled={deleting}
-              className="text-[var(--error-foreground)]"
             >
               <IconTrash size={14} />
               {deleting ? "Deleting..." : "Delete Script"}
@@ -1119,6 +1121,23 @@ export function TestCaseScriptTab({
           </div>
         </Modal>
       )}
+
+      <ConfirmModal
+        open={showDeleteConfirm}
+        title={state?.script?.activeVersionId ? `Delete Script Version v${state.script.activeVersion ?? ""}` : "Delete Automation Script"}
+        message={
+          state?.script?.activeVersionId && (state?.versions.length ?? 0) > 1
+            ? `Delete active version v${state.script.activeVersion ?? ""}? This version will be permanently removed and the previous version will become active.`
+            : "Delete this automation script? All saved script content for this version will be permanently removed and cannot be undone."
+        }
+        confirmLabel="Delete Script"
+        loading={deleting}
+        loadingLabel="Deleting…"
+        onConfirm={() => void handleDelete()}
+        onCancel={() => {
+          if (!deleting) setShowDeleteConfirm(false);
+        }}
+      />
     </div>
   );
 }

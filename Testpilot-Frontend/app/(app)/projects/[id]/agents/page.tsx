@@ -43,6 +43,7 @@ const CAPABILITY_META: Record<keyof ZyraCapabilities, { icon: ChipIcon; label: s
   suiteOperations: { icon: IconListCheck, label: "Suite operations" },
   runOperations: { icon: IconPlayerPlay, label: "Run operations" },
   bugOperations: { icon: IconBug, label: "Bug operations" },
+  automationOperations: { icon: IconWand, label: "Playwright automation" },
 };
 
 const futureAgents: Array<{
