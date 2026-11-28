@@ -24,7 +24,7 @@ import { assertSafePlaywrightScript, assertSafeTargetUrl } from "../common/scrip
 import { DatabaseService } from "../database/database.service";
 import { LegacyService, isUuid } from "../legacy/legacy.service";
 import { StorageService } from "../storage/storage.service";
-import { analyzePlaywrightFailure } from "./playwright-failure.analyzer";
+import { analyzePlaywrightFailure, analyzePlaywrightJsonReport } from "./playwright-failure.analyzer";
 import {
   MAX_SCRIPT_CONTENT_LENGTH,
   MAX_SCRIPT_OUTPUT_LENGTH,
@@ -494,7 +494,13 @@ export class ScriptRunnerService {
 
     await this.queue.add(
       SCRIPT_RUNNER_JOB,
-      { runId: runRow.id, browser },
+      {
+        runId: runRow.id,
+        browser,
+        ...(typeof input.retries === "number" ? { retries: input.retries } : {}),
+        ...(input.updateSnapshots ? { updateSnapshots: true } : {}),
+        ...(input.enableAccessibilityCheck ? { enableAccessibilityCheck: true } : {})
+      },
       { removeOnComplete: 50, removeOnFail: 50 }
     );
 
@@ -1302,17 +1308,22 @@ export class ScriptRunnerService {
    * Executes a queued Playwright script in an isolated temporary directory and persists
    * the verdict back into test_script_runs, executions, and cycles.
    */
-  async executeRunJob(runId: string, rawBrowser?: ScriptBrowser): Promise<void> {
+  async executeRunJob(
+    runId: string,
+    rawBrowser?: ScriptBrowser,
+    options?: { retries?: number; updateSnapshots?: boolean; enableAccessibilityCheck?: boolean }
+  ): Promise<void> {
     const runRes = await this.db.query<{
       id: string;
       project_id: string;
+      testcase_id: string;
       cycle_id: string | null;
       execution_id: string | null;
       target_url: string | null;
       triggered_by: string | null;
       script_content: string | null;
     }>(
-      `SELECT r.id, r.project_id, r.cycle_id, r.execution_id, r.target_url, r.triggered_by, v.script_content
+      `SELECT r.id, r.project_id, r.testcase_id, r.cycle_id, r.execution_id, r.target_url, r.triggered_by, v.script_content
        FROM test_script_runs r
        LEFT JOIN test_script_versions v ON v.id = r.version_id
        WHERE r.id = $1
@@ -1348,6 +1359,8 @@ export class ScriptRunnerService {
     try {
       tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "testpilot-pw-"));
       resultsDir = path.join(tempDir, "test-results");
+      const snapshotsDir = path.join(tempDir, "test.spec.ts-snapshots");
+      const jsonReportPath = path.join(tempDir, "report.json");
       const specPath = path.join(tempDir, "test.spec.ts");
       const configPath = path.join(tempDir, "playwright.config.ts");
 
@@ -1363,6 +1376,7 @@ export class ScriptRunnerService {
         selectedProjects.push(`{ name: "webkit", use: { ...devices["Desktop Safari"] } }`);
       }
 
+      const retries = typeof options?.retries === "number" && options.retries >= 0 ? Math.min(3, options.retries) : 0;
       const baseUrlLine = jobData.target_url ? `baseURL: ${JSON.stringify(jobData.target_url)},` : "";
       const configContent = [
         `import { defineConfig, devices } from "@playwright/test";`,
@@ -1370,7 +1384,8 @@ export class ScriptRunnerService {
         `  testDir: ".",`,
         `  outputDir: ${JSON.stringify(resultsDir)},`,
         `  timeout: ${SCRIPT_EXECUTION_TIMEOUT_MS},`,
-        `  reporter: [["list"]],`,
+        `  retries: ${retries},`,
+        `  reporter: [["list"], ["json", { outputFile: ${JSON.stringify(jsonReportPath)} }]],`,
         `  use: { headless: true, ignoreHTTPSErrors: true, ${baseUrlLine} screenshot: "on", trace: "on", video: "on" },`,
         `  projects: [${selectedProjects.join(", ")}]`,
         `});`
@@ -1383,11 +1398,18 @@ export class ScriptRunnerService {
       await fs.writeFile(configPath, configContent, "utf8");
       await fs.writeFile(specPath, jobData.script_content, "utf8");
 
+      const hadBaselines = await this.restoreVisualBaselines(jobData.project_id, jobData.testcase_id, snapshotsDir);
+
+      const playwrightArgs = ["test", "test.spec.ts", "--config", "playwright.config.ts"];
+      if (options?.updateSnapshots) {
+        playwrightArgs.push("--update-snapshots");
+      }
+
       const playwrightBin = path.join(process.cwd(), "node_modules", ".bin", "playwright");
       const nodeModulesDir = path.join(process.cwd(), "node_modules");
       const { stdout, stderr } = await execFileAsync(
         playwrightBin,
-        ["test", "test.spec.ts", "--config", "playwright.config.ts"],
+        playwrightArgs,
         {
           cwd: tempDir,
           timeout: SCRIPT_EXECUTION_TIMEOUT_MS,
@@ -1403,6 +1425,19 @@ export class ScriptRunnerService {
         }
       );
 
+      const jsonReport = await this.readJsonReportSafe(jsonReportPath);
+      if (options?.updateSnapshots || !hadBaselines) {
+        await this.syncVisualBaselines(jobData.project_id, jobData.testcase_id, jobData.triggered_by, snapshotsDir);
+      }
+      if (options?.enableAccessibilityCheck && jobData.target_url && jobData.execution_id) {
+        await this.runAndStoreAccessibilityAudit(
+          jobData.project_id,
+          jobData.execution_id,
+          jobData.triggered_by,
+          jobData.target_url
+        );
+      }
+
       await this.collectAndStoreEvidence(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
 
       await this.finalizeRun(runId, jobData.cycle_id, jobData.execution_id, {
@@ -1410,7 +1445,8 @@ export class ScriptRunnerService {
         durationMs: Date.now() - startedAt,
         stdout: redactSensitiveOutput(truncateOutput(stdout)),
         stderr: redactSensitiveOutput(truncateOutput(stderr)),
-        errorMessage: null
+        errorMessage: null,
+        jsonReport
       });
     } catch (err) {
       const execErr = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
@@ -1421,6 +1457,7 @@ export class ScriptRunnerService {
           truncateOutput(execErr.message) ||
           "Playwright execution failed."
       );
+      const jsonReport = tempDir ? await this.readJsonReportSafe(path.join(tempDir, "report.json")) : null;
 
       if (resultsDir) {
         await this.collectAndStoreEvidence(resultsDir, jobData.project_id, jobData.execution_id, jobData.triggered_by);
@@ -1431,7 +1468,8 @@ export class ScriptRunnerService {
         durationMs: Date.now() - startedAt,
         stdout: redactSensitiveOutput(truncateOutput(execErr.stdout)),
         stderr: redactSensitiveOutput(truncateOutput(execErr.stderr)),
-        errorMessage
+        errorMessage,
+        jsonReport
       });
     } finally {
       if (tempDir) {
@@ -1586,9 +1624,23 @@ export class ScriptRunnerService {
     if (!executionId) return;
     try {
       const pngPaths = await this.findFilesByExt(resultsDir, ".png");
+      let screenshotIdx = 0;
+      let diffIdx = 0;
       for (let i = 0; i < pngPaths.length; i++) {
         const buffer = await fs.readFile(pngPaths[i]);
-        const fileName = pngPaths.length === 1 ? "screenshot.png" : `screenshot-${i + 1}.png`;
+        const baseName = path.basename(pngPaths[i]).toLowerCase();
+        let fileName: string;
+        if (baseName.endsWith("-diff.png")) {
+          diffIdx++;
+          fileName = `visual-diff-${diffIdx}.png`;
+        } else if (baseName.endsWith("-actual.png")) {
+          fileName = `visual-actual-${diffIdx || i + 1}.png`;
+        } else if (baseName.endsWith("-expected.png")) {
+          fileName = `visual-expected-${diffIdx || i + 1}.png`;
+        } else {
+          screenshotIdx++;
+          fileName = screenshotIdx === 1 && pngPaths.length === 1 ? "screenshot.png" : `screenshot-${screenshotIdx}.png`;
+        }
         await this.storeAttachment(projectId, executionId, uploadedBy, fileName, "png", "image/png", "screenshot", buffer);
       }
 
@@ -1639,6 +1691,123 @@ export class ScriptRunnerService {
     }
   }
 
+  private async readJsonReportSafe(jsonPath: string): Promise<unknown | null> {
+    try {
+      const raw = await fs.readFile(jsonPath, "utf8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  private async restoreVisualBaselines(projectId: string, testcaseId: string, snapshotsDir: string): Promise<boolean> {
+    if (!testcaseId) return false;
+    try {
+      const res = await this.db.query<{ file_name: string; storage_path: string }>(
+        `SELECT file_name, storage_path FROM attachments
+         WHERE project_id = $1 AND entity_type = 'visual_baseline' AND entity_id = $2`,
+        [projectId, testcaseId]
+      );
+      if (res.rows.length === 0) return false;
+      await fs.mkdir(snapshotsDir, { recursive: true });
+      for (const row of res.rows) {
+        const buf = await this.storage.getBuffer(row.storage_path).catch(() => null);
+        if (buf) {
+          await fs.writeFile(path.join(snapshotsDir, path.basename(row.file_name)), buf);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async syncVisualBaselines(
+    projectId: string,
+    testcaseId: string,
+    uploadedBy: string | null,
+    snapshotsDir: string
+  ): Promise<void> {
+    if (!testcaseId) return;
+    try {
+      const pngs = await this.findFilesByExt(snapshotsDir, ".png");
+      if (pngs.length === 0) return;
+      await this.db.query(
+        `DELETE FROM attachments WHERE project_id = $1 AND entity_type = 'visual_baseline' AND entity_id = $2`,
+        [projectId, testcaseId]
+      );
+      for (const pngPath of pngs) {
+        const buffer = await fs.readFile(pngPath);
+        const fileName = path.basename(pngPath);
+        const storageKey = `visual-baselines/${projectId}/${testcaseId}/${randomUUID()}-${fileName}`;
+        await this.storage.put(storageKey, buffer, "image/png");
+        await this.db.query(
+          `INSERT INTO attachments
+             (project_id, entity_type, entity_id, file_name, content_type, file_size, storage_path, uploaded_by, evidence_kind)
+           VALUES ($1, 'visual_baseline', $2, $3, 'image/png', $4, $5, $6, 'screenshot')`,
+          [projectId, testcaseId, fileName, buffer.length, storageKey, uploadedBy]
+        );
+      }
+    } catch (err) {
+      this.logger.warn(`Failed to sync visual baselines: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private async runAndStoreAccessibilityAudit(
+    projectId: string,
+    executionId: string,
+    uploadedBy: string | null,
+    targetUrl: string
+  ): Promise<void> {
+    let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+    try {
+      browser = await chromium.launch({ headless: true });
+      const context = await browser.newContext({ ignoreHTTPSErrors: true });
+      const page = await context.newPage();
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
+
+      const violations = await page.evaluate(() => {
+        const issues: Array<{ rule: string; impact: "serious" | "moderate"; element: string; detail: string }> = [];
+        if (!document.documentElement.getAttribute("lang")) {
+          issues.push({ rule: "html-has-lang", impact: "serious", element: "<html>", detail: "Document is missing a lang attribute." });
+        }
+        if (!document.querySelector("main, [role='main']")) {
+          issues.push({ rule: "landmark-one-main", impact: "moderate", element: "<body>", detail: "Page is missing a <main> landmark." });
+        }
+        document.querySelectorAll("img").forEach((img) => {
+          if (!img.hasAttribute("alt")) {
+            issues.push({ rule: "image-alt", impact: "serious", element: img.outerHTML.slice(0, 120), detail: "<img> element is missing an alt attribute." });
+          }
+        });
+        document.querySelectorAll("button, a[href]").forEach((el) => {
+          const text = (el.textContent || "").trim();
+          const aria = el.getAttribute("aria-label") || el.getAttribute("title") || "";
+          if (!text && !aria && !el.querySelector("img[alt]")) {
+            issues.push({ rule: "accessible-name", impact: "serious", element: el.outerHTML.slice(0, 120), detail: `<${el.tagName.toLowerCase()}> has no discernible accessible text.` });
+          }
+        });
+        return issues.slice(0, 50);
+      });
+
+      const report = { url: page.url(), scannedAt: new Date().toISOString(), violationCount: violations.length, violations };
+      await this.storeAttachment(
+        projectId,
+        executionId,
+        uploadedBy,
+        "accessibility-report.json",
+        "json",
+        "application/json",
+        "api",
+        Buffer.from(JSON.stringify(report, null, 2), "utf8")
+      );
+    } catch (err) {
+      this.logger.warn(`Accessibility audit skipped: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      if (browser) await browser.close().catch(() => undefined);
+    }
+  }
+
   private async finalizeRun(
     runId: string,
     cycleId: string | null,
@@ -1649,13 +1818,14 @@ export class ScriptRunnerService {
       stdout: string | null;
       stderr: string | null;
       errorMessage: string | null;
+      jsonReport?: unknown | null;
     }
   ): Promise<void> {
     const executionStatus = outcome.status === "passed" ? "Passed" : "Failed";
     const failureAnalysis =
       outcome.status === "passed"
         ? null
-        : analyzePlaywrightFailure(outcome.stdout, outcome.stderr, outcome.errorMessage);
+        : analyzePlaywrightJsonReport(outcome.jsonReport ?? null, outcome.stdout, outcome.stderr, outcome.errorMessage);
 
     await this.db.transaction(async (client) => {
       await client.query(

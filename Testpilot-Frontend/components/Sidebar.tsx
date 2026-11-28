@@ -18,7 +18,8 @@ import {
   IconPlug,
   IconLogout,
   IconChevronLeft,
-  IconChevronRight,
+  IconLayoutSidebarLeftCollapse,
+  IconLayoutSidebarLeftExpand,
   IconKey,
   IconList,
   IconLayoutDashboard,
@@ -86,29 +87,30 @@ const projectNavSections: Array<{ section: string; items: NavItemConfig[] }> = [
 type MenuIconName =
   | "home" | "sparkles" | "book" | "list" | "fileText" | "clipboard"
   | "play" | "bug" | "chart" | "activity" | "settings" | "users" | "plug"
-  | "logout" | "chevronLeft" | "chevronRight" | "key"
+  | "logout" | "chevronLeft" | "sidebarCollapse" | "sidebarExpand" | "key"
   | "dashboard" | "folders" | "account";
 
 function MenuIcon({ name, className = "h-[20px] w-[20px]" }: { name: MenuIconName; className?: string }) {
   const props = { className, size: 20, stroke: 1.75 } as const;
   switch (name) {
-    case "home":         return <IconHome {...props} />;
-    case "sparkles":     return <IconSparkles {...props} />;
-    case "book":         return <IconBook {...props} />;
-    case "list":         return <IconList {...props} />;
-    case "fileText":     return <IconFileText {...props} />;
-    case "clipboard":    return <IconClipboardList {...props} />;
-    case "play":         return <IconPlayerPlay {...props} />;
-    case "bug":          return <IconBug {...props} />;
-    case "chart":        return <IconChartBar {...props} />;
-    case "activity":     return <IconActivity {...props} />;
-    case "settings":     return <IconSettings {...props} />;
-    case "users":        return <IconUsers {...props} />;
-    case "plug":         return <IconPlug {...props} />;
-    case "logout":       return <IconLogout {...props} />;
-    case "chevronLeft":  return <IconChevronLeft {...props} />;
-    case "chevronRight": return <IconChevronRight {...props} />;
-    case "key":          return <IconKey {...props} />;
+    case "home":            return <IconHome {...props} />;
+    case "sparkles":        return <IconSparkles {...props} />;
+    case "book":            return <IconBook {...props} />;
+    case "list":            return <IconList {...props} />;
+    case "fileText":        return <IconFileText {...props} />;
+    case "clipboard":       return <IconClipboardList {...props} />;
+    case "play":            return <IconPlayerPlay {...props} />;
+    case "bug":             return <IconBug {...props} />;
+    case "chart":           return <IconChartBar {...props} />;
+    case "activity":        return <IconActivity {...props} />;
+    case "settings":        return <IconSettings {...props} />;
+    case "users":           return <IconUsers {...props} />;
+    case "plug":            return <IconPlug {...props} />;
+    case "logout":          return <IconLogout {...props} />;
+    case "chevronLeft":     return <IconChevronLeft {...props} />;
+    case "sidebarCollapse": return <IconLayoutSidebarLeftCollapse {...props} />;
+    case "sidebarExpand":   return <IconLayoutSidebarLeftExpand {...props} />;
+    case "key":             return <IconKey {...props} />;
     case "dashboard":    return <IconLayoutDashboard {...props} />;
     case "folders":      return <IconFolders {...props} />;
     case "account":      return <IconUserCircle {...props} />;
@@ -242,7 +244,7 @@ function SidebarContent() {
             title="Collapse sidebar"
             aria-label="Collapse sidebar"
           >
-            <MenuIcon name="chevronLeft" className="h-[16px] w-[16px]" />
+            <MenuIcon name="sidebarCollapse" className="h-[17px] w-[17px]" />
           </button>
         )}
       </div>
@@ -259,7 +261,7 @@ function SidebarContent() {
             title="Expand sidebar"
             aria-label="Expand sidebar"
           >
-            <MenuIcon name="chevronRight" className="h-[18px] w-[18px] shrink-0" />
+            <MenuIcon name="sidebarExpand" className="h-[18px] w-[18px] shrink-0" />
           </button>
         )}
 

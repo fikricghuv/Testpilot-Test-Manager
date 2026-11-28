@@ -16,6 +16,7 @@ export interface TraceStepSummary {
   frameDataUrl: string | null;
   beforeSnapshotHtml: string | null;
   afterSnapshotHtml: string | null;
+  networkErrors?: TraceNetworkEntry[];
 }
 
 export interface TraceFilmstripFrame {
@@ -36,6 +37,7 @@ export interface TraceNetworkEntry {
   status: number | null;
   statusText: string | null;
   durationMs: number | null;
+  timestamp?: number | null;
 }
 
 export interface TraceErrorEntry {
@@ -49,6 +51,8 @@ export interface ParsedTraceSummary {
     baseUrl: string | null;
     viewport: { width: number; height: number } | null;
     totalDurationMs: number | null;
+    failedNetworkCount?: number;
+    consoleErrorCount?: number;
   };
   filmstrip: TraceFilmstripFrame[];
   steps: TraceStepSummary[];
@@ -451,7 +455,8 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
             url: String(snap.request?.url || ""),
             status: typeof snap.response?.status === "number" ? snap.response.status : null,
             statusText: typeof snap.response?.statusText === "string" ? snap.response.statusText : null,
-            durationMs: typeof snap.time === "number" ? Math.round(snap.time) : null
+            durationMs: typeof snap.time === "number" ? Math.round(snap.time) : null,
+            timestamp: typeof snap._monotonicTime === "number" ? snap._monotonicTime : null
           });
         } catch {
           // Ignore malformed network entry
@@ -515,6 +520,8 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
     return renderedSnapCache.get(sIdx) ?? null;
   };
 
+  const failedNetworkEntries = networkEntries.filter((n) => n.status !== null && n.status >= 400);
+
   for (let i = 0; i < filteredRawSteps.length; i++) {
     const { userFacing: _uf, beforeSnapName, afterSnapName, ...step } = filteredRawSteps[i];
     if (snapshotsList.length > 0) {
@@ -527,6 +534,17 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
       const afterCeiling = Math.min(endTs + 80, nextStepStart > endTs ? nextStepStart - 1 : endTs + 80);
       step.beforeFrameDataUrl = findFrameAtOrBefore(step.startTime);
       step.frameDataUrl = findFrameAtOrBefore(afterCeiling);
+    }
+    if (failedNetworkEntries.length > 0) {
+      const endTs = step.endTime ?? step.startTime;
+      const windowMatches = failedNetworkEntries.filter(
+        (n) => typeof n.timestamp === "number" && n.timestamp >= step.startTime - 500 && n.timestamp <= endTs + 1000
+      );
+      if (windowMatches.length > 0) {
+        step.networkErrors = windowMatches.slice(0, 10);
+      } else if (step.status === "failed") {
+        step.networkErrors = failedNetworkEntries.slice(0, 5);
+      }
     }
     steps.push(step);
   }
@@ -557,8 +575,17 @@ export function parsePlaywrightTraceArchive(zipBuffer: Buffer): ParsedTraceSumma
     }
   }
 
+  const consoleErrorCount = consoleEntries.filter((c) => c.level === "error").length;
+
   return {
-    metadata: { browserName, baseUrl, viewport, totalDurationMs },
+    metadata: {
+      browserName,
+      baseUrl,
+      viewport,
+      totalDurationMs,
+      failedNetworkCount: failedNetworkEntries.length,
+      consoleErrorCount
+    },
     filmstrip,
     steps,
     console: consoleEntries,

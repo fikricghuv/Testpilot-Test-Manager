@@ -12,16 +12,25 @@ import { ZyraDraftEditor, type ZyraDraftEditValues } from "./ZyraDraftEditor";
 import { ZyraCitationsList } from "./ZyraCitations";
 import { ZyraSeverityBadge } from "./ZyraContextDrawer";
 
-function firstStepPreview(value: unknown): string {
-  if (!value) return "—";
+function parseStepSummaries(value: unknown): Array<{ action: string; expectedResult: string }> {
+  if (!value) return [];
   if (Array.isArray(value)) {
-    const first = value[0] as Record<string, unknown> | undefined;
-    if (!first) return "—";
-    const text = first.action ?? first.expected;
-    return typeof text === "string" && text ? text : "—";
+    return value
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+      .map((step) => ({
+        action: typeof step.action === "string" ? step.action : typeof step.step === "string" ? step.step : "",
+        expectedResult: typeof step.expectedResult === "string" ? step.expectedResult : typeof step.expected === "string" ? step.expected : "",
+      }))
+      .filter((step) => step.action || step.expectedResult);
   }
-  if (typeof value !== "string") return "—";
-  try { return firstStepPreview(JSON.parse(value)); } catch { return "—"; }
+  if (typeof value !== "string") return [];
+  try { return parseStepSummaries(JSON.parse(value)); } catch { return []; }
+}
+
+function firstStepPreview(value: unknown): string {
+  const steps = parseStepSummaries(value);
+  if (!steps.length) return "—";
+  return steps[0].action || steps[0].expectedResult || "—";
 }
 
 function priorityTone(priority?: string) {
@@ -431,7 +440,9 @@ export function ZyraChatReviewPanel({
           </div>
 
           <ul className="space-y-2 list-none p-0 m-0" aria-label={t("review.listLabel")}>
-            {rows.map((row, index) => (
+            {rows.map((row, index) => {
+              const stepSummaries = parseStepSummaries(row.stepsJson);
+              return (
               <li key={`${reviewRequestId}-${index}`} className="rounded-md border border-[var(--border)] bg-[var(--background)] p-2.5">
                 <div className="flex items-start gap-2.5">
                   <input
@@ -459,9 +470,29 @@ export function ZyraChatReviewPanel({
                       )}
                       {row.component && <span className="text-[11px] text-[var(--muted)]">{row.component}</span>}
                       {row.externalId && <span className="font-mono text-[11px] text-[var(--muted)]">{row.externalId}</span>}
+                      <span className="text-[11px] text-[var(--muted)]">
+                        · {stepSummaries.length} {stepSummaries.length === 1 ? "step" : "steps"}
+                      </span>
                     </div>
                     <p className="mt-1 text-[13px] font-medium text-[var(--foreground)]">{row.title}</p>
-                    <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--muted)]">{firstStepPreview(row.stepsJson)}</p>
+                    {row.action === "proposed-update" && row.reason ? (
+                      <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--brand)]">{row.reason}</p>
+                    ) : null}
+                    {stepSummaries.length > 0 ? (
+                      <ol className="mt-1 space-y-0.5 list-none p-0 m-0 text-[11px] text-[var(--muted)]">
+                        {stepSummaries.slice(0, 3).map((step, sIdx) => (
+                          <li key={sIdx} className="line-clamp-1">
+                            <span className="font-mono">{sIdx + 1}.</span> {step.action}
+                            {step.expectedResult ? <span className="opacity-80"> → {step.expectedResult}</span> : null}
+                          </li>
+                        ))}
+                        {stepSummaries.length > 3 && (
+                          <li className="text-[10px] opacity-75">+{stepSummaries.length - 3} more step(s)</li>
+                        )}
+                      </ol>
+                    ) : (
+                      <p className="mt-0.5 line-clamp-1 text-[11px] text-[var(--muted)]">—</p>
+                    )}
                     {row.techniques?.length ? (
                       <div className="mt-1">
                         <TechniqueBadges techniques={row.techniques} />
@@ -489,7 +520,8 @@ export function ZyraChatReviewPanel({
                   </div>
                 )}
               </li>
-            ))}
+              );
+            })}
           </ul>
         </>
       )}

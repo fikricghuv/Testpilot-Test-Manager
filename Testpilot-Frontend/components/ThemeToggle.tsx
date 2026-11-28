@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
+import { flushSync } from "react-dom";
 import { applyTheme, persistTheme, readStoredTheme, THEME_CHANGE_EVENT, type ThemeMode } from "@/lib/theme";
 
 // 16px, matching the size IconBell renders at next to this control in the top bar.
@@ -41,10 +42,55 @@ export default function ThemeToggle() {
 
   const isDark = theme === "dark";
 
-  function toggle() {
+  function toggle(e: MouseEvent<HTMLButtonElement>) {
     const next: ThemeMode = isDark ? "light" : "dark";
-    setTheme(next);
-    persistTheme(next);
+    const prefersReducedMotion =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const doc = document as Document & {
+      startViewTransition?: (cb: () => void) => { ready: Promise<void> };
+    };
+
+    if (!doc.startViewTransition || prefersReducedMotion) {
+      setTheme(next);
+      persistTheme(next);
+      return;
+    }
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const endRadius = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y),
+    );
+
+    const transition = doc.startViewTransition(() => {
+      flushSync(() => {
+        setTheme(next);
+        persistTheme(next);
+      });
+    });
+
+    transition.ready
+      .then(() => {
+        document.documentElement.animate(
+          {
+            clipPath: [
+              `circle(0px at ${x}px ${y}px)`,
+              `circle(${endRadius}px at ${x}px ${y}px)`,
+            ],
+          },
+          {
+            duration: 500,
+            easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+            pseudoElement: "::view-transition-new(root)",
+          },
+        );
+      })
+      .catch(() => {
+        // Ignore aborted transition animations (e.g. rapid double-clicks).
+      });
   }
 
   return (

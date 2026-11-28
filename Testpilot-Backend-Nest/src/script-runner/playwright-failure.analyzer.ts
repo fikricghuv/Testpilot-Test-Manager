@@ -15,6 +15,116 @@ export interface ScriptFailureAnalysis {
   expected: string | null;
   received: string | null;
   suggestion: string;
+  source?: "json_reporter" | "regex_fallback";
+  retries?: number;
+  flaky?: boolean;
+  failedStepTitle?: string | null;
+}
+
+interface PlaywrightJsonError {
+  message?: string;
+  stack?: string;
+  snippet?: string;
+  location?: { file?: string; line?: number; column?: number };
+}
+
+interface PlaywrightJsonResult {
+  status?: string;
+  retry?: number;
+  duration?: number;
+  error?: PlaywrightJsonError;
+  errors?: PlaywrightJsonError[];
+  steps?: Array<{ title?: string; error?: PlaywrightJsonError; duration?: number }>;
+}
+
+function collectTestsFromSuites(suites: unknown[]): Array<{ title?: string; ok?: boolean; results?: PlaywrightJsonResult[] }> {
+  const out: Array<{ title?: string; ok?: boolean; results?: PlaywrightJsonResult[] }> = [];
+  for (const s of suites) {
+    if (!s || typeof s !== "object") continue;
+    const suite = s as Record<string, any>;
+    if (Array.isArray(suite.specs)) {
+      for (const spec of suite.specs) {
+        if (spec && typeof spec === "object" && Array.isArray(spec.tests)) {
+          for (const t of spec.tests) {
+            if (t && typeof t === "object") out.push(t);
+          }
+        }
+      }
+    }
+    if (Array.isArray(suite.suites)) {
+      out.push(...collectTestsFromSuites(suite.suites));
+    }
+  }
+  return out;
+}
+
+function stripAnsi(str: string): string {
+  return str.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+/**
+ * Analyzes Playwright's structured JSON reporter output first, falling back to
+ * regex-based log analysis when JSON report data is absent or malformed.
+ */
+export function analyzePlaywrightJsonReport(
+  reportJson: unknown,
+  stdout: string | null,
+  stderr: string | null,
+  errorMessage: string | null
+): ScriptFailureAnalysis {
+  if (reportJson && typeof reportJson === "object") {
+    const report = reportJson as Record<string, any>;
+    const suites = Array.isArray(report.suites) ? report.suites : [];
+    const tests = collectTestsFromSuites(suites);
+
+    const failedTest = tests.find((t) =>
+      Array.isArray(t.results) && t.results.some((r) => r.status === "failed" || r.status === "timedOut" || r.status === "interrupted")
+    );
+    const allResults = failedTest?.results ?? tests.flatMap((t) => t.results ?? []);
+    const lastFailedResult = [...allResults]
+      .reverse()
+      .find((r) => r.status === "failed" || r.status === "timedOut" || r.status === "interrupted");
+
+    const topLevelErrors: PlaywrightJsonError[] = Array.isArray(report.errors) ? report.errors : [];
+    const resultErrors: PlaywrightJsonError[] = lastFailedResult
+      ? [
+          ...(Array.isArray(lastFailedResult.errors) ? lastFailedResult.errors : []),
+          ...(lastFailedResult.error ? [lastFailedResult.error] : [])
+        ]
+      : [];
+    const primaryError = resultErrors[0] ?? topLevelErrors[0];
+
+    if (primaryError) {
+      const rawMsg = stripAnsi([primaryError.message, primaryError.stack, primaryError.snippet].filter(Boolean).join("\n"));
+      const base = analyzePlaywrightFailure(stdout, rawMsg, errorMessage);
+      const loc = primaryError.location;
+      const failedLine =
+        loc && typeof loc.line === "number"
+          ? `line ${loc.line}${typeof loc.column === "number" ? `:${loc.column}` : ""}`
+          : base.failedLine;
+
+      const failedStep = Array.isArray(lastFailedResult?.steps)
+        ? lastFailedResult.steps.find((st) => Boolean(st.error))
+        : undefined;
+
+      const maxRetry = allResults.reduce((m, r) => Math.max(m, Number(r.retry ?? 0)), 0);
+      const isFlaky = Boolean(failedTest?.ok) && maxRetry > 0;
+
+      return {
+        ...base,
+        failedLine,
+        source: "json_reporter",
+        retries: maxRetry,
+        flaky: isFlaky,
+        failedStepTitle: failedStep?.title ?? null
+      };
+    }
+  }
+
+  return {
+    ...analyzePlaywrightFailure(stdout, stderr, errorMessage),
+    source: "regex_fallback"
+  };
 }
 
 /**

@@ -44,7 +44,9 @@ import {
 } from "./performance-tests.constants";
 import type {
   CreatePerformanceTestInput,
+  PerformanceBaselineComparison,
   PerformanceBuilderConfig,
+  PerformanceEndpointBreakdown,
   PerformanceFlowConfig,
   PerformanceHttpMethod,
   PerformanceProjectReport,
@@ -217,6 +219,15 @@ export class PerformanceTestsService {
       browser: Browser | null;
       context: BrowserContext | null;
       page: Page | null;
+    }
+  >();
+  private readonly liveRunSnapshots = new Map<
+    string,
+    {
+      updatedAt: string;
+      timeseries: PerformanceTimeseriesPoint[];
+      endpoints: PerformanceEndpointBreakdown[];
+      statusCodes: Record<string, number>;
     }
   >();
 
@@ -568,6 +579,135 @@ export class PerformanceTestsService {
     return { run: mapRunRow(rows[0]) };
   }
 
+  async getLiveMetrics(
+    userId: string | null | undefined,
+    projectId: string,
+    testId: string,
+    runId: string
+  ): Promise<{
+    runId: string;
+    status: PerformanceRunStatus;
+    live: boolean;
+    updatedAt: string;
+    timeseries: PerformanceTimeseriesPoint[];
+    endpoints: PerformanceEndpointBreakdown[];
+    statusCodes: Record<string, number>;
+  }> {
+    const { run } = await this.getRun(userId, projectId, testId, runId);
+    const liveSnap = this.liveRunSnapshots.get(runId);
+    if (liveSnap && (run.status === "running" || run.status === "queued")) {
+      return {
+        runId,
+        status: run.status,
+        live: true,
+        updatedAt: liveSnap.updatedAt,
+        timeseries: liveSnap.timeseries,
+        endpoints: liveSnap.endpoints,
+        statusCodes: liveSnap.statusCodes
+      };
+    }
+
+    return {
+      runId,
+      status: run.status,
+      live: false,
+      updatedAt: run.finishedAt ?? run.createdAt,
+      timeseries: run.timeseriesJson ?? [],
+      endpoints: run.breakdownJson?.endpoints ?? [],
+      statusCodes: run.breakdownJson?.statusCodes ?? {}
+    };
+  }
+
+  async setBaselineRun(
+    userId: string | null | undefined,
+    projectId: string,
+    testId: string,
+    runId: string
+  ): Promise<{ run: PerformanceRunRecord; isBaseline: boolean }> {
+    const { run } = await this.getRun(userId, projectId, testId, runId);
+    await this.db.transaction(async (client) => {
+      await client.query(
+        `UPDATE performance_test_runs
+         SET summary_json = summary_json - 'isBaseline'
+         WHERE test_id = $1 AND project_id = $2 AND summary_json ? 'isBaseline'`,
+        [testId, projectId]
+      );
+      await client.query(
+        `UPDATE performance_test_runs
+         SET summary_json = jsonb_set(COALESCE(summary_json, '{}'::jsonb), '{isBaseline}', 'true'::jsonb)
+         WHERE id = $1 AND test_id = $2 AND project_id = $3`,
+        [runId, testId, projectId]
+      );
+    });
+    return { run, isBaseline: true };
+  }
+
+  async compareRuns(
+    userId: string | null | undefined,
+    projectId: string,
+    testId: string,
+    runId: string,
+    baselineRunId?: string
+  ): Promise<PerformanceBaselineComparison> {
+    const { run } = await this.getRun(userId, projectId, testId, runId);
+
+    let baselineRow: PerformanceRunRow | undefined;
+    if (baselineRunId) {
+      this.assertUuid(baselineRunId, "baseline run");
+      const { rows } = await this.db.query<PerformanceRunRow>(
+        `SELECT * FROM performance_test_runs WHERE id = $1 AND test_id = $2 AND project_id = $3 LIMIT 1`,
+        [baselineRunId, testId, projectId]
+      );
+      baselineRow = rows[0];
+    } else {
+      const { rows } = await this.db.query<PerformanceRunRow>(
+        `SELECT * FROM performance_test_runs
+         WHERE test_id = $1 AND project_id = $2 AND id <> $3 AND status = 'passed'
+         ORDER BY COALESCE((summary_json->>'isBaseline')::boolean, false) DESC, created_at DESC
+         LIMIT 1`,
+        [testId, projectId, runId]
+      );
+      baselineRow = rows[0];
+    }
+
+    if (!baselineRow) {
+      throw new NotFoundException("No baseline passed run found to compare against.");
+    }
+    const baseline = mapRunRow(baselineRow);
+
+    const diff = (curr: number | null, base: number | null): number | null =>
+      curr !== null && base !== null ? Number((curr - base).toFixed(4)) : null;
+    const pct = (curr: number | null, base: number | null): number | null =>
+      curr !== null && base !== null && base > 0 ? Number((((curr - base) / base) * 100).toFixed(2)) : null;
+
+    const p95Ms = diff(run.p95Ms, baseline.p95Ms);
+    const p95Pct = pct(run.p95Ms, baseline.p95Ms);
+    const avgMs = diff(run.avgMs, baseline.avgMs);
+    const avgPct = pct(run.avgMs, baseline.avgMs);
+    const rps = diff(run.rps, baseline.rps);
+    const rpsPct = pct(run.rps, baseline.rps);
+    const errorRate = diff(run.errorRate, baseline.errorRate);
+
+    const regressionDetected =
+      (p95Pct !== null && p95Pct > 15) ||
+      (errorRate !== null && errorRate > 0.01) ||
+      run.thresholdsPassed === false;
+
+    const parts: string[] = [];
+    if (p95Pct !== null) parts.push(`p95 ${p95Pct >= 0 ? "+" : ""}${p95Pct}%`);
+    if (rpsPct !== null) parts.push(`RPS ${rpsPct >= 0 ? "+" : ""}${rpsPct}%`);
+    if (errorRate !== null) parts.push(`error rate ${errorRate >= 0 ? "+" : ""}${(errorRate * 100).toFixed(2)}%`);
+
+    return {
+      runId: run.id,
+      baselineRunId: baseline.id,
+      baselineCreatedAt: baseline.createdAt,
+      regressionDetected,
+      summary: parts.length > 0 ? parts.join(", ") : "Insufficient metrics for comparison.",
+      deltas: { p95Ms, p95Pct, avgMs, avgPct, rps, rpsPct, errorRate }
+    };
+  }
+
   async cancelRun(
     userId: string | null | undefined,
     projectId: string,
@@ -642,6 +782,7 @@ export class PerformanceTestsService {
 
     const startedAt = Date.now();
     let tempDir: string | null = null;
+    let liveTimer: NodeJS.Timeout | null = null;
 
     try {
       tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "testpilot-k6-"));
@@ -650,6 +791,21 @@ export class PerformanceTestsService {
       const pointsPath = path.join(tempDir, "points.jsonl");
 
       await fs.writeFile(scriptPath, jobData.script_content, "utf8");
+
+      liveTimer = setInterval(() => {
+        void fs
+          .readFile(pointsPath, "utf8")
+          .then((ndjson) => {
+            const analyzed = analyzeK6JsonLines(ndjson);
+            this.liveRunSnapshots.set(runId, {
+              updatedAt: new Date().toISOString(),
+              timeseries: analyzed.timeseries,
+              endpoints: analyzed.endpoints,
+              statusCodes: analyzed.statusCodes
+            });
+          })
+          .catch(() => undefined);
+      }, 1500);
 
       const maxTimeoutMs = (Math.min(jobData.duration_sec ?? MAX_DURATION_SEC, MAX_DURATION_SEC) * 1000) + K6_TIMEOUT_BUFFER_MS;
       const k6Bin = process.env.K6_BINARY_PATH || "k6";
@@ -699,6 +855,15 @@ export class PerformanceTestsService {
       }
 
       const parsed = rawSummary ? parseK6SummaryJson(rawSummary) : null;
+      if (parsed?.timingBreakdown || parsed?.customMetrics?.length) {
+        breakdown = {
+          endpoints: breakdown?.endpoints ?? [],
+          statusCodes: breakdown?.statusCodes ?? {},
+          checks: breakdown?.checks ?? checksList,
+          ...(parsed.timingBreakdown ? { timingBreakdown: parsed.timingBreakdown } : {}),
+          ...(parsed.customMetrics?.length ? { customMetrics: parsed.customMetrics } : {})
+        };
+      }
       let finalStatus: PerformanceRunStatus = "passed";
       let errorMessage: string | null = null;
 
@@ -784,6 +949,8 @@ export class PerformanceTestsService {
         [runId, truncateOutput(message), Date.now() - startedAt]
       );
     } finally {
+      if (liveTimer) clearInterval(liveTimer);
+      this.liveRunSnapshots.delete(runId);
       this.activeProcesses.delete(runId);
       this.cancelledRunIds.delete(runId);
       if (tempDir) {

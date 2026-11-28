@@ -2,8 +2,10 @@ import { BadRequestException } from "@nestjs/common";
 import * as net from "node:net";
 import { MAX_DURATION_SEC, MAX_TARGET_RPS, MAX_VUS, PERFORMANCE_HTTP_METHODS } from "./performance-tests.constants";
 import type {
+  K6CustomMetricSummary,
   K6SummaryData,
   K6ThresholdResult,
+  K6TimingBreakdown,
   PerformanceBuilderConfig,
   PerformanceCheckBreakdown,
   PerformanceEndpointBreakdown,
@@ -150,6 +152,19 @@ function normalizeLoadOptions(raw: {
   return { loadProfile, vus, durationSec, targetRps, stages };
 }
 
+function buildThresholdEntry(
+  expr: string,
+  abortOnFail?: boolean,
+  delayAbortEval?: string | null
+): string | { threshold: string; abortOnFail: boolean; delayAbortEval?: string } {
+  if (!abortOnFail) return expr;
+  return {
+    threshold: expr,
+    abortOnFail: true,
+    ...(delayAbortEval?.trim() ? { delayAbortEval: delayAbortEval.trim() } : {})
+  };
+}
+
 function buildK6Options(config: {
   loadProfile?: PerformanceLoadProfile;
   vus: number;
@@ -158,14 +173,20 @@ function buildK6Options(config: {
   stages?: PerformanceStage[];
   p95ThresholdMs?: number | null;
   errorRateThresholdPct?: number | null;
+  abortOnFail?: boolean;
+  delayAbortEval?: string | null;
 }): Record<string, unknown> {
-  const thresholds: Record<string, string[]> = {};
+  const thresholds: Record<string, Array<string | { threshold: string; abortOnFail: boolean; delayAbortEval?: string }>> = {};
   if (config.p95ThresholdMs !== null && config.p95ThresholdMs !== undefined) {
-    thresholds.http_req_duration = [`p(95)<${config.p95ThresholdMs}`];
+    thresholds.http_req_duration = [
+      buildThresholdEntry(`p(95)<${config.p95ThresholdMs}`, config.abortOnFail, config.delayAbortEval)
+    ];
   }
   if (config.errorRateThresholdPct !== null && config.errorRateThresholdPct !== undefined) {
     const rate = Number((config.errorRateThresholdPct / 100).toFixed(4));
-    thresholds.http_req_failed = [`rate<=${rate}`];
+    thresholds.http_req_failed = [
+      buildThresholdEntry(`rate<=${rate}`, config.abortOnFail, config.delayAbortEval)
+    ];
   }
 
   const profile =
@@ -272,6 +293,9 @@ export function normalizeBuilderConfig(raw: PerformanceBuilderConfig): Performan
     sleepSec,
     p95ThresholdMs,
     errorRateThresholdPct,
+    ...(raw.abortOnFail ? { abortOnFail: true } : {}),
+    ...(raw.delayAbortEval?.trim() ? { delayAbortEval: raw.delayAbortEval.trim() } : {}),
+    ...(raw.customMetrics ? { customMetrics: true } : {}),
     expectedStatus
   };
 }
@@ -292,7 +316,15 @@ export function generateK6Script(config: PerformanceBuilderConfig): string {
   const lines: string[] = [
     `import http from "k6/http";`,
     `import { check, sleep } from "k6";`,
+    ...(config.customMetrics ? [`import { Rate, Trend } from "k6/metrics";`] : []),
     ``,
+    ...(config.customMetrics
+      ? [
+          `const apiSuccessRate = new Rate("api_success_rate");`,
+          `const apiTtfbMs = new Trend("api_ttfb_ms", true);`,
+          ``
+        ]
+      : []),
     `export const options = ${JSON.stringify(optionsObj, null, 2)};`,
     ``,
     `export default function () {`,
@@ -319,10 +351,14 @@ export function generateK6Script(config: PerformanceBuilderConfig): string {
   }
 
   lines.push(
-    `  check(res, {`,
+    `  const passed = check(res, {`,
     `    "status is ${expectedStatus}": (r) => r.status === ${expectedStatus}`,
     `  });`
   );
+  if (config.customMetrics) {
+    lines.push(`  apiSuccessRate.add(passed);`);
+    lines.push(`  apiTtfbMs.add(res.timings.waiting);`);
+  }
 
   if (sleepSec > 0) {
     lines.push(`  sleep(${sleepSec});`);
@@ -363,6 +399,71 @@ export function parseK6SummaryJson(raw: Record<string, unknown>): K6SummaryData 
 
   const thresholdsPassed = thresholds.length > 0 ? thresholds.every((t) => t.ok) : null;
 
+  const BUILTIN_K6_METRICS = new Set([
+    "http_reqs",
+    "http_req_duration",
+    "http_req_failed",
+    "http_req_blocked",
+    "http_req_connecting",
+    "http_req_tls_handshaking",
+    "http_req_sending",
+    "http_req_waiting",
+    "http_req_receiving",
+    "iteration_duration",
+    "iterations",
+    "vus",
+    "vus_max",
+    "data_sent",
+    "data_received",
+    "checks"
+  ]);
+
+  const readMetricValues = (name: string) =>
+    ((metrics[name]?.values ?? metrics[name] ?? {}) as Record<string, unknown>);
+
+  const blocked = readMetricValues("http_req_blocked");
+  const connecting = readMetricValues("http_req_connecting");
+  const tls = readMetricValues("http_req_tls_handshaking");
+  const sending = readMetricValues("http_req_sending");
+  const waiting = readMetricValues("http_req_waiting");
+  const receiving = readMetricValues("http_req_receiving");
+
+  const hasTiming =
+    asNumber(waiting.avg) !== null ||
+    asNumber(blocked.avg) !== null ||
+    asNumber(connecting.avg) !== null;
+
+  const timingBreakdown: K6TimingBreakdown | undefined = hasTiming
+    ? {
+        blockedAvgMs: asNumber(blocked.avg),
+        connectingAvgMs: asNumber(connecting.avg),
+        tlsHandshakingAvgMs: asNumber(tls.avg),
+        sendingAvgMs: asNumber(sending.avg),
+        waitingAvgMs: asNumber(waiting.avg),
+        waitingP95Ms: asNumber(waiting["p(95)"]),
+        receivingAvgMs: asNumber(receiving.avg)
+      }
+    : undefined;
+
+  const customMetrics: K6CustomMetricSummary[] = [];
+  for (const [metricName, metricObj] of Object.entries(metrics)) {
+    if (BUILTIN_K6_METRICS.has(metricName) || metricName.includes("{")) continue;
+    const rawVals = (metricObj?.values ?? metricObj ?? {}) as Record<string, unknown>;
+    const numericValues: Record<string, number> = {};
+    for (const [k, v] of Object.entries(rawVals)) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        numericValues[k] = v;
+      }
+    }
+    if (Object.keys(numericValues).length > 0) {
+      customMetrics.push({
+        name: metricName,
+        type: typeof metricObj?.type === "string" ? metricObj.type : null,
+        values: numericValues
+      });
+    }
+  }
+
   return {
     totalRequests: asNumber(httpReqs.count),
     rps: asNumber(httpReqs.rate),
@@ -376,7 +477,9 @@ export function parseK6SummaryJson(raw: Record<string, unknown>): K6SummaryData 
     checksPassed: asNumber(checks.passes),
     checksFailed: asNumber(checks.fails),
     thresholdsPassed,
-    thresholds
+    thresholds,
+    ...(timingBreakdown ? { timingBreakdown } : {}),
+    ...(customMetrics.length > 0 ? { customMetrics } : {})
   };
 }
 
@@ -498,6 +601,9 @@ export function normalizeFlowConfig(raw: PerformanceFlowConfig): PerformanceFlow
     stages: load.stages,
     p95ThresholdMs,
     errorRateThresholdPct,
+    ...(raw.abortOnFail ? { abortOnFail: true } : {}),
+    ...(raw.delayAbortEval?.trim() ? { delayAbortEval: raw.delayAbortEval.trim() } : {}),
+    ...(raw.customMetrics ? { customMetrics: true } : {}),
     steps
   };
 }
@@ -512,7 +618,15 @@ export function generateK6FlowScript(config: PerformanceFlowConfig): string {
   const lines: string[] = [
     `import http from "k6/http";`,
     `import { check, group, sleep } from "k6";`,
+    ...(config.customMetrics ? [`import { Rate, Trend } from "k6/metrics";`] : []),
     ``,
+    ...(config.customMetrics
+      ? [
+          `const flowSuccessRate = new Rate("flow_step_success_rate");`,
+          `const flowTtfbMs = new Trend("flow_ttfb_ms", true);`,
+          ``
+        ]
+      : []),
     `export const options = ${JSON.stringify(optionsObj, null, 2)};`,
     ``,
     `export default function () {`
@@ -546,10 +660,14 @@ export function generateK6FlowScript(config: PerformanceFlowConfig): string {
     }
 
     lines.push(
-      `    check(res, {`,
+      `    const passed = check(res, {`,
       `      "status is ${expectedStatus}": (r) => r.status === ${expectedStatus}`,
       `    });`
     );
+    if (config.customMetrics) {
+      lines.push(`    flowSuccessRate.add(passed, { step: ${JSON.stringify(stepLabel)} });`);
+      lines.push(`    flowTtfbMs.add(res.timings.waiting, { step: ${JSON.stringify(stepLabel)} });`);
+    }
 
     if ((step.sleepAfterSec ?? 0) > 0) {
       lines.push(`    sleep(${step.sleepAfterSec});`);

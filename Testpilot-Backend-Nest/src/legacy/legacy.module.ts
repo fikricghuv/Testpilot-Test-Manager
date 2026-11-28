@@ -14,6 +14,7 @@ import { LegacyService } from "./legacy.service";
 import { SignupController } from "./signup.controller";
 import { SignupService } from "./signup.service";
 import { ZyraProgressService } from "./zyra-progress.service";
+import { ZyraChatSessionService } from "./zyra-chat-session.service";
 import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
 
 @Module({
@@ -30,7 +31,7 @@ import { KbExtractionRunnerService } from "./kb-extraction-runner.service";
     forwardRef(() => ScriptRunnerModule)
   ],
   controllers: [LegacyController, SignupController],
-  providers: [LegacyService, SignupService, ZyraProgressService, KbExtractionRunnerService],
+  providers: [LegacyService, SignupService, ZyraProgressService, ZyraChatSessionService, KbExtractionRunnerService],
   exports: [LegacyService]
 })
 export class LegacyModule {}

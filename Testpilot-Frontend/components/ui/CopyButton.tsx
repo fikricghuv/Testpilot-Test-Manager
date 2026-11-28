@@ -12,6 +12,7 @@ export type CopyButtonProps = {
   copiedLabel?: string;
   iconOnly?: boolean;
   size?: "sm" | "md";
+  variant?: "subtle" | "secondary";
   className?: string;
   /** Resting-state icon, e.g. a share glyph instead of the default copy icon. */
   icon?: IconComponent;
@@ -23,6 +24,7 @@ export default function CopyButton({
   copiedLabel = "Copied",
   iconOnly = false,
   size = "sm",
+  variant = "secondary",
   className,
   icon: Icon = IconCopy,
 }: CopyButtonProps) {
@@ -53,7 +55,10 @@ export default function CopyButton({
       onClick={handleCopy}
       title={iconOnly ? (copied ? copiedLabel : label) : undefined}
       className={cx(
-        "inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]",
+        "inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-md border font-medium whitespace-nowrap transition-[background-color,border-color,color,transform] duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--denim)_30%,transparent)] focus-visible:ring-offset-1 active:scale-[0.98]",
+        variant === "secondary"
+          ? "border-[var(--border-strong)] bg-[var(--surface)] text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+          : "border-[var(--border)] bg-transparent text-[var(--foreground)]/80 hover:border-[var(--border-strong)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]",
         size === "sm" ? "h-7 px-2.5 text-[11px]" : "h-8 px-3 text-xs",
         iconOnly && "px-1.5",
         className,

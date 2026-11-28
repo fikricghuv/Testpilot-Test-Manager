@@ -164,6 +164,37 @@ export class PerformanceTestsController {
     return this.performanceTests.getRun(req.userId, projectId, testId, runId);
   }
 
+  @Get("/api/projects/:projectId/performance-tests/:testId/runs/:runId/live")
+  getLiveMetrics(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testId") testId: string,
+    @Param("runId") runId: string
+  ) {
+    return this.performanceTests.getLiveMetrics(req.userId, projectId, testId, runId);
+  }
+
+  @Post("/api/projects/:projectId/performance-tests/:testId/runs/:runId/baseline")
+  setBaselineRun(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testId") testId: string,
+    @Param("runId") runId: string
+  ) {
+    return this.performanceTests.setBaselineRun(req.userId, projectId, testId, runId);
+  }
+
+  @Get("/api/projects/:projectId/performance-tests/:testId/runs/:runId/compare")
+  compareRuns(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testId") testId: string,
+    @Param("runId") runId: string,
+    @Query("baselineRunId") baselineRunId?: string
+  ) {
+    return this.performanceTests.compareRuns(req.userId, projectId, testId, runId, baselineRunId);
+  }
+
   @Get("/api/projects/:projectId/performance-tests/:testId/runs/:runId/report")
   async downloadRunReport(
     @Req() req: AuthenticatedRequest,

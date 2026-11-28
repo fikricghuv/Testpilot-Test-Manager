@@ -92,7 +92,9 @@ describe("parsePlaywrightTraceArchive", () => {
       browserName: "chromium",
       baseUrl: "https://example.com",
       viewport: { width: 1280, height: 720 },
-      totalDurationMs: 800
+      totalDurationMs: 800,
+      failedNetworkCount: 1,
+      consoleErrorCount: 1
     });
     expect(parsed.steps).toHaveLength(2);
     expect(parsed.steps[0]).toMatchObject({
@@ -109,6 +111,7 @@ describe("parsePlaywrightTraceArchive", () => {
       status: "failed",
       error: "Strict mode violation"
     });
+    expect(parsed.steps[1].networkErrors).toHaveLength(1);
     expect(parsed.console).toHaveLength(1);
     expect(parsed.network).toHaveLength(1);
     expect(parsed.errors).toHaveLength(1);

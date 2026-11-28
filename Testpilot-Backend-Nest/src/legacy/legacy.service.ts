@@ -32,6 +32,15 @@ import {
 import { DEFAULT_WORKSPACE_TIMEZONE, assertDateRange, assertStartNotInPast, duePhase, isValidTimezone, parseDay, resolveDateChange, todayIn, type DuePhase } from "./due-dates";
 import { isCoverageAnalysisRequest, notificationLinks, notificationMessages, runLabel, zyraSubject, type NotificationLink, type NotificationType } from "./notification-events";
 import { runInZyraLanguage, zyraReplyLanguage } from "./zyra-language-context";
+import {
+  buildZyraPostApplyFacts,
+  finalizeZyraChatReply as finalizeZyraChatReplyGuard,
+  isZyraTestcaseTable as isZyraTestcaseTableGuard,
+  reconcileZyraReply as reconcileZyraReplyGuard,
+  stripZyraTestcaseTables as stripZyraTestcaseTablesGuard,
+  zyraMoveBreakdownSuffix as zyraMoveBreakdownSuffixGuard
+} from "./zyra-reply-guards";
+import { ZyraChatSessionService, zyraPublicOptions as zyraPublicOptionsHelper } from "./zyra-chat-session.service";
 import { localizeZyraTaskEntry } from "./zyra-task-activity-ru";
 import { AutomationAgentsService } from "../automation-agents/automation-agents.service";
 import { ScriptRunnerService } from "../script-runner/script-runner.service";
@@ -580,7 +589,7 @@ function camel(key: string): string {
   return key.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 
-function toCamel<T extends QueryResultRow>(row: T): Body {
+export function toCamel<T extends QueryResultRow>(row: T): Body {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [camel(key), value]));
 }
 
@@ -917,7 +926,7 @@ function estimateTokens(value: string): number {
   return Math.max(1, Math.ceil(value.length / 4));
 }
 
-function normalizeJsonArray(value: unknown): any[] {
+export function normalizeJsonArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
 }
 
@@ -1455,8 +1464,20 @@ export class LegacyService implements OnModuleInit {
     @Inject(forwardRef(() => CustomFieldsService)) private readonly customFields: CustomFieldsService,
     @Inject(forwardRef(() => CustomTagsService)) private readonly customTags: CustomTagsService,
     @Optional() @Inject(forwardRef(() => AutomationAgentsService)) private readonly automationAgents?: AutomationAgentsService,
-    @Optional() @Inject(forwardRef(() => ScriptRunnerService)) private readonly scriptRunner?: ScriptRunnerService
+    @Optional() @Inject(forwardRef(() => ScriptRunnerService)) private readonly scriptRunner?: ScriptRunnerService,
+    @Optional() private readonly zyraChatSessionSvc?: ZyraChatSessionService
   ) {}
+
+  private _zyraChatSessionFallback?: ZyraChatSessionService;
+  private get zyraChatSessionService(): ZyraChatSessionService {
+    return this.zyraChatSessionSvc ?? (this._zyraChatSessionFallback ??= new ZyraChatSessionService(this.db));
+  }
+
+  private async authorizeZyraProject(userId: string | null | undefined, projectId: string): Promise<string> {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    return uid;
+  }
 
   /*
    * Live events of background plan batches — the batch's review panel appearing, each draft as it is
@@ -14928,115 +14949,23 @@ export class LegacyService implements OnModuleInit {
   }
 
   async zyraChatSessions(projectId: string, userId: string | null | undefined) {
-    await this.requireProjectAccess(this.requireUser(userId), projectId);
-    // has_messages is additive, not a filter: every session this project ever created is still
-    // returned (callers and existing tests rely on a just-created session showing up immediately).
-    // It exists so the sidebar can hide sessions nobody ever used without the API silently dropping
-    // rows out of its own list.
-    const res = await this.db.query(
-      `SELECT s.id, s.project_id, s.user_id, s.title, s.created_at, s.updated_at, s.active_plan,
-              EXISTS (SELECT 1 FROM zyra_chat_messages m WHERE m.session_id = s.id) AS has_messages
-       FROM zyra_chat_sessions s
-       WHERE s.project_id = $1 AND s.deleted_at IS NULL
-       ORDER BY s.updated_at DESC
-       LIMIT 50`,
-      [projectId]
-    );
-    return { list: res.rows.map(toCamel) };
+    return this.zyraChatSessionService.listSessions(projectId, userId, (u, p) => this.authorizeZyraProject(u, p));
   }
 
   async zyraChatSession(projectId: string, userId: string | null | undefined, sessionId: string) {
-    await this.requireProjectAccess(this.requireUser(userId), projectId);
-    if (!isUuid(sessionId)) throw new NotFoundException({ error: "Chat session not found" });
-    const session = await this.db.query(
-      // language: the Zyra screens render their labels in it (see V132_zyra_generation_language.sql).
-      `SELECT id, project_id, user_id, title, created_at, updated_at, active_plan, language,
-              (processing_since IS NOT NULL AND processing_since >= now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes') AS turn_alive
-       FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL`,
-      [sessionId, projectId]
-    );
-    if (!session.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
-    const { turn_alive: turnAlive, ...sessionRow } = session.rows[0];
-    // Read-time view of work whose owner is gone, never a write from a GET. A user message still
-    // `processing` with no live claim in its session, or a resume whose heartbeat has lapsed, was
-    // left behind by a process that died mid-turn: nothing will ever settle it, and shown as-is it
-    // disables the composer (and keeps the page polling) forever. The next send's claim, or a
-    // Continue on the resume, is what actually rewrites these rows.
-    // A 'resuming' row with no resuming_since predates the heartbeat; it is left as-is rather than
-    // guessed dead.
-    const messages = await this.db.query(
-      `SELECT id, session_id, project_id, user_id, role, content, reasoning_summary, action_type,
-              CASE
-                WHEN role = 'user' AND status = $3 AND NOT $4::boolean THEN $5
-                WHEN status = 'resuming' AND resuming_since < now() - interval '${LegacyService.ZYRA_CLAIM_STALE_MINUTES} minutes' THEN 'timed_out'
-                ELSE status
-              END AS status,
-              testcases, activity, created_at, review_request_id, resume_attempt, trace, options
-       FROM zyra_chat_messages
-       WHERE session_id = $1 AND project_id = $2
-       ORDER BY created_at ASC`,
-      [sessionId, projectId, LegacyService.ZYRA_USER_MESSAGE_PROCESSING, Boolean(turnAlive), LegacyService.ZYRA_USER_MESSAGE_FAILED]
-    );
-    return {
-      ...toCamel(sessionRow),
-      messages: messages.rows.map((row) => {
-        const item = toCamel(row);
-        item.testcases = normalizeJsonArray(row.testcases);
-        item.activity = normalizeJsonArray(row.activity);
-        item.options = LegacyService.zyraPublicOptions(row.options);
-        return item;
-      })
-    };
+    return this.zyraChatSessionService.getSession(projectId, userId, sessionId, (u, p) => this.authorizeZyraProject(u, p));
   }
 
   async createZyraChatSession(projectId: string, userId: string | null | undefined, body: Body) {
-    // The caller was passed in but never checked: an anonymous request opened a session with a null
-    // user_id in any project by id, and a member of one project could open a chat in another.
-    const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
-    const title = String(body.title || "Zyra chat").trim().slice(0, 240) || "Zyra chat";
-    const res = await this.db.query(
-      `INSERT INTO zyra_chat_sessions (project_id, user_id, title)
-       VALUES ($1,$2,$3)
-       RETURNING id, project_id, user_id, title, created_at, updated_at`,
-      [projectId, userId || null, title]
-    );
-    return { ...toCamel(res.rows[0]), messages: [] };
+    return this.zyraChatSessionService.createSession(projectId, userId, body, (u, p) => this.authorizeZyraProject(u, p));
   }
 
   async renameZyraChatSession(projectId: string, userId: string | null | undefined, sessionId: string, body: Body) {
-    const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
-    if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
-    const title = String(body.title ?? "").trim().slice(0, 240);
-    if (!title) throw new BadRequestException({ error: "title is required" });
-    const res = await this.db.query(
-      `UPDATE zyra_chat_sessions SET title = $3, updated_at = now()
-       WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL
-       RETURNING id, project_id, user_id, title, created_at, updated_at`,
-      [sessionId, projectId, title]
-    );
-    if (!res.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
-    return toCamel(res.rows[0]);
+    return this.zyraChatSessionService.renameSession(projectId, userId, sessionId, body, (u, p) => this.authorizeZyraProject(u, p));
   }
 
   async deleteZyraChatSession(projectId: string, userId: string | null | undefined, sessionId: string) {
-    const uid = this.requireUser(userId);
-    await this.requireProjectAccess(uid, projectId);
-    if (!isUuid(sessionId)) throw new NotFoundException({ error: "Zyra chat session not found" });
-    const existing = await this.db.query<{ active_plan: { status?: string } | null }>(
-      "SELECT active_plan FROM zyra_chat_sessions WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL",
-      [sessionId, projectId]
-    );
-    if (!existing.rows[0]) throw new NotFoundException({ error: "Zyra chat session not found" });
-    if (existing.rows[0].active_plan?.status === "running") {
-      throw new ConflictException({ error: "Stop the running generation plan before deleting this conversation." });
-    }
-    // Messages and any staged review batch are left physically in place, untouched — the FKs are
-    // ON DELETE RESTRICT now, not CASCADE (V116), and nothing reads them independently of this
-    // session's own now-gated existence, same reasoning as bug_links surviving a soft-deleted bug.
-    await this.db.query("UPDATE zyra_chat_sessions SET deleted_at = now(), deleted_by = $3 WHERE id = $1 AND project_id = $2 AND deleted_at IS NULL", [sessionId, projectId, uid]);
-    return { success: true };
+    return this.zyraChatSessionService.deleteSession(projectId, userId, sessionId, (u, p) => this.authorizeZyraProject(u, p));
   }
 
   /** User-message status while a background turn (startZyraChatMessage) is still running. */
@@ -15567,7 +15496,8 @@ export class LegacyService implements OnModuleInit {
         savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
         proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
       });
-      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision, applied, testcases, activity, traceMessageId });
+      const synthesizedDecision = await this.synthesizeZyraPostApplyReply(projectId, message, decision, applied);
+      const item = await this.insertZyraAssistantMessage({ sessionId, projectId, uid, decision: synthesizedDecision, applied, testcases, activity, traceMessageId });
       const title = this.compactTitle(message);
       await this.db.query(
         "UPDATE zyra_chat_sessions SET title = CASE WHEN title = 'Zyra chat' THEN $3 ELSE title END, updated_at = now() WHERE id = $1 AND project_id = $2",
@@ -15832,6 +15762,7 @@ export class LegacyService implements OnModuleInit {
         savedCount: applied.testcases.filter((tc) => !(typeof tc.action === "string" && tc.action.startsWith("proposed-"))).length,
         proposedCount: applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length
       });
+      const synthesizedDecision = await this.synthesizeZyraPostApplyReply(projectId, resumeMessage, decision, applied);
       const trace = recorder.finish(decision.timedOut ? "timed_out" : undefined);
       await recorder.drain();
       // A fresh timeout on THIS attempt (decision.timedOut) chains the streak forward on the new
@@ -15839,7 +15770,7 @@ export class LegacyService implements OnModuleInit {
       // param and the "cap is per-chain" note on continueZyraChatMessage.
       const nextResumeAttempt = decision.timedOut ? priorAttempts + 1 : 0;
       const item = await this.insertZyraAssistantMessage({
-        sessionId, projectId, uid, decision, applied, testcases, activity,
+        sessionId, projectId, uid, decision: synthesizedDecision, applied, testcases, activity,
         traceMessageId: checkpointUserMessageId, resumeAttempt: nextResumeAttempt, trace
       });
       // Terminal — this checkpoint has now produced its follow-up message and cannot be resumed
@@ -23651,6 +23582,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       "Return only a JSON object: {\"updates\":[{\"externalId\":\"\",\"fields\":{},\"sourceRefs\":[\"\"]}]} with one entry per test case you were given, using its exact externalId.",
       "fields uses exactly these keys (camelCase): title, description, preconditions, postconditions, stepsJson, testData, priority, severity, type, automationStatus, automationTags, component, status. Include only fields you actually change, each with its complete new value, and only when it genuinely differs from the current value.",
       "To change any step, set fields.stepsJson to the FULL step list as an array of {\"stepNumber\":1,\"action\":\"...\",\"expectedResult\":\"...\"} — every step, including unchanged ones copied exactly. Every expected result must state the specific, observable outcome of its own step; never leave a placeholder or vague result in a step you were asked to fix.",
+      "If the request asks to copy, match, or align with another existing test case (listed under 'Referenced test cases'), copy the requested fields/steps from that referenced test case into `fields` (unless the target test case already has identical values).",
       "Keep each test case's existing language and terminology. If a test case genuinely needs no change, return it with an empty fields object.",
       "A test case's `requirement` lists the source label(s) of the requirement it was written from — base its new values on that requirement first.",
       "Base the new values on the project sources in the user message wherever they apply. Each source has a label (e.g. 'KB 2', 'HBP-14', 'AIP-TC-73', 'BUG 3'). sourceRefs is REQUIRED on every update: list the labels of the sources that change draws on, written exactly as the label is shown (e.g. \"KB 2\") — not the document's title — never invented, and never the test case being revised itself. Use an empty array only when no listed source informs that change."
@@ -23753,10 +23685,37 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
           stepsJson: (this.safeSteps(row.steps) as Body[]).map((step, index) => ({ stepNumber: index + 1, action: step?.action || "", expectedResult: step?.expectedResult || "" }))
         }
       }));
+      const targetIds = new Set(batch.map(({ row }) => String(row.externalId || "").toUpperCase()).filter(Boolean));
+      const refIdMatches = ([params.message, ...batch.map(({ op }) => String(op.reason || ""))].join(" ")
+        .match(/\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-\d+\b/g) || [])
+        .map((id) => id.toUpperCase())
+        .filter((id) => !targetIds.has(id));
+      const uniqueRefIds = Array.from(new Set(refIdMatches)).slice(0, 5);
+      const referencedCases = uniqueRefIds.length
+        ? (await Promise.all(uniqueRefIds.map(async (extId) => {
+            const found = await this.findProjectTestcase(params.projectId, undefined, extId).catch(() => null);
+            if (!found) return null;
+            const full = await this.getTestCase(found.id).catch(() => null);
+            if (!full) return null;
+            return {
+              externalId: full.externalId,
+              title: full.title,
+              description: full.description || "",
+              preconditions: full.preconditions || "",
+              postconditions: full.postconditions || "",
+              stepsJson: (this.safeSteps(full.steps) as Body[]).map((step, index) => ({
+                stepNumber: index + 1,
+                action: step?.action || "",
+                expectedResult: step?.expectedResult || ""
+              }))
+            };
+          }))).filter((c): c is NonNullable<typeof c> => Boolean(c))
+        : [];
       const user = [
         `The user asked: ${params.message}`,
         "",
         `Test cases to revise:\n${JSON.stringify(cases, null, 2)}`,
+        ...(referencedCases.length ? ["", `Referenced test cases (read-only, use when copying/aligning):\n${JSON.stringify(referencedCases, null, 2)}`] : []),
         "",
         this.zyraStaticSourcePrompt({ ...sources, linear: [] } as unknown as ZyraGenerationInput)
       ].join("\n");
@@ -24306,63 +24265,73 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   // none of it existed in the repository. Tables that are not testcase listings (coverage summaries,
   // Jira comparisons) are legitimate prose and are left untouched.
   private stripZyraTestcaseTables(reply: string, hasRows: boolean): string {
-    const lines = reply.split("\n");
-    const kept: string[] = [];
-    let removed = false;
-    for (let i = 0; i < lines.length; ) {
-      if (!lines[i].trim().startsWith("|")) {
-        kept.push(lines[i]);
-        i += 1;
-        continue;
-      }
-      let end = i;
-      while (end < lines.length && lines[end].trim().startsWith("|")) end += 1;
-      const block = lines.slice(i, end);
-      if (this.isZyraTestcaseTable(block)) {
-        removed = true;
-      } else {
-        kept.push(...block);
-      }
-      i = end;
-    }
-    if (!removed) return reply;
-    const cleaned = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-    if (hasRows) return cleaned;
-    // Nothing was saved and the only record of those cases was the markdown just removed — say what
-    // happened and how to actually get them, rather than leaving a table that implies they exist.
-    return [
-      cleaned,
-      "",
-      zyraReplyLanguage() === "ru"
-        ? ZYRA_RU.strippedTable
-        : "_Those test cases were only described in chat — they were not saved to the repository. Ask me to generate them and they'll be created and shown in the table above._"
-    ].join("\n").trim();
+    return stripZyraTestcaseTablesGuard(reply, hasRows);
   }
 
   private isZyraTestcaseTable(block: string[]): boolean {
-    if (block.length < 2) return false;
-    // A markdown table needs its separator row (|---|---|) within the first two lines.
-    if (!block.slice(0, 2).some((line) => /^\s*\|[\s:|-]+\|\s*$/.test(line))) return false;
-    const header = block[0].split("|").map((cell) => cell.trim().toLowerCase()).filter(Boolean);
-    // Only a column that DEFINES new test content — a title/scenario to run, steps to follow, an
-    // expected outcome, a pre/postcondition — is evidence a table is authoring test cases. "Test
-    // Case(s)" is not: a coverage table cites existing cases by id under exactly that header ("Area
-    // | Test Cases" -> "TTM-TC-1"), so treating it as an anchor misfired on coverage answers, a
-    // per-module breakdown, and a Jira-to-testcase comparison alike — all reference existing rows,
-    // none define new ones. Reference-only columns (priority/status/area/id/"test case" itself) stay
-    // in the secondary count below since authored tables carry them too, but none alone is authorship.
-    const anchors = ["title", "scenario", "steps", "step", "expected", "precondition", "preconditions", "postcondition", "postconditions"];
-    const columns = [...anchors, "priority", "severity", "type", "status", "area", "module", "id", "#", "test case", "testcase"];
-    const hasAnchor = header.some((cell) => anchors.some((anchor) => cell.includes(anchor)));
-    const matches = header.filter((cell) => columns.some((column) => cell.includes(column))).length;
-    return hasAnchor && matches >= 2;
+    return isZyraTestcaseTableGuard(block);
+  }
+
+  private static readonly ZYRA_POST_APPLY_SYNTHESIS_TIMEOUT_MS = 15_000;
+
+  /**
+   * Post-apply reply synthesis for mutation turns: generates a concise, honest reply grounded in
+   * the actual database/staging outcome (`applied`) rather than relying on pre-execution prose.
+   * Answer-only turns skip this (staying 1-call), and any failure/timeout falls back to the
+   * pre-execution reply + deterministic `finalizeZyraChatReply` guards.
+   */
+  private async synthesizeZyraPostApplyReply(
+    projectId: string,
+    userMessage: string,
+    decision: ZyraChatDecision,
+    applied: ZyraAppliedOperations
+  ): Promise<ZyraChatDecision> {
+    if (decision.timedOut) return decision;
+    const facts = buildZyraPostApplyFacts(decision, applied);
+    if (!facts.shouldSynthesize) return decision;
+
+    const allocation = await this.zyraAiAllocation(projectId).catch(() => ({ key: null, reason: "" }));
+    if (!allocation.key) return decision;
+
+    const lang = zyraReplyLanguage();
+    const systemPrompt = [
+      "You are Zyra, an AI QA assistant. Write a concise (1-3 sentence) summary of what actually happened after executing the user's request.",
+      "Rules:",
+      "- State ONLY facts present in the execution outcome JSON. Never invent counts, IDs, or suites.",
+      "- If stagedCount > 0, describe those items as DRAFTED/PROPOSED and staged for review — NEVER say they were already saved or created in the repository.",
+      "- If persistedCount > 0 or archivedNowCount > 0, state those actual persisted changes.",
+      "- Do NOT output any markdown tables of test cases.",
+      lang === "ru" ? "- Respond in Russian." : "- Respond in English."
+    ].join("\n");
+
+    const userPrompt = JSON.stringify({
+      userRequest: userMessage.slice(0, 400),
+      intentSummary: decision.reply.slice(0, 400),
+      executionOutcome: facts
+    });
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        this.runProjectAiPrompt(projectId, systemPrompt, userPrompt, 512),
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), LegacyService.ZYRA_POST_APPLY_SYNTHESIS_TIMEOUT_MS);
+        })
+      ]);
+      const synthesized = result && typeof result.text === "string" ? result.text.trim() : "";
+      return synthesized ? { ...decision, reply: synthesized } : decision;
+    } catch (err) {
+      this.logger.warn(`Post-apply reply synthesis failed for project ${projectId}, falling back to deterministic reconciliation: ${err instanceof Error ? err.message : String(err)}`);
+      return decision;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   // Everything a reply must satisfy before the user sees it: test cases live only in the table, and
   // no claim of a mutation survives that the system did not actually perform.
   private finalizeZyraChatReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations, renderedRows: Body[]): string {
-    const reconciled = this.reconcileZyraReply(decision, applied);
-    return this.stripZyraTestcaseTables(reconciled, renderedRows.length > 0);
+    return finalizeZyraChatReplyGuard(decision, applied, renderedRows);
   }
 
   // The reply is written by the model (or by the generator) BEFORE the operations are applied, and
@@ -24754,281 +24723,12 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   // adverb in between ("that was recently removed") — which is what the false positives actually
   // were ("the suite that was removed last week"), while leaving a bare "was"/"were" claim with no
   // relative pronoun in front of it fully caught, the same as before the first fix ever ran.
-  private static readonly ZYRA_COMPLETION_CLAIM =
-    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b|\b(test\s?cases?|suite)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|generated|saved|archived|updated|deleted|removed|moved)\b/i;
-
-  // Same pattern as ZYRA_COMPLETION_CLAIM, "suite" removed from every noun alternative — used only
-  // for a turn whose operations are ALL create_suite (reconcileZyraReply's own bypass for that
-  // shape, below). That bypass exists because a genuine "Created the Regression suite" would
-  // otherwise trip ZYRA_COMPLETION_CLAIM itself ("suite" is one of its nouns), so the full check
-  // can't run there — but skipping it entirely left a gap: a reply that ALSO claims an unrelated,
-  // unrequested testcase mutation in the same message (hallucinated content with no corresponding
-  // operation at all) went uncaught, since nothing else in this function inspects that branch's
-  // reply text. This narrower pattern still catches a testcase-specific claim while never matching
-  // on the word "suite" itself, so a true suite-only success keeps passing through untouched.
-  private static readonly ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM =
-    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|generated(\s+and\s+saved)?|saved|archived|updated|deleted|removed|moved|staged|drafted|proposed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|repository)\b|\b(test\s?cases?)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|generated|saved|archived|updated|removed|moved|staged|drafted|proposed)\b|\b(test\s?cases?)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|generated|saved|archived|updated|deleted|removed|moved)\b/i;
-
-  // A reply that already admits nothing happened — "Nothing was saved", "No test cases were
-  // created", "could not create/save" — must not be wrapped a second time; the completion-claim
-  // guard above exists to add an honest correction, not to stack one on top of an honest refusal.
-  // Also covers the PRESENT-tense staging disclosure the system prompt tells the model to use for a
-  // genuinely staged batch ("nothing IS changed…", "…staged for review", "…until you save them") —
-  // the past-tense-only "nothing WAS saved" wording used to miss this, so an honest, correctly staged
-  // reply got double-wrapped with the same warning it was already giving the user.
-  // "generated"/"changed" added to both verb lists below — zyraDegradedDecision's own hardcoded
-  // note ("no test cases were generated or changed") used exactly this wording, and this regex's
-  // verb lists didn't recognize it as an honest disclosure: ZYRA_COMPLETION_CLAIM's own verb list
-  // DOES include "generated", so every degraded-mode reply (AI provider unreachable, key revoked,
-  // out of credit — any reason string) tripped the false-completion banner and got a second,
-  // contradictory "Sorry! Nothing was saved... Ask me to go ahead" stacked on top of a reply that
-  // had already said precisely that. Safe to widen: both alternatives are anchored on "nothing" /
-  // "no test case(s)" immediately before the verb, so this can only ever recognize a genuine
-  // negation — it cannot swallow a real positive completion claim ("test cases were generated" with
-  // no "no"/"nothing" in front still trips ZYRA_COMPLETION_CLAIM as before).
-  // "i did not save (it|them)" added — applyStorageGateToGenerated forces actionType "answer" on a
-  // real generation reply so it never routes through the save-branch's narrower
-  // zyraPersistedClaimBanner (which correctly allows "drafted"/"staged" wording). That reroutes it
-  // through the wider zyraFalseCompletionBanner/ZYRA_COMPLETION_CLAIM instead — the check meant for
-  // genuine answer turns — and the gate's own prefix wasn't recognized as an honest disclosure, so
-  // every generation reply shown while test case storage is disabled got a false "Sorry! Nothing was
-  // saved... Ask me to go ahead" stacked on top, with a call-to-action that is actively wrong there
-  // (asking Zyra to proceed cannot save anything while the capability itself is off).
-  private static readonly ZYRA_ALREADY_DISCLOSED =
-    /\b(nothing (is|was|has\s+been) (saved|changed|created|written|generated)|no\s+test\s?cases?\s+(were|was)\s+(created|saved|added|generated|changed)|could\s+not\s+(create|save|generate|archive|update|add)|i\s+did\s+not\s+save\s+(it|them)|generation\s+is\s+(turned\s+off|disabled|off)|staged\s+for\s+(your\s+)?review|awaiting\s+(your\s+)?(go[\s-]?ahead|confirmation|approval)|until\s+you\s+save|not\s+(yet\s+)?(saved|written|applied)\s+to\s+the\s+repository)\b/i;
-
-  // Deterministic per-suite footer built from applied.moveBreakdown (ground truth read back from the
-  // database in zyraMoveBreakdown), appended to every reconcileZyraReply return path. The model's own
-  // prose is never parsed or rewritten to check its counts — that's unreliable free-text matching —
-  // this just states the real numbers underneath, the same "banner alongside the model's words rather
-  // than editing them" pattern the rest of this function already uses.
   private zyraMoveBreakdownSuffix(moveBreakdown: Array<{ suiteId: string; suiteName: string; created: boolean; count: number }> | undefined): string {
-    if (!moveBreakdown || !moveBreakdown.length) return "";
-    const total = moveBreakdown.reduce((sum, entry) => sum + entry.count, 0);
-    if (zyraReplyLanguage() === "ru") {
-      const partsRu = moveBreakdown.map((entry) => {
-        const label = entry.created ? ZYRA_RU.moveSuiteCreated(entry.suiteName) : entry.suiteName;
-        return entry.count > 0 ? `${label}: ${entry.count}` : ZYRA_RU.moveNoneMatched(label);
-      });
-      return ZYRA_RU.movedToSuites(partsRu, total);
-    }
-    const parts = moveBreakdown.map((entry) => {
-      const label = entry.created ? `${entry.suiteName} (created)` : entry.suiteName;
-      return entry.count > 0 ? `${label}: ${entry.count}` : `${label}: 0 (none matched)`;
-    });
-    return `\n\n📦 **Moved to suites (actual):** ${parts.join(" · ")} — ${total} test case(s) total.`;
-  }
-
-  // Shared by every branch of reconcileZyraReply below: a reply whose own prose falsely claims
-  // past-tense completion ("created", "saved", "archived"...) needs the same correction regardless
-  // of which action type the turn routed to. The `answer` branch needed this first (an answer
-  // changes nothing by definition, so any completion claim in it is necessarily false) — but a
-  // create/update/archive turn's own decision.reply can make the identical false claim even when
-  // reviewHint below correctly discloses staging, and until now nothing checked that branch's own
-  // wording at all, only appended a footer after it.
-  // `salvaged` (decision.__salvaged) means this reply's text is not the model's genuine, considered
-  // answer — it's whatever fragment of `reply`/`reasoningSummary` survived text-salvage out of
-  // otherwise-unparseable router JSON (see buildZyraChatDecision). Such a reply can accidentally use
-  // exactly the model's own instructed honest-disclosure vocabulary ("staged for your review") while
-  // describing a create/update/archive that never actually got structured into real operations — the
-  // ALREADY_DISCLOSED bypass below exists to avoid double-warning a genuinely staged batch, and must
-  // never apply to a turn that is not one.
-  // claimPattern defaults to the full ZYRA_COMPLETION_CLAIM; the create_suite-only branch of
-  // reconcileZyraReply passes ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM instead, so a genuine suite-only
-  // success ("Created the Regression suite") never trips this on the word "suite" itself, while an
-  // unrelated hallucinated testcase claim in the same reply still does.
-  private zyraFalseCompletionBanner(reply: string, salvaged = false, claimPattern: RegExp = LegacyService.ZYRA_COMPLETION_CLAIM): string {
-    if (zyraReplyLanguage() === "ru") return this.zyraFalseCompletionBannerRu(reply, salvaged, claimPattern);
-    if (!claimPattern.test(reply)) return "";
-    if (!salvaged && LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
-    return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
-  }
-
-  // Narrower than ZYRA_COMPLETION_CLAIM above, and used only where proposedCount > 0 (see the
-  // create/update/archive branch of reconcileZyraReply): "drafted"/"staged"/"proposed"/"generated"
-  // are exactly the words the system prompt tells the model to use for something that really is
-  // staged ("CRITICAL: ... your WORDING must match reality: describe what you produce as
-  // DRAFTED/PROPOSED and staged for review"), so a reply using them while proposedCount > 0 is
-  // telling the truth — ZYRA_COMPLETION_CLAIM would misfire on every ordinary "I drafted 3 test
-  // cases" reply. Only a verb implying the row already exists in the repository is false here.
-  // Same tense-aware lookbehind as ZYRA_COMPLETION_CLAIM, and for the same reason: "9 cases being
-  // updated" or "TC-4 will be archived" is not a persistence claim just because the bare word
-  // "updated"/"archived" appears near a testcase token.
-  // Same noun-first addition as ZYRA_COMPLETION_CLAIM above, restricted to this regex's own
-  // (narrower, "moved" excluded — a real move writes immediately, see the call site) verb list, and
-  // the same review-driven tightening (10-char window, no comma/semicolon crossing, and the narrower
-  // relative-clause-only "was"/"were" exclusion, NOT a bare one — see ZYRA_COMPLETION_CLAIM's own
-  // comment for why a bare exclusion silently regressed the original bug this whole guard exists for).
-  private static readonly ZYRA_PERSISTED_CLAIM =
-    /\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(created|added|saved|archived|updated|deleted|removed)\b[^.!?\n]{0,80}\b(test\s?cases?|tc-\d|suite|repository)\b|\b(test\s?cases?|suite)\b[^.!?\n]{0,80}\b(have|has|were|was)\s+been\s+(created|added|saved|archived|updated|removed)\b|\b(test\s?cases?|suite)\b[^.!?\n,;]{0,10}\b(?<!\b(?:being|getting|will\s+be|would\s+be|should\s+be|could\s+be|can\s+be|must\s+be|to\s+be|not\s+yet)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s)(?<!\b(?:that|which|who)\s(?:was|were)\s\w{1,12}\s)(created|added|saved|archived|updated|deleted|removed)\b/i;
-
-  /*
-   * A Russian session's reply is checked against BOTH languages: the Russian claim pattern for the
-   * Russian prose it was asked to write, and the English one in case the model answered in English
-   * anyway. Either language's disclosure phrases exempt it, exactly as in English.
-   */
-  private zyraFalseCompletionBannerRu(reply: string, salvaged: boolean, englishPattern: RegExp): string {
-    const folded = foldRu(reply);
-    if (!englishPattern.test(reply) && !ZYRA_RU_COMPLETION_CLAIM.test(folded)) return "";
-    if (!salvaged && (LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded))) return "";
-    return ZYRA_RU.falseClaimBanner;
-  }
-
-  private zyraPersistedClaimBanner(reply: string): string {
-    if (zyraReplyLanguage() === "ru") {
-      const folded = foldRu(reply);
-      const claims = LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || ZYRA_RU_COMPLETION_CLAIM.test(folded);
-      const disclosed = LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply) || ZYRA_RU_ALREADY_DISCLOSED.test(folded);
-      return claims && !disclosed ? ZYRA_RU.falseClaimBanner : "";
-    }
-    if (!LegacyService.ZYRA_PERSISTED_CLAIM.test(reply) || LegacyService.ZYRA_ALREADY_DISCLOSED.test(reply)) return "";
-    return "⚠️ **Sorry! Nothing was saved.** Anything described below as created, saved or archived was not carried out — I only described it.\n\nAsk me to go ahead and I'll make the change and show you the affected test cases.";
+    return zyraMoveBreakdownSuffixGuard(moveBreakdown);
   }
 
   private reconcileZyraReply(decision: ZyraChatDecision, applied: ZyraAppliedOperations): string {
-    // Ground truth for a confirmed archive applied this turn — the model may still word it as
-    // staged, so the reply states what actually happened. Carried on the same suffix every return
-    // path below already appends.
-    const archiveFailure = applied.activity.find((entry) => String(entry.detail || "").startsWith("The confirmed archive failed"));
-    const archivedSuffix = applied.archivedNowCount
-      ? `\n\n🗄️ Archived ${applied.archivedNowCount} test case${applied.archivedNowCount === 1 ? "" : "s"} — they now show under the Archived filter in the repository and can be restored from there.`
-      : archiveFailure
-        ? `\n\n⚠️ ${String(archiveFailure.detail)}`
-        : "";
-    const moveSuffix = this.zyraMoveBreakdownSuffix(applied.moveBreakdown) + archivedSuffix;
-    /*
-     * An `answer` turn used to return its reply unchecked, on the reasoning that an answer changes
-     * nothing so there is nothing to reconcile. That is exactly backwards: an answer changes nothing,
-     * so a reply that SAYS it changed something is the one case nothing else can catch.
-     *
-     * Three cards, one shape (Basecamp 10231190735, 10231274688, 10231923903): the user replies "yes"
-     * to a proposed archive, or asks again in a session where an earlier turn really did create
-     * cases, the turn routes to `answer`, and the model's prose reports the work as done. On
-     * 10231190735 the user then asked "is it created?" and Zyra — reading the same transcript
-     * annotations — correctly answered no. It had already told them yes.
-     *
-     * The correction goes FIRST, before the model's prose, so the two are read in the right order.
-     */
-    if (decision.actionType === "answer") {
-      const banner = !applied.testcases.length && !applied.liveSavedCount ? this.zyraFalseCompletionBanner(decision.reply, decision.__salvaged) : "";
-      return banner ? [banner, "", decision.reply].join("\n") + moveSuffix : decision.reply + moveSuffix;
-    }
-    // Creating an empty suite, or running/bug CRUD operations, touches no testcases and is still a
-    // complete success — but the reply can still separately hallucinate an unrelated testcase claim
-    // with no corresponding operation at all, which nothing else in this function would ever see
-    // if this branch returned unchecked.
-    const nonTestcaseOpTypes = new Set([
-      "create_suite",
-      "create_run",
-      "update_run",
-      "delete_run",
-      "create_bug",
-      "update_bug",
-      "delete_bug",
-      "generate_script",
-      "run_script",
-    ]);
-    if (decision.operations.length && decision.operations.every((op) => nonTestcaseOpTypes.has(op.type))) {
-      const banner = this.zyraFalseCompletionBanner(decision.reply, decision.__salvaged, LegacyService.ZYRA_TESTCASE_ONLY_COMPLETION_CLAIM);
-      return (banner ? banner + "\n\n" : "") + decision.reply + moveSuffix;
-    }
-
-    // Non-testcase operations are not expected to produce a testcase row.
-    const requested = decision.operations.filter((op) => !nonTestcaseOpTypes.has(op.type)).length;
-    const appliedCount = applied.testcases.length + (applied.liveSavedCount ?? 0);
-
-    const ru = zyraReplyLanguage() === "ru";
-    // Every update named an existing test case but none of them would change anything (see
-    // applyZyraChatOperations) — a different situation from "those test cases don't exist", so it
-    // gets its own wording rather than the not-found one below.
-    // Also covers an update whose drafting step failed (authorZyraUpdates' authoringError) — the
-    // test case exists, so the not-found wording below would be wrong for it too.
-    const unchangedUpdates = applied.activity
-      .filter((entry) => entry.title === "Could not update testcase" && /did not change any field|drafting it|drafting step/.test(String(entry.detail || "")))
-      .map((entry) => String(entry.detail));
-    if (!appliedCount && unchangedUpdates.length) {
-      if (ru) return [ZYRA_RU.nothingStagedNoChange(unchangedUpdates.length), "", decision.reply].join("\n") + moveSuffix;
-      return [
-        `⚠️ Nothing was staged. ${unchangedUpdates.join(" ")} The test case${unchangedUpdates.length === 1 ? " is" : "s are"} unchanged.`,
-        "",
-        decision.reply
-      ].join("\n") + moveSuffix;
-    }
-    if (!appliedCount && ru) {
-      const detailRu = decision.operations.length ? ZYRA_RU.nothingSavedMissing : ZYRA_RU.nothingSavedNoOps;
-      return [ZYRA_RU.nothingSaved(detailRu), "", decision.reply].join("\n") + moveSuffix;
-    }
-    if (!appliedCount) {
-      const detail = decision.operations.length
-        ? "The test cases it referred to do not exist in this project, so there was nothing to change."
-        : "I did not produce any test case operations for this request.";
-      return [
-        `⚠️ Nothing was saved. ${detail} Ask me to generate the test cases and I'll draft them for review in the same step.`,
-        "",
-        decision.reply
-      ].join("\n") + moveSuffix;
-    }
-
-    // create/update/archive no longer write straight to the repository — they're staged for review
-    // (see applyZyraChatOperations), so a reply claiming "created"/"saved"/"archived" past tense is
-    // no longer accurate even when every requested operation produced a row. Appended after the
-    // model's own prose rather than replacing it, so the reply keeps whatever specifics it named.
-    const proposedCount = applied.testcases.filter((tc) => typeof tc.action === "string" && tc.action.startsWith("proposed-")).length;
-    const reviewHint = proposedCount > 0 && ru
-      ? ZYRA_RU.reviewHint(proposedCount)
-      : proposedCount > 0
-      ? `\n\n📝 ${proposedCount} of them ${proposedCount === 1 ? "is" : "are"} staged for your review — open the review panel to select, edit, or discard, then Save to add ${proposedCount === 1 ? "it" : "them"} to the repository. Nothing has been written to the repository yet.`
-      : "";
-
-    // Gated on proposedCount, not just the reply text: move_to_suite/create_suite write immediately
-    // (applied.testcases rows carry a real id, no "proposed-" action), so a reply claiming "saved"/
-    // "moved" there is true and must pass through untouched — only a turn with something actually
-    // still staged can make the reply's completion claim false. And zyraPersistedClaimBanner, not
-    // zyraFalseCompletionBanner, because a staged turn legitimately says "drafted"/"staged" — see
-    // that method's own comment for why the two banners can't share one regex.
-    const banner = proposedCount > 0 ? this.zyraPersistedClaimBanner(decision.reply) : "";
-    const bannerPrefix = banner ? banner + "\n\n" : "";
-
-    // unresolvedMoveTargetCount catches a shortfall appliedCount/requested structurally cannot: one
-    // move_to_suite operation can resolve anywhere from 0 to all of its named ids, so "2 rows moved,
-    // 1 operation requested" always reads as full success by the operation-count comparison alone,
-    // even when 3 of 5 named ids never existed. See applyZyraChatOperations' own comment (F4).
-    const unresolvedMoves = applied.unresolvedMoveTargetCount || 0;
-    if (appliedCount < requested || unresolvedMoves > 0) {
-      // The reasons are already in the activity log this turn; naming them here keeps the chat itself
-      // truthful instead of making the user open the activity panel to find out.
-      const reasons = applied.activity
-        .filter((entry) => /could not|skipped/i.test(String(entry.title || "")))
-        .map((entry) => String(entry.detail || entry.title))
-        .filter(Boolean);
-      // The two shortfalls are independent and can both be true in the same turn (an update that
-      // never resolved to a row, and a move that only partially matched its named ids) — state
-      // whichever applies rather than picking one wording and silently dropping the other.
-      if (ru) {
-        // The activity reasons are English sentences from the activity log — not pasted into a
-        // Russian reply; the headline still states both shortfalls.
-        const headlineRu = [
-          appliedCount < requested ? ZYRA_RU.partialHeadline(appliedCount, requested) : "",
-          unresolvedMoves > 0 ? ZYRA_RU.partialUnresolvedMoves(unresolvedMoves) : ""
-        ].filter(Boolean).join(" ");
-        return bannerPrefix + [
-          `⚠️ ${headlineRu}` + (appliedCount < requested ? ZYRA_RU.partialRestNotDrafted : ""),
-          "",
-          decision.reply + reviewHint
-        ].join("\n") + moveSuffix;
-      }
-      const headline = [
-        appliedCount < requested ? `${appliedCount} of ${requested} test case operation(s) were drafted for review.` : "",
-        unresolvedMoves > 0 ? `${unresolvedMoves} named test case(s) could not be moved.` : ""
-      ].filter(Boolean).join(" ");
-      return bannerPrefix + [
-        `⚠️ ${headline}` + (reasons.length ? ` ${reasons.join(" ")}` : appliedCount < requested ? " The rest were not drafted." : ""),
-        "",
-        decision.reply + reviewHint
-      ].join("\n") + moveSuffix;
-    }
-
-    return bannerPrefix + decision.reply + reviewHint + moveSuffix;
+    return reconcileZyraReplyGuard(decision, applied);
   }
 
   private aiUnavailableForZyraChat(existingCount: number, reason = "AI generation was not available for this chat request."): ZyraChatDecision {
@@ -25413,9 +25113,7 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
 
   /** What the client sees of a message's options: never `context`. */
   private static zyraPublicOptions(raw: unknown): Body | null {
-    if (!raw || typeof raw !== "object") return null;
-    const options = raw as Body;
-    return { kind: options.kind, choices: normalizeJsonArray(options.choices), answeredId: options.answeredId ?? null };
+    return zyraPublicOptionsHelper(raw);
   }
 
   /*
@@ -25819,7 +25517,14 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
       }
       const currentSteps = this.safeSteps(current.steps) as Body[];
       const incoming = (this.safeSteps(value) as Body[]).filter((step) => step && typeof step === "object");
-      const isPatch = incoming.length < currentSteps.length || incoming.some((step) => !text(step.action));
+      // Only treat as a partial patch when a step omits `action` (e.g. fixing expectedResult only)
+      // or explicitly starts past step 1 (`stepNumber > 1`). A full list starting at step 1 with
+      // actions on every step replaces `currentSteps` even when it has fewer steps (e.g. aligning
+      // a 3-step testcase with a 1-step testcase).
+      const firstStepNum = Number(incoming[0]?.stepNumber);
+      const startsAfterFirst = Number.isInteger(firstStepNum) && firstStepNum > 1;
+      const hasBlankAction = incoming.some((step) => !text(step.action));
+      const isPatch = incoming.length > 0 && (hasBlankAction || (incoming.length < currentSteps.length && startsAfterFirst));
       let next: Body[];
       if (!isPatch) {
         next = incoming;

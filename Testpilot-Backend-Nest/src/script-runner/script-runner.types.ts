@@ -89,6 +89,9 @@ export interface RecorderSessionResponse {
 export interface TriggerScriptRunInput {
   targetUrl?: string | null;
   browser?: ScriptBrowser;
+  retries?: number;
+  updateSnapshots?: boolean;
+  enableAccessibilityCheck?: boolean;
 }
 
 export interface RecordHeadedRunInput {
@@ -118,4 +121,7 @@ export interface SuiteRunResponse {
 export interface ScriptRunnerJobPayload {
   runId: string;
   browser?: ScriptBrowser;
+  retries?: number;
+  updateSnapshots?: boolean;
+  enableAccessibilityCheck?: boolean;
 }

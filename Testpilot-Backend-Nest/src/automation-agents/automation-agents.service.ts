@@ -31,6 +31,21 @@ import { PageInspectorService } from "./page-inspector.service";
 
 const execFileAsync = promisify(execFile);
 
+export function computeAriaSnapshotDiff(baselineAria: string, currentAria: string, maxLines = 80): string {
+  const baseLines = baselineAria.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean);
+  const currLines = currentAria.split(/\r?\n/).map((l) => l.trimEnd()).filter(Boolean);
+  const baseSet = new Set(baseLines);
+  const currSet = new Set(currLines);
+
+  const removed = baseLines.filter((l) => !currSet.has(l)).slice(0, Math.floor(maxLines / 2)).map((l) => `- ${l}`);
+  const added = currLines.filter((l) => !baseSet.has(l)).slice(0, Math.floor(maxLines / 2)).map((l) => `+ ${l}`);
+
+  if (removed.length === 0 && added.length === 0) {
+    return "No structural ARIA differences detected.";
+  }
+  return [...removed, ...added].join("\n");
+}
+
 function stripCodeFences(raw: string): string {
   const trimmed = raw.trim();
   const match = trimmed.match(/^```(?:typescript|ts|javascript|js|json)?\s*\n([\s\S]*?)\n```$/i);
@@ -529,13 +544,15 @@ export class AutomationAgentsService {
 
         // Re-inspect if failure happened on a navigated URL or use Playwright's error-context.md
         const failureContext = execResult.errorContext || snapshot.ariaSnapshot;
+        const ariaDiff = computeAriaSnapshotDiff(snapshot.ariaSnapshot, failureContext);
         currentScript = await this.runHealerAgent(
           job.projectId,
           tc,
           currentScript,
           lastError,
           failureContext,
-          snapshot
+          snapshot,
+          ariaDiff
         );
 
         const healedSave = await this.scriptRunner.upsertScript(uid, job.projectId, job.testcaseId, {
@@ -636,25 +653,39 @@ export class AutomationAgentsService {
   private async runExplorePipeline(job: TestAgentJobRecord, auth: DecryptedAutomationAuth | null): Promise<void> {
     await this.appendJobUpdate(job.id, {
       stage: "planning",
-      logMessage: `Explorer: Inspecting ${job.targetUrl} with headless Chromium...`
+      logMessage: `Explorer: Multi-page & interactive exploration of ${job.targetUrl} with headless Chromium...`
     });
-    const snapshot = await this.inspector.inspectPage(job.targetUrl, auth);
+    const exploration =
+      typeof this.inspector.exploreInteractiveFlows === "function"
+        ? await this.inspector.exploreInteractiveFlows(job.targetUrl, auth, 4)
+        : {
+            entryUrl: job.targetUrl,
+            visitedPages: [await this.inspector.inspectPage(job.targetUrl, auth)],
+            discoveredRoutes: [job.targetUrl]
+          };
+
+    const snapshot = exploration.visitedPages[0];
+    const totalElements = exploration.visitedPages.reduce((sum, p) => sum + p.interactiveElements.length, 0);
 
     const systemPrompt = [
       "You are the TestPilot Playwright Planner Agent.",
-      "Analyze the live page ARIA snapshot and interactive elements below.",
+      "Analyze the multi-page ARIA snapshots, discovered routes, and interactive elements below.",
       "Return ONLY valid JSON: { \"scenarios\": [ { \"title\": string, \"description\": string, \"steps\": string[], \"expectedResult\": string, \"priority\": \"low\"|\"medium\"|\"high\" } ] }.",
-      "CRITICAL RULE: Only propose scenarios that interact with elements that ACTUALLY EXIST in the provided snapshot. Never invent buttons, inputs, or routes."
+      "CRITICAL RULE: Only propose scenarios that interact with elements that ACTUALLY EXIST in the provided snapshots. Never invent buttons, inputs, or routes."
     ].join("\n");
 
+    const visitedSummaries = exploration.visitedPages.map((p, idx) => [
+      `--- State ${idx + 1}: ${p.url} (Title: ${p.title}) ---`,
+      `Interactive Elements (${p.interactiveElements.length}): ${JSON.stringify(p.interactiveElements.slice(0, 35))}`,
+      p.failedRequests?.length ? `Failed Network Requests: ${JSON.stringify(p.failedRequests.slice(0, 10))}` : "",
+      `ARIA Snapshot:\n${p.ariaSnapshot.slice(0, 2500)}`
+    ].filter(Boolean).join("\n"));
+
     const userPrompt = [
-      `Target URL: ${snapshot.url}`,
-      `Page Title: ${snapshot.title}`,
+      `Entry URL: ${exploration.entryUrl}`,
+      `Discovered Routes (${exploration.discoveredRoutes.length}): ${exploration.discoveredRoutes.join(", ")}`,
       job.instructions ? `User Scope/Instructions: ${job.instructions}` : "",
-      `Interactive Elements (${snapshot.interactiveElements.length}):`,
-      JSON.stringify(snapshot.interactiveElements.slice(0, 60)),
-      `ARIA Snapshot:`,
-      snapshot.ariaSnapshot.slice(0, 6000)
+      visitedSummaries.join("\n\n")
     ].filter(Boolean).join("\n\n");
 
     const aiRes = await this.legacy.runProjectAiPrompt(job.projectId, systemPrompt, userPrompt, 3000);
@@ -671,7 +702,7 @@ export class AutomationAgentsService {
     await this.appendJobUpdate(job.id, {
       stage: "completed",
       discoveredScenarios: scenarios,
-      logMessage: `Explorer discovered ${scenarios.length} grounded test scenario(s) from ${snapshot.interactiveElements.length} live elements.`
+      logMessage: `Explorer discovered ${scenarios.length} grounded test scenario(s) across ${exploration.visitedPages.length} state(s) and ${totalElements} live elements.`
     });
   }
 
@@ -723,9 +754,10 @@ export class AutomationAgentsService {
       "2. Import `{ test, expect } from \"@playwright/test\";`.",
       "3. GROUNDING: ONLY use locators verified in the Planner output or `interactiveElements`. Never invent `data-testid` or CSS IDs.",
       "4. USER-FACING LOCATORS & STRICT MODE: Prefer `getByRole`, `getByLabel`, `getByPlaceholder`, `getByTestId`; use `.filter({ hasText })` or chaining for repeated items; avoid strict mode violations (`.first()` only if truly ambiguous).",
-      "5. WEB-FIRST ASSERTIONS ONLY: Always use auto-retrying assertions like `await expect(locator).toBeVisible()`, `toContainText()`, `toHaveValue()`, `toHaveURL()`. NEVER use `expect(await locator.textContent()).toBe(...)` or `page.$()` / `elementHandle()`.",
+      "5. WEB-FIRST ASSERTIONS ONLY: Always use auto-retrying assertions like `await expect(locator).toBeVisible()`, `toContainText()`, `toHaveValue()`, `toHaveURL()`. Use `await expect(locator).toMatchAriaSnapshot(...)` for structural region checks (nav, forms, dialogs) when appropriate. NEVER use `expect(await locator.textContent()).toBe(...)` or `page.$()` / `elementHandle()`.",
       "6. NO HARD SLEEPS: NEVER use `page.waitForTimeout(...)`. Rely on Playwright auto-waiting and web-first assertions.",
-      "7. STRUCTURE: Group logical test phases with `await test.step('...', async () => { ... });` for clear trace reporting."
+      "7. API & HYBRID TESTING: When the test case involves API verification or data seeding, use Playwright's `{ page, request }` fixture (`APIRequestContext`) cleanly.",
+      "8. STRUCTURE: Group logical test phases with `await test.step('...', async () => { ... });` for clear trace reporting."
     ].join("\n");
 
     const userPrompt = [
@@ -745,11 +777,12 @@ export class AutomationAgentsService {
     failingScript: string,
     errorMessage: string,
     failureAriaContext: string,
-    snapshot: PageSnapshot
+    snapshot: PageSnapshot,
+    ariaDiff?: string
   ): Promise<string> {
     const systemPrompt = [
       "You are the TestPilot Playwright Healer Agent.",
-      "Fix the failing Playwright TypeScript test using the actual failure error and live page ARIA snapshot while strictly following Playwright best practices:",
+      "Fix the failing Playwright TypeScript test using the actual failure error, ARIA diff, and live page ARIA snapshot while strictly following Playwright best practices:",
       "1. Output ONLY the full corrected TypeScript spec (no prose).",
       "2. Fix strict mode violations, wrong locators, or timing issues using ONLY elements present in the ARIA snapshot or verified elements.",
       "3. NEVER insert `page.waitForTimeout(...)`, `page.$()`, or non-retrying `expect(await ...)` assertions — use web-first `await expect(locator)...` and `.filter({ hasText })`.",
@@ -760,9 +793,10 @@ export class AutomationAgentsService {
       `Test Case: ${tc.title}`,
       `Failing Script:\n${failingScript}`,
       `Playwright Error:\n${errorMessage.slice(0, 4000)}`,
+      ariaDiff ? `ARIA Tree Diff (Baseline vs Failure):\n${ariaDiff}` : "",
       `Failure Page ARIA / Context:\n${failureAriaContext.slice(0, 6000)}`,
       `Initial Page Verified Elements:\n${JSON.stringify(snapshot.interactiveElements.slice(0, 60))}`
-    ].join("\n\n");
+    ].filter(Boolean).join("\n\n");
 
     const aiRes = await this.legacy.runProjectAiPrompt(projectId, systemPrompt, userPrompt, 3000);
     return stripCodeFences(aiRes.text);

@@ -2030,202 +2030,79 @@ export default function TestCasesPage() {
             {/* ── Main content ── */}
             <div className="flex min-w-0 flex-1 flex-col bg-[var(--surface)]">
               {/* Filter bar */}
-              <div className="flex min-h-[48px] shrink-0 flex-wrap items-center gap-2 border-b border-[var(--border)] px-4 py-2">
-                  <label className="flex h-[30px] min-w-[200px] max-w-[280px] flex-1 items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]">
-                    <IconSearch size={13} stroke={1.75} className="shrink-0" />
-                    <input
-                      type="text"
-                      value={suiteSearch}
-                      onChange={(e) => setSuiteSearch(e.target.value)}
-                      placeholder="Search by ID, title, or type"
-                      className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
-                    />
-                    {suiteSearch && (
-                      <button
-                        type="button"
-                        onClick={() => setSuiteSearch("")}
-                        aria-label="Clear search"
-                        className="shrink-0 rounded-full p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                      >
-                        <IconX size={12} stroke={2} />
-                      </button>
-                    )}
-                  </label>
-                  {activeSuiteId && (
-                    <span className="rounded-full bg-[var(--brand-soft)] px-2.5 py-0.5 text-[11.5px] font-medium text-[var(--accent-light)]">
-                      {/* The unfiled view has no suite row to take a name from, so it names itself. */}
-                      {isUnfiledView ? "No suites" : selectedSuite?.name ?? "Suite"}
-                    </span>
-                  )}
-                  {activeSuiteId && !isUnfiledView && (
-                    <div className="inline-flex items-center overflow-hidden rounded-full border border-[var(--brand-primary)] bg-[var(--background)]">
-                      <div className="relative flex items-center">
-                        <select
-                          value={suiteBrowser}
-                          onChange={(e) => setSuiteBrowser(e.target.value as TestScriptBrowser)}
-                          aria-label="Suite browser"
-                          className="h-6 cursor-pointer appearance-none bg-[var(--background)] pl-2.5 pr-6 text-[11px] font-medium text-[var(--foreground)] focus:outline-none"
+              <div className="flex shrink-0 flex-col gap-2 border-b border-[var(--border)] px-4 py-2.5">
+                {/* Row 1: Search, suite context/run action, and view/export controls */}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <label className="flex h-[30px] w-[240px] sm:w-[260px] items-center gap-1.5 rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--muted-soft)] transition-colors focus-within:border-[var(--brand-primary)]">
+                      <IconSearch size={13} stroke={1.75} className="shrink-0" />
+                      <input
+                        type="text"
+                        value={suiteSearch}
+                        onChange={(e) => setSuiteSearch(e.target.value)}
+                        placeholder="Search by ID, title, or type"
+                        className="min-w-0 flex-1 bg-transparent text-[var(--foreground)] outline-none focus-visible:outline-none placeholder:text-[var(--muted-soft)]"
+                      />
+                      {suiteSearch && (
+                        <button
+                          type="button"
+                          onClick={() => setSuiteSearch("")}
+                          aria-label="Clear search"
+                          className="shrink-0 rounded-full p-0.5 text-[var(--muted-soft)] transition-colors hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                         >
-                          <option value="chromium" className="bg-[var(--background)] text-[var(--foreground)]">Chromium</option>
-                          <option value="firefox" className="bg-[var(--background)] text-[var(--foreground)]">Firefox</option>
-                          <option value="webkit" className="bg-[var(--background)] text-[var(--foreground)]">WebKit</option>
-                          <option value="all" className="bg-[var(--background)] text-[var(--foreground)]">All Browsers</option>
-                        </select>
-                        <IconChevronDown size={12} stroke={2} className="pointer-events-none absolute right-1.5 text-[var(--muted)]" />
+                          <IconX size={12} stroke={2} />
+                        </button>
+                      )}
+                    </label>
+                    {activeSuiteId && (
+                      <span className="rounded-full bg-[var(--brand-soft)] px-2.5 py-0.5 text-[11.5px] font-medium text-[var(--accent-light)]">
+                        {/* The unfiled view has no suite row to take a name from, so it names itself. */}
+                        {isUnfiledView ? "No suites" : selectedSuite?.name ?? "Suite"}
+                      </span>
+                    )}
+                    {activeSuiteId && !isUnfiledView && (
+                      <div className="inline-flex items-center overflow-hidden rounded-full border border-[var(--brand-primary)] bg-[var(--background)]">
+                        <div className="relative flex items-center">
+                          <select
+                            value={suiteBrowser}
+                            onChange={(e) => setSuiteBrowser(e.target.value as TestScriptBrowser)}
+                            aria-label="Suite browser"
+                            className="h-6 cursor-pointer appearance-none bg-[var(--background)] pl-2.5 pr-6 text-[11px] font-medium text-[var(--foreground)] outline-none focus:outline-none"
+                          >
+                            <option value="chromium" className="bg-[var(--background)] text-[var(--foreground)]">Chromium</option>
+                            <option value="firefox" className="bg-[var(--background)] text-[var(--foreground)]">Firefox</option>
+                            <option value="webkit" className="bg-[var(--background)] text-[var(--foreground)]">WebKit</option>
+                            <option value="all" className="bg-[var(--background)] text-[var(--foreground)]">All Browsers</option>
+                          </select>
+                          <IconChevronDown size={12} stroke={2} className="pointer-events-none absolute right-1.5 text-[var(--muted)]" />
+                        </div>
+                        <button
+                          type="button"
+                          disabled={runningSuite}
+                          onClick={async () => {
+                            setRunningSuite(true);
+                            setSuiteCasesError(null);
+                            try {
+                              const res = await runSuiteScripts(projectId, activeSuiteId, { browser: suiteBrowser });
+                              router.push(`/projects/${projectId}/cycles/${res.cycleId}`);
+                            } catch (err) {
+                              setSuiteCasesError(err instanceof Error ? err.message : "Failed to run Playwright suite.");
+                            } finally {
+                              setRunningSuite(false);
+                            }
+                          }}
+                          className="inline-flex h-6 items-center gap-1.5 bg-[var(--brand-primary)] px-2.5 text-[11.5px] font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                          title="Run all Playwright scripts in this suite"
+                        >
+                          {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
+                          {runningSuite ? "Starting..." : "Run Suite"}
+                        </button>
                       </div>
-                      <button
-                        type="button"
-                        disabled={runningSuite}
-                        onClick={async () => {
-                          setRunningSuite(true);
-                          setSuiteCasesError(null);
-                          try {
-                            const res = await runSuiteScripts(projectId, activeSuiteId, { browser: suiteBrowser });
-                            router.push(`/projects/${projectId}/cycles/${res.cycleId}`);
-                          } catch (err) {
-                            setSuiteCasesError(err instanceof Error ? err.message : "Failed to run Playwright suite.");
-                          } finally {
-                            setRunningSuite(false);
-                          }
-                        }}
-                        className="inline-flex h-6 items-center gap-1.5 bg-[var(--brand-primary)] px-2.5 text-[11.5px] font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                        title="Run all Playwright scripts in this suite"
-                      >
-                        {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
-                        {runningSuite ? "Starting..." : "Run Suite"}
-                      </button>
-                    </div>
-                  )}
-                  <div className="ml-auto flex flex-wrap items-center gap-1.5">
-                    {archivedHidden && (
-                      <button
-                        type="button"
-                        data-testid="archived-hidden-chip"
-                        title="Archived test cases are not shown in this list"
-                        onClick={() => setSuiteStatusFilter("Archived")}
-                        className="flex items-center gap-1 rounded-full border border-[var(--border)] px-2.5 py-0.5 text-[11.5px] text-[var(--muted)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
-                      >
-                        <IconArchive size={11} stroke={1.75} />
-                        {archivedCaseCount} archived hidden
-                      </button>
                     )}
-                    {suiteStatusFilter !== "all" && (
-                      <button
-                        type="button"
-                        onClick={() => setSuiteStatusFilter("all")}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
-                      >
-                        <span className="text-[var(--muted)]">Status:</span> {suiteStatusFilter}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {suitePriorityFilter !== "all" && (
-                      <button
-                        type="button"
-                        onClick={() => setSuitePriorityFilter("all")}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
-                      >
-                        <span className="text-[var(--muted)]">Priority:</span> {suitePriorityFilter}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {suiteTypeFilter !== "all" && (
-                      <button
-                        type="button"
-                        onClick={() => setSuiteTypeFilter("all")}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
-                      >
-                        <span className="text-[var(--muted)]">Type:</span> {suiteTypeFilter}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {suiteAutomationFilter !== "all" && (
-                      <button
-                        type="button"
-                        onClick={() => setSuiteAutomationFilter("all")}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
-                      >
-                        <span className="text-[var(--muted)]">Automation:</span> {suiteAutomationFilter}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {activeJiraIssueKey && (
-                      <button
-                        type="button"
-                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
-                      >
-                        <span className="opacity-70">Jira:</span> {activeJiraIssueKey}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {activeLinearIssueKey && (
-                      <button
-                        type="button"
-                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
-                      >
-                        <span className="opacity-70">Linear:</span> {activeLinearIssueKey}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    {activeNotionPageId && (
-                      <button
-                        type="button"
-                        onClick={() => router.replace(`/projects/${projectId}/testcases`)}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
-                      >
-                        <span className="opacity-70">Notion:</span> {notionPageKey(activeNotionPageId)}
-                        <IconX size={11} stroke={2.5} />
-                      </button>
-                    )}
-                    <select
-                      value={suiteTypeFilter}
-                      onChange={(e) => setSuiteTypeFilter(e.target.value)}
-                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none"
-                    >
-                      <option value="all">All types</option>
-                      {TESTCASE_TYPES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </select>
-                    <select
-                      value={suiteStatusFilter}
-                      onChange={(e) => setSuiteStatusFilter(e.target.value)}
-                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none"
-                    >
-                      <option value="all">All statuses</option>
-                      {TESTCASE_STATUSES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </select>
-                    <select
-                      value={suitePriorityFilter}
-                      onChange={(e) => setSuitePriorityFilter(e.target.value)}
-                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none"
-                    >
-                      <option value="all">All priorities</option>
-                      {TESTCASE_PRIORITIES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </select>
-                    <select
-                      value={suiteAutomationFilter}
-                      onChange={(e) => setSuiteAutomationFilter(e.target.value)}
-                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none"
-                    >
-                      <option value="all">All automation types</option>
-                      {TESTCASE_AUTOMATION_TYPES.map((option) => (
-                        <option key={option} value={option}>{option}</option>
-                      ))}
-                    </select>
-                    <CustomFieldFilterPopover
-                      definitions={customFieldDefinitions}
-                      conditions={customFieldFilters}
-                      onChange={setCustomFieldFilters}
-                    />
-                    <CustomTagsFilterPopover tags={customTags} selectedIds={suiteTagFilter} onChange={setSuiteTagFilter} />
-                    {/* Columns control renders here (portaled from the table), as the 5th dropdown. */}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {/* Columns control renders here (portaled from the table). */}
                     <div ref={setColumnsSlotEl} className="flex items-center empty:hidden" />
                     <div
                       className="inline-flex h-[30px] items-center rounded-[6px] border border-[var(--border)] bg-[var(--background)] p-0.5"
@@ -2261,20 +2138,173 @@ export default function TestCasesPage() {
                     </div>
                     {selectedSuiteCases.length > 0 && (
                       <span title={copyCasesTitle}>
-                        <CopyButton value={testCasesTsv} label={copyCasesLabel} copiedLabel="Copied" />
+                        <CopyButton
+                          value={testCasesTsv}
+                          label={copyCasesLabel}
+                          copiedLabel="Copied"
+                          variant="secondary"
+                          className="h-[30px] px-2.5 text-[12px]"
+                        />
                       </span>
                     )}
+                  </div>
+                </div>
+
+                {/* Row 2: Filter dropdowns + active filter chips */}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <select
+                      value={suiteTypeFilter}
+                      onChange={(e) => setSuiteTypeFilter(e.target.value)}
+                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none transition-colors focus:border-[var(--brand-primary)]"
+                    >
+                      <option value="all">All types</option>
+                      {TESTCASE_TYPES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={suiteStatusFilter}
+                      onChange={(e) => setSuiteStatusFilter(e.target.value)}
+                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none transition-colors focus:border-[var(--brand-primary)]"
+                    >
+                      <option value="all">All statuses</option>
+                      {TESTCASE_STATUSES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={suitePriorityFilter}
+                      onChange={(e) => setSuitePriorityFilter(e.target.value)}
+                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none transition-colors focus:border-[var(--brand-primary)]"
+                    >
+                      <option value="all">All priorities</option>
+                      {TESTCASE_PRIORITIES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                    <select
+                      value={suiteAutomationFilter}
+                      onChange={(e) => setSuiteAutomationFilter(e.target.value)}
+                      className="h-[30px] rounded-[6px] border border-[var(--border)] bg-[var(--background)] px-2.5 text-[12px] text-[var(--ink-600)] outline-none transition-colors focus:border-[var(--brand-primary)]"
+                    >
+                      <option value="all">All automation types</option>
+                      {TESTCASE_AUTOMATION_TYPES.map((option) => (
+                        <option key={option} value={option}>{option}</option>
+                      ))}
+                    </select>
+                    <CustomFieldFilterPopover
+                      definitions={customFieldDefinitions}
+                      conditions={customFieldFilters}
+                      onChange={setCustomFieldFilters}
+                    />
+                    <CustomTagsFilterPopover tags={customTags} selectedIds={suiteTagFilter} onChange={setSuiteTagFilter} />
                     {activeFilterCount > 0 && (
                       <button
                         type="button"
                         onClick={clearSuiteFilters}
-                        className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--ink-200)] px-3 text-[12px] font-medium text-[var(--ink-600)] hover:bg-[var(--ink-100)]"
+                        className="flex h-[30px] shrink-0 items-center rounded-[6px] border border-[var(--ink-200)] px-3 text-[12px] font-medium text-[var(--ink-600)] transition-colors hover:bg-[var(--ink-100)]"
                       >
                         Clear all
                       </button>
                     )}
                   </div>
+
+                  {(archivedHidden ||
+                    suiteStatusFilter !== "all" ||
+                    suitePriorityFilter !== "all" ||
+                    suiteTypeFilter !== "all" ||
+                    suiteAutomationFilter !== "all" ||
+                    Boolean(activeJiraIssueKey) ||
+                    Boolean(activeLinearIssueKey) ||
+                    Boolean(activeNotionPageId)) && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {archivedHidden && (
+                        <button
+                          type="button"
+                          data-testid="archived-hidden-chip"
+                          title="Archived test cases are not shown in this list"
+                          onClick={() => setSuiteStatusFilter("Archived")}
+                          className="flex items-center gap-1 rounded-full border border-[var(--border)] px-2.5 py-0.5 text-[11.5px] text-[var(--muted)] transition-colors hover:border-[var(--brand-primary)] hover:text-[var(--accent-light)]"
+                        >
+                          <IconArchive size={11} stroke={1.75} />
+                          {archivedCaseCount} archived hidden
+                        </button>
+                      )}
+                      {suiteStatusFilter !== "all" && (
+                        <button
+                          type="button"
+                          onClick={() => setSuiteStatusFilter("all")}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
+                        >
+                          <span className="text-[var(--muted)]">Status:</span> {suiteStatusFilter}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {suitePriorityFilter !== "all" && (
+                        <button
+                          type="button"
+                          onClick={() => setSuitePriorityFilter("all")}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
+                        >
+                          <span className="text-[var(--muted)]">Priority:</span> {suitePriorityFilter}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {suiteTypeFilter !== "all" && (
+                        <button
+                          type="button"
+                          onClick={() => setSuiteTypeFilter("all")}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
+                        >
+                          <span className="text-[var(--muted)]">Type:</span> {suiteTypeFilter}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {suiteAutomationFilter !== "all" && (
+                        <button
+                          type="button"
+                          onClick={() => setSuiteAutomationFilter("all")}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--brand-soft)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--accent-light)] hover:opacity-80"
+                        >
+                          <span className="text-[var(--muted)]">Automation:</span> {suiteAutomationFilter}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {activeJiraIssueKey && (
+                        <button
+                          type="button"
+                          onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                        >
+                          <span className="opacity-70">Jira:</span> {activeJiraIssueKey}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {activeLinearIssueKey && (
+                        <button
+                          type="button"
+                          onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                        >
+                          <span className="opacity-70">Linear:</span> {activeLinearIssueKey}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                      {activeNotionPageId && (
+                        <button
+                          type="button"
+                          onClick={() => router.replace(`/projects/${projectId}/testcases`)}
+                          className="inline-flex items-center gap-1 rounded-full bg-[var(--info-soft,#EEF2FF)] py-[3px] pl-2 pr-2.5 text-[11.5px] font-medium text-[var(--info-foreground,#2D3DB0)] hover:opacity-80"
+                        >
+                          <span className="opacity-70">Notion:</span> {notionPageKey(activeNotionPageId)}
+                          <IconX size={11} stroke={2.5} />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
+              </div>
 
                 {/* Bulk action bar (when rows selected) */}
                 {selectedCaseIds.length > 0 && (

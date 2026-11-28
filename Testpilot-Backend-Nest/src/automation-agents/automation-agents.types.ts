@@ -18,6 +18,19 @@ export interface InteractiveElement {
   testId: string | null;
   id: string | null;
   playwrightLocator: string;
+  frameUrl?: string | null;
+  strictMatchCount?: number;
+}
+
+export interface PageConsoleIssue {
+  level: string;
+  text: string;
+}
+
+export interface PageFailedRequest {
+  method: string;
+  url: string;
+  status: number | null;
 }
 
 export interface PageSnapshot {
@@ -25,6 +38,15 @@ export interface PageSnapshot {
   title: string;
   ariaSnapshot: string;
   interactiveElements: InteractiveElement[];
+  consoleErrors?: PageConsoleIssue[];
+  pageErrors?: string[];
+  failedRequests?: PageFailedRequest[];
+}
+
+export interface MultiPageExplorationResult {
+  entryUrl: string;
+  visitedPages: PageSnapshot[];
+  discoveredRoutes: string[];
 }
 
 export interface AgentLogEntry {

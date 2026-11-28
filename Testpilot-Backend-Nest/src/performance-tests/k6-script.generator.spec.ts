@@ -316,5 +316,52 @@ describe("k6-script.generator", () => {
       expect(rpsScript).toContain('"rate": 40');
       expect(rpsScript).toContain('"preAllocatedVUs": 15');
     });
+
+    it("supports abortOnFail thresholds and custom k6/metrics", () => {
+      const cfg = normalizeBuilderConfig({
+        targetUrl: "https://test.k6.io",
+        method: "GET",
+        vus: 5,
+        durationSec: 15,
+        p95ThresholdMs: 300,
+        errorRateThresholdPct: 5,
+        abortOnFail: true,
+        delayAbortEval: "5s",
+        customMetrics: true
+      });
+      const script = generateK6Script(cfg);
+      expect(script).toContain('import { Rate, Trend } from "k6/metrics";');
+      expect(script).toContain('"abortOnFail": true');
+      expect(script).toContain('"delayAbortEval": "5s"');
+      expect(script).toContain("apiSuccessRate.add(passed)");
+      expect(script).toContain("apiTtfbMs.add(res.timings.waiting)");
+    });
+
+    it("extracts timingBreakdown and customMetrics from summary JSON", () => {
+      const parsed = parseK6SummaryJson({
+        metrics: {
+          http_reqs: { values: { count: 10, rate: 5 } },
+          http_req_blocked: { values: { avg: 1.2 } },
+          http_req_connecting: { values: { avg: 2.5 } },
+          http_req_tls_handshaking: { values: { avg: 4.1 } },
+          http_req_sending: { values: { avg: 0.4 } },
+          http_req_waiting: { values: { avg: 32.0, "p(95)": 55.0 } },
+          http_req_receiving: { values: { avg: 1.8 } },
+          api_ttfb_ms: { type: "trend", values: { avg: 32.0, "p(95)": 55.0 } }
+        }
+      });
+      expect(parsed.timingBreakdown).toEqual({
+        blockedAvgMs: 1.2,
+        connectingAvgMs: 2.5,
+        tlsHandshakingAvgMs: 4.1,
+        sendingAvgMs: 0.4,
+        waitingAvgMs: 32.0,
+        waitingP95Ms: 55.0,
+        receivingAvgMs: 1.8
+      });
+      expect(parsed.customMetrics).toEqual([
+        { name: "api_ttfb_ms", type: "trend", values: { avg: 32.0, "p(95)": 55.0 } }
+      ]);
+    });
   });
 });

@@ -578,7 +578,7 @@ function MessageBubble({
         <button
           type="button"
           onClick={handleCopy}
-          className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[var(--border)] px-2.5 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--brand-border)] hover:text-[var(--foreground)]"
+          className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-[var(--border-strong)] bg-[var(--surface)] px-2.5 text-[11px] font-medium text-[var(--foreground)] transition-[background-color,border-color,color,transform] duration-150 hover:bg-[var(--surface-secondary)] active:scale-[0.98]"
         >
           <IconCopy size={13} stroke={1.9} />
           {copied ? t("copied") : t("copy")}

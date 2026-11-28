@@ -1129,13 +1129,29 @@ textarea::placeholder {
   color: var(--muted-soft);
 }
 
-button:focus-visible,
-a:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible {
-  outline: 2px solid color-mix(in oklab, var(--brand-primary) 40%, transparent);
-  outline-offset: 1px;
+@layer base {
+  button:focus-visible,
+  a:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid color-mix(in oklab, var(--brand-primary) 40%, transparent);
+    outline-offset: 1px;
+  }
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-old(root) {
+  z-index: 1;
+}
+
+::view-transition-new(root) {
+  z-index: 9999;
 }
 
 /* Tailwind's preflight resets `button { cursor: default }`; restore the pointer affordance for

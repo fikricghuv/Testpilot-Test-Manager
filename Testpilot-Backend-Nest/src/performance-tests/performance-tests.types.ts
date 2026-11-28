@@ -28,6 +28,9 @@ export interface PerformanceBuilderConfig {
   sleepSec?: number;
   p95ThresholdMs?: number | null;
   errorRateThresholdPct?: number | null;
+  abortOnFail?: boolean;
+  delayAbortEval?: string | null;
+  customMetrics?: boolean;
   expectedStatus?: number | null;
 }
 
@@ -35,6 +38,22 @@ export interface K6ThresholdResult {
   metric: string;
   expression: string;
   ok: boolean;
+}
+
+export interface K6TimingBreakdown {
+  blockedAvgMs: number | null;
+  connectingAvgMs: number | null;
+  tlsHandshakingAvgMs: number | null;
+  sendingAvgMs: number | null;
+  waitingAvgMs: number | null;
+  waitingP95Ms: number | null;
+  receivingAvgMs: number | null;
+}
+
+export interface K6CustomMetricSummary {
+  name: string;
+  type: string | null;
+  values: Record<string, number>;
 }
 
 export interface K6SummaryData {
@@ -51,6 +70,8 @@ export interface K6SummaryData {
   checksFailed: number | null;
   thresholdsPassed: boolean | null;
   thresholds: K6ThresholdResult[];
+  timingBreakdown?: K6TimingBreakdown;
+  customMetrics?: K6CustomMetricSummary[];
 }
 
 export interface PerformanceFlowStep {
@@ -73,6 +94,9 @@ export interface PerformanceFlowConfig {
   stages?: PerformanceStage[];
   p95ThresholdMs?: number | null;
   errorRateThresholdPct?: number | null;
+  abortOnFail?: boolean;
+  delayAbortEval?: string | null;
+  customMetrics?: boolean;
   steps: PerformanceFlowStep[];
 }
 
@@ -184,6 +208,25 @@ export interface PerformanceRunBreakdown {
   endpoints: PerformanceEndpointBreakdown[];
   statusCodes: Record<string, number>;
   checks: PerformanceCheckBreakdown[];
+  timingBreakdown?: K6TimingBreakdown;
+  customMetrics?: K6CustomMetricSummary[];
+}
+
+export interface PerformanceBaselineComparison {
+  runId: string;
+  baselineRunId: string;
+  baselineCreatedAt: string;
+  regressionDetected: boolean;
+  summary: string;
+  deltas: {
+    p95Ms: number | null;
+    p95Pct: number | null;
+    avgMs: number | null;
+    avgPct: number | null;
+    rps: number | null;
+    rpsPct: number | null;
+    errorRate: number | null;
+  };
 }
 
 export interface PerformanceRunRecord extends PerformanceRunSummary {
