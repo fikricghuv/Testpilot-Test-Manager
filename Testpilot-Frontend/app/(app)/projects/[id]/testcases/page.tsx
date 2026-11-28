@@ -13,6 +13,7 @@ import {
   IconArchive,
   IconFolderOff,
   IconFolders,
+  IconLayoutGrid,
   IconLayoutSidebarLeftCollapse,
   IconLayoutSidebarLeftExpand,
   IconLoader2,
@@ -20,6 +21,7 @@ import {
   IconPlayerPlay,
   IconPlus,
   IconSearch,
+  IconTable,
   IconTrash,
   IconUpload,
   IconX,
@@ -76,6 +78,7 @@ const CONTEXT_TYPE_LABEL: Record<ContextEntry["type"], string> = {
 
 import { buildContextEntries, isLinkedOnlyContext, type ContextEntry } from "@/lib/testcase-context";
 import { RepositoryTestCaseTable, type RepoTcSort, type RepoTcSortColumn } from "@/components/testcases/RepositoryTestCaseTable";
+import { RepositoryTestCaseGrid } from "@/components/testcases/RepositoryTestCaseGrid";
 import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import {
@@ -521,9 +524,13 @@ export default function TestCasesPage() {
     setRepoSummary(next.repoSummary);
   }, [projectId, customFieldDefinitions, customTags, cacheKey]);
 
+  const [viewMode, setViewMode] = useState<"table" | "grid">("table");
+
   useEffect(() => {
     const saved = readStoredValue("testpilot_tc_suite_panel");
     if (saved === "closed") setSuitePanelOpen(false);
+    const savedView = readStoredValue("testpilot_tc_view_mode");
+    if (savedView === "grid") setViewMode("grid");
     if (!currentUser) {
       router.replace("/login");
       return;
@@ -1096,6 +1103,19 @@ export default function TestCasesPage() {
     setSelectedCaseIds((prev) =>
       prev.includes(testcaseId) ? prev.filter((id) => id !== testcaseId) : [...prev, testcaseId]
     );
+  }
+
+  function selectCaseRange(ids: string[]) {
+    setSelectedCaseIds((prev) => Array.from(new Set([...prev, ...ids])));
+  }
+
+  function patchSuiteCaseLocal(id: string, patch: Partial<TestCaseListItem>) {
+    setSuiteCases((prev) => prev.map((tc) => (tc.id === id ? { ...tc, ...patch } : tc)));
+  }
+
+  function handleViewModeChange(next: "table" | "grid") {
+    setViewMode(next);
+    writeStoredValue("testpilot_tc_view_mode", next);
   }
 
   function toggleSelectAllCases() {
@@ -2038,18 +2058,21 @@ export default function TestCasesPage() {
                     </span>
                   )}
                   {activeSuiteId && !isUnfiledView && (
-                    <div className="inline-flex items-center overflow-hidden rounded-full border border-[var(--brand-primary)] bg-[var(--brand-primary)] text-white">
-                      <select
-                        value={suiteBrowser}
-                        onChange={(e) => setSuiteBrowser(e.target.value as TestScriptBrowser)}
-                        aria-label="Suite browser"
-                        className="h-6 bg-transparent pl-2.5 pr-1 text-[11px] font-medium text-white focus:outline-none"
-                      >
-                        <option value="chromium" className="text-black">Chromium</option>
-                        <option value="firefox" className="text-black">Firefox</option>
-                        <option value="webkit" className="text-black">WebKit</option>
-                        <option value="all" className="text-black">All Browsers</option>
-                      </select>
+                    <div className="inline-flex items-center overflow-hidden rounded-full border border-[var(--brand-primary)] bg-[var(--background)]">
+                      <div className="relative flex items-center">
+                        <select
+                          value={suiteBrowser}
+                          onChange={(e) => setSuiteBrowser(e.target.value as TestScriptBrowser)}
+                          aria-label="Suite browser"
+                          className="h-6 cursor-pointer appearance-none bg-[var(--background)] pl-2.5 pr-6 text-[11px] font-medium text-[var(--foreground)] focus:outline-none"
+                        >
+                          <option value="chromium" className="bg-[var(--background)] text-[var(--foreground)]">Chromium</option>
+                          <option value="firefox" className="bg-[var(--background)] text-[var(--foreground)]">Firefox</option>
+                          <option value="webkit" className="bg-[var(--background)] text-[var(--foreground)]">WebKit</option>
+                          <option value="all" className="bg-[var(--background)] text-[var(--foreground)]">All Browsers</option>
+                        </select>
+                        <IconChevronDown size={12} stroke={2} className="pointer-events-none absolute right-1.5 text-[var(--muted)]" />
+                      </div>
                       <button
                         type="button"
                         disabled={runningSuite}
@@ -2065,7 +2088,7 @@ export default function TestCasesPage() {
                             setRunningSuite(false);
                           }
                         }}
-                        className="inline-flex h-6 items-center gap-1.5 border-l border-white/25 px-2.5 text-[11.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                        className="inline-flex h-6 items-center gap-1.5 bg-[var(--brand-primary)] px-2.5 text-[11.5px] font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                         title="Run all Playwright scripts in this suite"
                       >
                         {runningSuite ? <IconLoader2 size={12} className="animate-spin" /> : <IconPlayerPlay size={12} />}
@@ -2204,6 +2227,38 @@ export default function TestCasesPage() {
                     <CustomTagsFilterPopover tags={customTags} selectedIds={suiteTagFilter} onChange={setSuiteTagFilter} />
                     {/* Columns control renders here (portaled from the table), as the 5th dropdown. */}
                     <div ref={setColumnsSlotEl} className="flex items-center empty:hidden" />
+                    <div
+                      className="inline-flex h-[30px] items-center rounded-[6px] border border-[var(--border)] bg-[var(--background)] p-0.5"
+                      role="group"
+                      aria-label="View mode"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleViewModeChange("table")}
+                        title="Table view"
+                        className={`inline-flex h-[24px] items-center gap-1 rounded-[4px] px-2 text-[11.5px] font-medium transition-colors ${
+                          viewMode === "table"
+                            ? "bg-[var(--brand-soft)] text-[var(--accent-light)]"
+                            : "text-[var(--muted)] hover:text-[var(--foreground)]"
+                        }`}
+                      >
+                        <IconTable size={13} stroke={1.8} />
+                        Table
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleViewModeChange("grid")}
+                        title="Spreadsheet Grid view (inline edit & paste from Google Sheet)"
+                        className={`inline-flex h-[24px] items-center gap-1 rounded-[4px] px-2 text-[11.5px] font-medium transition-colors ${
+                          viewMode === "grid"
+                            ? "bg-[var(--brand-soft)] text-[var(--accent-light)]"
+                            : "text-[var(--muted)] hover:text-[var(--foreground)]"
+                        }`}
+                      >
+                        <IconLayoutGrid size={13} stroke={1.8} />
+                        Grid
+                      </button>
+                    </div>
                     {selectedSuiteCases.length > 0 && (
                       <span title={copyCasesTitle}>
                         <CopyButton value={testCasesTsv} label={copyCasesLabel} copiedLabel="Copied" />
@@ -2301,7 +2356,7 @@ export default function TestCasesPage() {
                   <p className="flex min-h-0 flex-1 items-center justify-center p-4 text-sm text-[var(--muted)]">
                     Loading test cases...
                   </p>
-                ) : suiteCasesTotal === 0 ? (
+                ) : suiteCasesTotal === 0 && viewMode === "table" ? (
                   <div className="flex min-h-0 flex-1 flex-col items-center justify-center p-10 text-center">
                     <p className="text-[15px] font-semibold text-[var(--foreground)]">No test cases found</p>
                     <p className="mt-2 text-[13px] text-[var(--muted)]">
@@ -2333,22 +2388,43 @@ export default function TestCasesPage() {
                         </span>
                       </div>
                     )}
-                    <RepositoryTestCaseTable
-                      key={projectId}
-                      projectId={projectId}
-                      suiteNameMap={suiteNameMap}
-                      cases={selectedSuiteCases}
-                      rowHighlightId={panelTestcaseId}
-                      selectedCaseIdSet={selectedCaseIdSet}
-                      areAllCasesSelected={areAllCasesSelected}
-                      onToggleSelectAll={toggleSelectAllCases}
-                      onToggleCase={toggleCaseSelection}
-                      onOpenRow={openViewPanel}
-                      suitePanelOpen={suitePanelOpen}
-                      columnsSlot={columnsSlotEl}
-                      sort={suiteCasesSort}
-                      onToggleSort={toggleSuiteCasesSort}
-                    />
+                    {viewMode === "grid" ? (
+                      <RepositoryTestCaseGrid
+                        key={`grid-${projectId}`}
+                        projectId={projectId}
+                        cases={selectedSuiteCases}
+                        suites={suites}
+                        activeSuiteId={activeSuiteId}
+                        selectedCaseIdSet={selectedCaseIdSet}
+                        areAllCasesSelected={areAllCasesSelected}
+                        onToggleSelectAll={toggleSelectAllCases}
+                        onToggleCase={toggleCaseSelection}
+                        onSelectRange={selectCaseRange}
+                        onOpenRow={openViewPanel}
+                        onPatchCaseLocal={patchSuiteCaseLocal}
+                        onCasesChanged={async () => {
+                          await loadData();
+                          await loadSelectedSuiteCases();
+                        }}
+                      />
+                    ) : (
+                      <RepositoryTestCaseTable
+                        key={projectId}
+                        projectId={projectId}
+                        suiteNameMap={suiteNameMap}
+                        cases={selectedSuiteCases}
+                        rowHighlightId={panelTestcaseId}
+                        selectedCaseIdSet={selectedCaseIdSet}
+                        areAllCasesSelected={areAllCasesSelected}
+                        onToggleSelectAll={toggleSelectAllCases}
+                        onToggleCase={toggleCaseSelection}
+                        onOpenRow={openViewPanel}
+                        suitePanelOpen={suitePanelOpen}
+                        columnsSlot={columnsSlotEl}
+                        sort={suiteCasesSort}
+                        onToggleSort={toggleSuiteCasesSort}
+                      />
+                    )}
 
                     {/* Pagination */}
                     <div

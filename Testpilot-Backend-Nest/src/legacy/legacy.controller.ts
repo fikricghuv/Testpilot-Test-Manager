@@ -582,6 +582,46 @@ export class LegacyController {
     return this.legacy.importTestCases(req.userId, projectId, body);
   }
 
+  @Get("/api/projects/:projectId/testcases/:testcaseId/comments")
+  listTestCaseComments(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string
+  ) {
+    return this.legacy.listTestCaseComments(req.userId, projectId, testcaseId);
+  }
+
+  @Post("/api/projects/:projectId/testcases/:testcaseId/comments")
+  createTestCaseComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.createTestCaseComment(req.userId, projectId, testcaseId, body);
+  }
+
+  @Patch("/api/projects/:projectId/testcases/:testcaseId/comments/:commentId")
+  updateTestCaseComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Param("commentId") commentId: string,
+    @Body() body: Record<string, any>
+  ) {
+    return this.legacy.updateTestCaseComment(req.userId, projectId, testcaseId, commentId, body);
+  }
+
+  @Delete("/api/projects/:projectId/testcases/:testcaseId/comments/:commentId")
+  deleteTestCaseComment(
+    @Req() req: AuthenticatedRequest,
+    @Param("projectId") projectId: string,
+    @Param("testcaseId") testcaseId: string,
+    @Param("commentId") commentId: string
+  ) {
+    return this.legacy.deleteTestCaseComment(req.userId, projectId, testcaseId, commentId);
+  }
+
   @Get("/api/projects/:projectId/plans")
   listPlans(@Req() req: AuthenticatedRequest, @Param("projectId") projectId: string) {
     return this.legacy.listPlansForUser(req.userId, projectId);

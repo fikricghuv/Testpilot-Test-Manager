@@ -4665,6 +4665,7 @@ export class LegacyService implements OnModuleInit {
   }
 
   private async listTestCasesUncached(projectId: string, query: Body, limit: number, offset: number) {
+    await this.ensureTestcaseCommentsTable();
     const { filters, values, suiteSubtreeCteSql, customFieldJoinSql } = await this.buildTestcaseFilterFragments(projectId, query);
     const where = filters.join(" AND ");
     const orderBySql = this.buildTestcaseOrderBySql(query);
@@ -4691,6 +4692,8 @@ export class LegacyService implements OnModuleInit {
                  WHERE tct.testcase_id = testcases.id),
                 '[]'::json
               ) AS custom_tags,
+              (SELECT COUNT(*)::int FROM testcase_comments tc_c WHERE tc_c.testcase_id = testcases.id AND tc_c.resolved = false) AS unresolved_comment_count,
+              (SELECT COUNT(*)::int FROM testcase_comments tc_c WHERE tc_c.testcase_id = testcases.id) AS total_comment_count,
               COUNT(*) OVER () AS total_count
        FROM testcases ${customFieldJoinSql} WHERE ${where}
        ORDER BY ${orderBySql} LIMIT $${values.length - 1} OFFSET $${values.length}`,
@@ -26313,6 +26316,112 @@ Plan scenarios for ${key} only — every other ticket in this request is planned
   async deleteProjectTelegramIntegration(projectId: string, userId: string | null | undefined) {
     await this.requireProjectAccess(userId, projectId);
     await this.db.query("DELETE FROM project_telegram_integrations WHERE project_id = $1", [projectId]);
+    return { ok: true };
+  }
+
+  private testcaseCommentsTableReady = false;
+
+  private async ensureTestcaseCommentsTable(): Promise<void> {
+    if (this.testcaseCommentsTableReady) return;
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS testcase_comments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id UUID NOT NULL,
+        testcase_id UUID NOT NULL,
+        author_id UUID NOT NULL,
+        target_field VARCHAR(64) NOT NULL DEFAULT 'General',
+        body TEXT NOT NULL,
+        resolved BOOLEAN NOT NULL DEFAULT false,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_testcase_comments_tc ON testcase_comments (testcase_id, created_at);
+    `);
+    this.testcaseCommentsTableReady = true;
+  }
+
+  async listTestCaseComments(userId: string | null | undefined, projectId: string, testcaseId: string) {
+    await this.requireProjectAccess(userId, projectId);
+    await this.ensureTestcaseCommentsTable();
+    const res = await this.db.query(
+      `SELECT c.id, c.project_id, c.testcase_id, c.author_id, c.target_field, c.body, c.resolved, c.created_at, c.updated_at,
+              COALESCE(u.name, u.email, 'Unknown') AS author_name
+       FROM testcase_comments c
+       LEFT JOIN users u ON u.id = c.author_id
+       WHERE c.project_id = $1 AND c.testcase_id = $2
+       ORDER BY c.created_at ASC`,
+      [projectId, testcaseId]
+    );
+    return { list: res.rows.map((r) => toCamel(r)), total: res.rows.length };
+  }
+
+  async createTestCaseComment(userId: string | null | undefined, projectId: string, testcaseId: string, body: Body) {
+    const uid = this.requireUser(userId);
+    await this.requireProjectAccess(uid, projectId);
+    await this.ensureTestcaseCommentsTable();
+    const text = String(body.body || "").trim();
+    if (!text) throw new BadRequestException({ error: "Comment body is required." });
+    const targetField = String(body.targetField || "General").trim().slice(0, 64) || "General";
+
+    const inserted = await this.db.query(
+      `INSERT INTO testcase_comments (project_id, testcase_id, author_id, target_field, body)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [projectId, testcaseId, uid, targetField, text]
+    );
+
+    const markStatus = typeof body.markStatus === "string" ? body.markStatus.trim() : "";
+    if (markStatus === "In Review" || markStatus === "Approved") {
+      await this.db.query(
+        `UPDATE testcases SET status = $2, updated_by = $3, updated_at = now() WHERE id = $1 AND project_id = $4 AND deleted_at IS NULL`,
+        [testcaseId, markStatus, uid, projectId]
+      );
+      await this.suitesCache.invalidate(projectId);
+    }
+    await this.testcasesListCache.invalidate(projectId);
+
+    const userRes = await this.db.query(`SELECT COALESCE(name, email, 'Unknown') AS author_name FROM users WHERE id = $1`, [uid]);
+    return toCamel({ ...inserted.rows[0], author_name: userRes.rows[0]?.author_name ?? "Unknown" });
+  }
+
+  async updateTestCaseComment(
+    userId: string | null | undefined,
+    projectId: string,
+    testcaseId: string,
+    commentId: string,
+    body: Body
+  ) {
+    await this.requireProjectAccess(userId, projectId);
+    await this.ensureTestcaseCommentsTable();
+    const resolved = typeof body.resolved === "boolean" ? body.resolved : undefined;
+    const text = typeof body.body === "string" ? body.body.trim() : undefined;
+    const res = await this.db.query(
+      `UPDATE testcase_comments
+       SET resolved = COALESCE($4, resolved),
+           body = COALESCE($5, body),
+           updated_at = now()
+       WHERE id = $1 AND project_id = $2 AND testcase_id = $3
+       RETURNING *`,
+      [commentId, projectId, testcaseId, resolved ?? null, text || null]
+    );
+    if (!res.rows[0]) throw new NotFoundException({ error: "Comment not found" });
+    await this.testcasesListCache.invalidate(projectId);
+    return toCamel(res.rows[0]);
+  }
+
+  async deleteTestCaseComment(
+    userId: string | null | undefined,
+    projectId: string,
+    testcaseId: string,
+    commentId: string
+  ) {
+    await this.requireProjectAccess(userId, projectId);
+    await this.ensureTestcaseCommentsTable();
+    await this.db.query(
+      `DELETE FROM testcase_comments WHERE id = $1 AND project_id = $2 AND testcase_id = $3`,
+      [commentId, projectId, testcaseId]
+    );
+    await this.testcasesListCache.invalidate(projectId);
     return { ok: true };
   }
 }

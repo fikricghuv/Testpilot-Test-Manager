@@ -25,12 +25,14 @@ import {
   IconDeviceDesktop,
   IconDownload,
   IconFilterOff,
+  IconLayoutGrid,
   IconLoader2,
   IconPlayerPlay,
   IconPlus,
   IconRefresh,
   IconSearch,
   IconShare,
+  IconTable,
   IconTag,
   IconTrash,
   IconUserPlus,
@@ -74,6 +76,8 @@ import { useTopBarSlots } from "@/components/TopBarSlots";
 import { Breadcrumbs } from "@/components/workflows";
 import { useAppData } from "@/components/app/AppDataProvider";
 import { useProjectData } from "@/components/project/ProjectDataProvider";
+import { CycleExecutionGrid } from "@/components/testruns/CycleExecutionGrid";
+import { readStoredValue, writeStoredValue } from "@/lib/storage";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7000";
 
@@ -403,6 +407,17 @@ export default function TestRunDetailPage() {
   }, [setTopBarFilled]);
 
   const [run, setRun] = useState<TestRunDetail | null>(null);
+  const [runViewMode, setRunViewMode] = useState<"table" | "grid">(() =>
+    readStoredValue("testpilot_run_view_mode") === "grid" ? "grid" : "table"
+  );
+  const handleRunViewModeChange = useCallback((mode: "table" | "grid") => {
+    setRunViewMode(mode);
+    writeStoredValue("testpilot_run_view_mode", mode);
+  }, []);
+  const emptyLinkedBugsMap = useMemo(
+    () => new Map<string, Array<{ bugKey: string; title: string }>>(),
+    []
+  );
   const [executions, setExecutions] = useState<ExecutionItem[]>([]);
   const [scriptRuns, setScriptRuns] = useState<TestScriptRunRecord[]>([]);
   const [reportFormat, setReportFormat] = useState<CycleReportFormat>("pdf");
@@ -1455,14 +1470,47 @@ export default function TestRunDetailPage() {
               )}
             </div>
 
-            <div className="relative ml-auto">
-              <IconSearch size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--muted-soft)]" />
-              <input
-                value={tableSearch}
-                onChange={(e) => setTableSearch(e.target.value)}
-                placeholder="Search test cases…"
-                className="h-[30px] w-[220px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] pl-8 pr-3 text-[13px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
-              />
+            <div className="ml-auto flex items-center gap-2">
+              <div
+                className="inline-flex h-[30px] items-center rounded-[6px] border border-[var(--border)] bg-[var(--background)] p-0.5"
+                role="group"
+                aria-label="Run view mode"
+              >
+                <button
+                  type="button"
+                  onClick={() => handleRunViewModeChange("table")}
+                  className={`inline-flex h-[24px] items-center gap-1 rounded-[4px] px-2 text-[11.5px] font-medium transition-colors ${
+                    runViewMode === "table"
+                      ? "bg-[var(--brand-soft)] text-[var(--accent-light)]"
+                      : "text-[var(--muted)] hover:text-[var(--foreground)]"
+                  }`}
+                >
+                  <IconTable size={13} stroke={1.8} />
+                  Table
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleRunViewModeChange("grid")}
+                  title="Spreadsheet Execution Grid (inline Actual Result & Ctrl+V screenshot)"
+                  className={`inline-flex h-[24px] items-center gap-1 rounded-[4px] px-2 text-[11.5px] font-medium transition-colors ${
+                    runViewMode === "grid"
+                      ? "bg-[var(--brand-soft)] text-[var(--accent-light)]"
+                      : "text-[var(--muted)] hover:text-[var(--foreground)]"
+                  }`}
+                >
+                  <IconLayoutGrid size={13} stroke={1.8} />
+                  Grid
+                </button>
+              </div>
+              <div className="relative">
+                <IconSearch size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--muted-soft)]" />
+                <input
+                  value={tableSearch}
+                  onChange={(e) => setTableSearch(e.target.value)}
+                  placeholder="Search test cases…"
+                  className="h-[30px] w-[220px] rounded-[6px] border border-[var(--border)] bg-[var(--surface-secondary)] pl-8 pr-3 text-[13px] text-[var(--foreground)] outline-none focus:border-[var(--brand-primary)]"
+                />
+              </div>
             </div>
           </div>
 
@@ -1516,6 +1564,27 @@ export default function TestRunDetailPage() {
               <p className="text-[14px] font-medium text-[var(--muted)]">No test cases match</p>
               <p className="mt-1 text-[13px] text-[var(--muted-soft)]">Try adjusting the filter or search query.</p>
             </div>
+          ) : runViewMode === "grid" ? (
+            <CycleExecutionGrid
+              cycleId={cycleId}
+              executions={pagedExecutions}
+              isCompleted={isCompleted}
+              statusSaving={statusSaving}
+              linkedBugsByExecId={emptyLinkedBugsMap}
+              onStatusChange={handleStatusChange}
+              onPatchExecutionLocal={(executionId, patch) => {
+                setExecutions((prev) =>
+                  prev.map((e) => (e.id === executionId ? { ...e, ...patch } : e))
+                );
+              }}
+              onOpenDetail={openExecutionPanel}
+              onLogBug={(exec) => openBugDialogFor(exec, exec.status)}
+              onEvidenceUploaded={(executionId, newTotal) => {
+                setExecutions((prev) =>
+                  prev.map((e) => (e.id === executionId ? { ...e, evidenceCount: newTotal } : e))
+                );
+              }}
+            />
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full">

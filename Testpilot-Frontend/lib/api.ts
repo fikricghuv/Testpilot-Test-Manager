@@ -1737,6 +1737,8 @@ export interface TestCaseListItem {
   sourceRefs?: ZyraSourceRef[];
   /** The project custom tags assigned to this case, sorted by name. */
   customTags?: { id: string; name: string }[];
+  unresolvedCommentCount?: number;
+  totalCommentCount?: number;
 }
 
 export async function listTestCases(
@@ -1840,6 +1842,59 @@ export async function bulkUpdateTestCases(projectId: string, data: { testcaseIds
 
 export async function bulkDeleteTestCases(projectId: string, data: { testcaseIds: string[] }): Promise<void> {
   await api(`/api/projects/${projectId}/testcases/bulk-delete`, { method: "POST", body: data });
+}
+
+export interface TestCaseComment {
+  id: string;
+  projectId: string;
+  testcaseId: string;
+  authorId: string;
+  authorName: string;
+  targetField: string;
+  body: string;
+  resolved: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function listTestCaseComments(
+  projectId: string,
+  testcaseId: string
+): Promise<{ list: TestCaseComment[]; total: number }> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/comments`);
+}
+
+export async function createTestCaseComment(
+  projectId: string,
+  testcaseId: string,
+  data: { body: string; targetField?: string; markStatus?: "In Review" | "Approved" }
+): Promise<TestCaseComment> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/comments`, {
+    method: "POST",
+    body: data,
+  });
+}
+
+export async function updateTestCaseComment(
+  projectId: string,
+  testcaseId: string,
+  commentId: string,
+  data: { resolved?: boolean; body?: string }
+): Promise<TestCaseComment> {
+  return api(`/api/projects/${projectId}/testcases/${testcaseId}/comments/${commentId}`, {
+    method: "PATCH",
+    body: data,
+  });
+}
+
+export async function deleteTestCaseComment(
+  projectId: string,
+  testcaseId: string,
+  commentId: string
+): Promise<void> {
+  await api(`/api/projects/${projectId}/testcases/${testcaseId}/comments/${commentId}`, {
+    method: "DELETE",
+  });
 }
 
 // Custom fields (Pro plan feature) ------------------------------------------------
